@@ -77,7 +77,8 @@ type Dashboard = {
   disagreements: Disagreement[];
   influence_observations: Influence[];
 };
-type RunState = { task_id: string; status: string; logs: string[]; result?: { metric_snapshot_id: number } | null; error?: string };
+type RunLog = { stage: string; level: string; message: string };
+type RunState = { task_id: string; status: string; logs: RunLog[]; result?: { metric_snapshot_id: number } | null; error?: string };
 type DomainRules = { scenario_id: number; revision: string; generated: boolean; stale: boolean; agent_count: number; rules: { hard_constraints?: string[]; owned_checks?: string[]; principles?: string[]; primary_sources?: string[]; automatic_deficit_ceiling?: number } };
 type AgentForm = Omit<Agent, "id" | "has_llm_api_key" | "template_key" | "system_prompt"> & { llm_api_key: string };
 type ScenarioForm = Omit<Scenario, "id" | "max_deficit_constraint">;
@@ -127,6 +128,9 @@ export default function Home() {
   const [rulesBusy, setRulesBusy] = useState(false);
   const [busy, setBusy] = useState(false);
   const [editingAgentId, setEditingAgentId] = useState<number | null>(null);
+  const [scenarioExpanded, setScenarioExpanded] = useState(false);
+  const [templateModalOpen, setTemplateModalOpen] = useState(false);
+  const [templateConfigs, setTemplateConfigs] = useState<Record<string, { llm_base_url: string; llm_api_key: string; llm_model: string; temperature: number; max_tokens: number }>>({});
 
   async function loadTemplates() {
     const response = await fetch("/api/agent-templates", { cache: "no-store" });
@@ -194,13 +198,19 @@ export default function Home() {
     });
   }
 
+  function openTemplateModal() {
+    setTemplateConfigs(Object.fromEntries(templates.map((item) => [item.key, { llm_base_url: "", llm_api_key: "", llm_model: "", temperature: item.temperature, max_tokens: item.max_tokens }])));
+    setTemplateModalOpen(true);
+  }
+
   async function loadAllTemplates() {
     setBusy(true);
     try {
-      const response = await fetch(`${apiUrl}/api/agents/load-templates`, { method: "POST" });
+      const configs = Object.fromEntries(Object.entries(templateConfigs).map(([key, value]) => [key, { ...value, llm_base_url: value.llm_base_url || null, llm_api_key: value.llm_api_key || null, llm_model: value.llm_model || null }]));
+      const response = await fetch(`${apiUrl}/api/agents/load-templates`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ configs }) });
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.detail ?? "Template agents could not be loaded");
-      await Promise.all([loadSetup(), loadTemplates()]);
+      await Promise.all([loadSetup(), loadTemplates()]); setDomainRules(null); setTemplateModalOpen(false);
       setNotice(`${payload.created} template baru dimuat; ${payload.total} template APBN siap digunakan.`);
     } catch (error) {
       setNotice(error instanceof Error ? error.message : "Template agents could not be loaded");
@@ -278,7 +288,7 @@ export default function Home() {
   }
 
   const latest = dashboard?.latest_metric ?? null;
-  const activeLogs = run?.logs ?? ["Awaiting task dispatch."];
+  const activeLogs = run?.logs ?? [{ stage: "IDLE", level: "INFO", message: "Awaiting task dispatch." }];
   const selectedTemplateData = templates.find((item) => item.key === selectedTemplate);
   const canGenerateRules = selectedScenario !== null && agents.length > 0;
   const rulesAreStale = canGenerateRules && (!domainRules || domainRules.agent_count !== agents.length);
@@ -289,18 +299,18 @@ export default function Home() {
     <section className="dashboard-hero"><div><div className="eyebrow">PHASE 05 / OBSERVATION LAYER</div><h1>Make disagreement<br /><em>inspectable.</em></h1><p>A live evidence surface for tracking execution, divergence, hard constraints, and the convergence states produced by each fiscal experiment.</p></div><div className="hero-orbit"><span>DDR</span><b>→</b><span>CAR</span><b>→</b><span>SHCR</span></div></section>
     <div className="notice"><span className="notice-label">SYSTEM NOTE</span><span>{notice}</span></div>
 
-    <section className="control-strip"><div className="scenario-select"><label className="field"><span>Active scenario / experiment scope</span><select value={selectedScenario ?? ""} onChange={(event) => { setSelectedScenario(Number(event.target.value)); setDomainRules(null); }}><option value="" disabled>Select scenario</option>{scenarios.map((item) => <option key={item.id} value={item.id}>#{item.id} — {item.description}</option>)}</select></label></div><button className="primary-button run-button" onClick={startRun} disabled={run?.status === "RUNNING" || run?.status === "QUEUED" || rulesAreStale}>{run?.status === "RUNNING" ? "Diskusi berjalan…" : "Mulai Diskusi"}<span>↗</span></button></section>
+    <section className="control-strip"><div className="scenario-overview"><span>ACTIVE SCENARIO / SCOPE</span><strong>{selectedScenario ? `Scenario #${selectedScenario}` : "Belum dipilih"}</strong><p className={scenarioExpanded ? "expanded" : "collapsed"}>{scenarios.find((item) => item.id === selectedScenario)?.description ?? "Pilih skenario untuk memulai."}</p><button type="button" onClick={() => setScenarioExpanded((value) => !value)}>{scenarioExpanded ? "Sembunyikan Detail" : "Tampilkan Detail / Expand"}</button><select aria-label="Select active scenario" value={selectedScenario ?? ""} onChange={(event) => { setSelectedScenario(Number(event.target.value)); setDomainRules(null); }}><option value="" disabled>Select scenario</option>{scenarios.map((item) => <option key={item.id} value={item.id}>#{item.id} — {item.description.slice(0, 72)}</option>)}</select></div><button className="primary-button run-button" onClick={startRun} disabled={run?.status === "RUNNING" || run?.status === "QUEUED" || rulesAreStale}>{run?.status === "RUNNING" ? "Diskusi berjalan…" : "Mulai Diskusi"}<span>↗</span></button></section>
 
     <nav className="menu-rail"><span className="menu-label">CONTROL MENUS</span><a href="#setup">01 / Setup</a><a href="#setup">02 / Scenario</a><a className="active" href="#tracker">03 / Live Tracker</a><a href="#ddr">04 / DDR Network</a><a href="#analytics">05 / Analytics</a></nav>
 
-    <section id="tracker" className="tracker-panel panel"><div className="section-header"><div><span className="section-number">03</span><h2>Live Tracker</h2></div><span className={`run-state ${run?.status?.toLowerCase() ?? "idle"}`}>{run?.status ?? "IDLE"}</span></div><div className="tracker-content"><div className="progress-console">{activeLogs.map((log, index) => <div className="console-line" key={`${log}-${index}`}><span>{String(index + 1).padStart(2, "0")}</span><i className={index === activeLogs.length - 1 && run?.status !== "SUCCEEDED" ? "pulse" : "done"} />{log}</div>)}</div><div className="task-readout"><span>TASK IDENTIFIER</span><strong>{run?.task_id ?? "—"}</strong><small>{run?.error ?? (run?.status === "SUCCEEDED" ? "Result persisted" : "Polling every 1.2 seconds")}</small></div></div></section>
+    <section id="tracker" className="tracker-panel panel"><div className="section-header"><div><span className="section-number">03</span><h2>Live Tracker</h2></div><span className={`run-state ${run?.status?.toLowerCase() ?? "idle"}`}>{run?.status ?? "IDLE"}</span></div><div className="tracker-content"><div className="progress-console">{activeLogs.map((log, index) => <div className={`console-line ${log.level.toLowerCase()}`} key={`${log.stage}-${index}`}><span>{String(index + 1).padStart(2, "0")}</span><i className={index === activeLogs.length - 1 && run?.status !== "SUCCEEDED" ? "pulse" : "done"} /><div><b>[{log.level}] {log.stage}</b><small>{log.message}</small></div></div>)}</div><div className="task-readout"><span>TASK IDENTIFIER</span><strong>{run?.task_id ?? "—"}</strong><small>{run?.error ?? (run?.status === "SUCCEEDED" ? "Result persisted" : "Polling every 1.2 seconds")}</small></div></div></section>
 
     <section id="ddr" className="panel"><div className="section-header"><div><span className="section-number">04</span><h2>DDR Network</h2></div><span className="panel-code">D<sub>ij</sub> / 8 COMPONENTS</span></div><div className="matrix-wrap">{dashboard?.disagreements.length ? <table className="ddr-table"><thead><tr><th>AGENT PAIR</th>{components.map((component) => <th key={component}>{component}</th>)}<th>RESOLUTION MECHANISM</th></tr></thead><tbody>{dashboard.disagreements.map((item) => <tr key={item.id}><td><strong>{item.agent_i}</strong><small>× {item.agent_j}</small></td>{components.map((component) => <td key={component}><span className={`bool ${item[component] ? "conflict" : "clear"}`}>{item[component] ? "1" : "0"}</span></td>)}<td className="resolution">{item.resolution_mechanism}</td></tr>)}</tbody></table> : <div className="empty-state"><strong>No DDR vectors yet.</strong><span>Run a cycle with at least two schema-valid agents to populate the matrix.</span></div>}</div></section>
 
     <section id="analytics" className="analytics-section"><div className="section-header"><div><span className="section-number">05</span><h2>Decision Analytics</h2></div><button className="export-button" onClick={exportManifest}>↓ Export reproducibility manifest</button></div><div className="convergence-banner"><div><span>FINAL CONVERGENCE STATE</span><strong>{latest?.convergence_status ?? "AWAITING CYCLE"}</strong></div><div className="convergence-meta"><span>FEASIBLE ALTERNATIVES</span><b>{latest?.feasible_alternatives_count ?? "—"}</b></div></div><div className="metric-grid"><MetricCard label="Hard-constraint violation rate" value={latest ? latest.hard_constraint_violation_rate.toFixed(2) : "—"} unit="%" tone="rust" /><MetricCard label="Provenance completeness" value={latest ? latest.provenance_completeness_percent.toFixed(2) : "—"} unit="%" /><MetricCard label="Schema validity" value={dashboard ? dashboard.schema_validity_percent.toFixed(2) : "—"} unit="%" tone="mint" /><MetricCard label="Latency / token usage" value={latest ? latest.latency_ms.toFixed(0) : "—"} unit={latest ? `ms · ${latest.token_usage} tok` : ""} /></div><div className="analytics-lower"><div className="history-block"><div className="subhead"><span>METRIC SNAPSHOT HISTORY</span><b>{dashboard?.metric_history.length ?? 0} RUNS</b></div>{dashboard?.metric_history.length ? dashboard.metric_history.slice(0, 5).map((metric) => <div className="history-row" key={metric.id}><span>#{metric.id}</span><strong>{metric.convergence_status}</strong><i>{metric.provenance_completeness_percent.toFixed(1)}% provenance</i><b>{new Date(metric.created_at).toLocaleTimeString()}</b></div>) : <p className="empty">Metric history will appear after the first completed cycle.</p>}</div><div className="influence-block"><div className="subhead"><span>RAR-DAI INFLUENCE RANKING</span><b>{activeInfluence.length} OBSERVATIONS</b></div>{activeInfluence.length ? activeInfluence.slice(0, 4).map((item, index) => <div className="weight-row" key={`${item.agent}-${item.proposition}`}><span>{String(index + 1).padStart(2, "0")}</span><div><strong>{item.agent}</strong><small>{item.proposition}</small></div><b>{item.normalized_weight === null ? "—" : `${(item.normalized_weight * 100).toFixed(1)}%`}</b></div>) : <p className="empty">No influence observations recorded for this scenario.</p>}</div></div></section>
 
     <section id="setup" className="setup-section">
-      <div className="section-header"><div><span className="section-number">01 / 02</span><h2>Heterogeneous Agent Studio</h2></div><button type="button" className="template-load-button" onClick={loadAllTemplates} disabled={busy}>Muat 5 template APBN</button></div>
+      <div className="section-header"><div><span className="section-number">01 / 02</span><h2>Heterogeneous Agent Studio</h2></div><button type="button" className="template-load-button" onClick={openTemplateModal} disabled={busy}>Muat 5 template APBN</button></div>
       <p className="setup-intro">Pilih template untuk mengisi mandat otomatis, lalu sesuaikan identitas, koneksi model, kebijakan generasi, dan bobot RAR-DAI sebelum menyimpan agen.</p>
       <form className="agent-config-form" onSubmit={submitAgent}>
         <fieldset className="form-card">
@@ -346,6 +356,7 @@ export default function Home() {
 
       <form className="scenario-config-form" onSubmit={submitScenario}><div><span className="section-number">SCENARIO</span><h3>Uji kebijakan fiskal</h3><small>Constraint hukum dan batas defisit diterapkan otomatis oleh agen.</small></div><label className="form-field"><strong>Goal / Deskripsi Kebijakan</strong><textarea value={scenario.description} onChange={(event) => setScenario({ ...scenario, description: event.target.value })} rows={4} required /><small>Jelaskan tujuan kebijakan, program yang diuji, horizon waktu, dan hasil yang diharapkan.</small></label><label className="form-field"><strong>Program Cost / Parameter Finansial</strong><input type="number" min="0" step="0.01" value={scenario.program_cost ?? ""} onChange={(event) => setScenario({ ...scenario, program_cost: event.target.value === "" ? null : Number(event.target.value) })} /><small>Opsional. Gunakan satuan fiskal yang konsisten dengan alternatif; kosongkan bila belum diketahui.</small></label><button className="secondary-button" disabled={busy}>Simpan skenario</button></form>
     </section>
+    {templateModalOpen && <div className="modal-backdrop" role="dialog" aria-modal="true" aria-label="Konfigurasi LLM template APBN"><div className="template-modal"><div className="section-header"><div><span className="section-number">LLM</span><h2>Konfigurasi 5 Template APBN</h2></div><button type="button" className="modal-close" onClick={() => setTemplateModalOpen(false)}>×</button></div><p>Atur koneksi tiap agen sebelum template disimpan. Kolom kosong memakai konfigurasi environment default.</p><div className="template-config-list">{templates.map((item) => { const config = templateConfigs[item.key]; if (!config) return null; return <fieldset className="template-config-card" key={item.key}><legend>{item.name}</legend><label><span>API Base URL</span><input value={config.llm_base_url} onChange={(event) => setTemplateConfigs({ ...templateConfigs, [item.key]: { ...config, llm_base_url: event.target.value } })} /></label><label><span>API Key</span><input type="password" value={config.llm_api_key} onChange={(event) => setTemplateConfigs({ ...templateConfigs, [item.key]: { ...config, llm_api_key: event.target.value } })} /></label><label><span>Model Name</span><input value={config.llm_model} onChange={(event) => setTemplateConfigs({ ...templateConfigs, [item.key]: { ...config, llm_model: event.target.value } })} /></label><label><span>Temperature</span><input type="number" min="0" max="2" step="0.01" value={config.temperature} onChange={(event) => setTemplateConfigs({ ...templateConfigs, [item.key]: { ...config, temperature: Number(event.target.value) } })} /></label><label><span>Max Tokens</span><input type="number" min="1" value={config.max_tokens} onChange={(event) => setTemplateConfigs({ ...templateConfigs, [item.key]: { ...config, max_tokens: Number(event.target.value) } })} /></label></fieldset>; })}</div><button type="button" className="primary-button" onClick={loadAllTemplates} disabled={busy}>{busy ? "Menyimpan…" : "Simpan dan Muat Semua Template"}<span>↗</span></button></div></div>}
     <footer><span>STRUCTURED CONSENSUS / RESEARCH INSTRUMENT</span><span>SRR + (RAR → DAI) + DDR + CAR</span></footer>
   </main>;
 }

@@ -155,7 +155,7 @@ def start_run(scenario_id: int) -> dict[str, Any]:
         "task_id": task.id,
         "scenario_id": scenario_id,
         "status": "QUEUED",
-        "logs": ["Cycle queued for worker execution."],
+        "logs": [{"stage": "QUEUE", "level": "INFO", "message": "Cycle queued for worker execution."}],
     }
 
 
@@ -183,11 +183,11 @@ def run_status(task_id: str) -> dict[str, Any]:
     if result.successful():
         payload["result"] = result.result
         payload["logs"] = [
-            "Executing SRR...",
-            "Calculating DDR vector...",
-            "Applying CAR filter...",
-            "Persisting dissertation metrics...",
-            "SHCR cycle completed.",
+            {"stage": "SRR", "level": "SUCCESS", "message": "All available agent responses processed."},
+            {"stage": "DDR", "level": "SUCCESS", "message": "Disagreement vectors calculated and resolution routes recorded."},
+            {"stage": "CAR", "level": "SUCCESS", "message": "Hard constraints applied before reconciliation."},
+            {"stage": "METRICS", "level": "SUCCESS", "message": "Dissertation metrics persisted to PostgreSQL."},
+            {"stage": "COMPLETE", "level": "SUCCESS", "message": "SHCR cycle completed."},
         ]
     elif result.failed():
         payload["error"] = str(result.result)

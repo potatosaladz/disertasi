@@ -25,6 +25,22 @@ from .models import (
 )
 
 
+class TemplateLLMConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    llm_base_url: str | None = Field(default=None, max_length=2048)
+    llm_api_key: str | None = Field(default=None, max_length=4096)
+    llm_model: str | None = Field(default=None, max_length=255)
+    temperature: float = Field(default=0.2, ge=0.0, le=2.0, allow_inf_nan=False)
+    max_tokens: int = Field(default=4000, gt=0)
+
+
+class LoadTemplatesRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    configs: dict[str, TemplateLLMConfig] = Field(default_factory=dict)
+
+
 class AgentCreate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -166,9 +182,16 @@ def list_agent_templates() -> list[dict[str, object]]:
 
 
 @app.post("/api/agents/load-templates")
-def load_agent_templates() -> dict[str, object]:
+def load_agent_templates(payload: LoadTemplatesRequest | None = None) -> dict[str, object]:
+    configs = {
+        key: config.model_dump()
+        for key, config in (payload.configs if payload else {}).items()
+    }
+    unknown = set(configs) - {item["key"] for item in template_catalog()}
+    if unknown:
+        raise HTTPException(status_code=422, detail=f"Unknown templates: {sorted(unknown)}")
     with SessionLocal() as session:
-        agents, created = load_standard_agent_templates(session)
+        agents, created = load_standard_agent_templates(session, configs)
         return {
             "created": created,
             "total": len(agents),

@@ -342,7 +342,10 @@ def template_catalog() -> list[dict[str, Any]]:
     return [template.as_payload() for template in AGENTS]
 
 
-def load_standard_agent_templates(session: Session) -> tuple[list[Agent], int]:
+def load_standard_agent_templates(
+    session: Session,
+    configs: dict[str, dict[str, Any]] | None = None,
+) -> tuple[list[Agent], int]:
     existing_by_key = {
         agent.template_key: agent
         for agent in session.scalars(
@@ -357,6 +360,7 @@ def load_standard_agent_templates(session: Session) -> tuple[list[Agent], int]:
     }
     created = 0
     agents: list[Agent] = []
+    configurations = configs or {}
     for template in AGENTS:
         agent = existing_by_key.get(template.key) or existing_by_name.get(template.name)
         if agent is None:
@@ -365,6 +369,9 @@ def load_standard_agent_templates(session: Session) -> tuple[list[Agent], int]:
             created += 1
         elif agent.template_key is None:
             agent.template_key = template.key
+        for field, value in configurations.get(template.key, {}).items():
+            if value not in (None, ""):
+                setattr(agent, field, value)
         agents.append(agent)
     session.commit()
     for agent in agents:

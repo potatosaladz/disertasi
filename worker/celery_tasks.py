@@ -32,7 +32,39 @@ from worker.srr_models import SRRResponse
 
 logger = logging.getLogger(__name__)
 LLMCaller = Callable[[Agent, Scenario], tuple[str, int]]
-ProgressReporter = Callable[[list[str]], None]
+ProgressReporter = Callable[[list[dict[str, str]]], None]
+
+
+def _log(stage: str, level: str, message: str) -> dict[str, str]:
+    return {"stage": stage, "level": level, "message": message}
+
+
+def _extract_llm_response(response: object) -> tuple[str, int]:
+    if isinstance(response, str):
+        return response, 0
+    if isinstance(response, dict):
+        content = response.get("content")
+        if content is None:
+            choices = response.get("choices")
+            if isinstance(choices, list) and choices:
+                choice = choices[0]
+                if isinstance(choice, dict):
+                    message = choice.get("message")
+                    if isinstance(message, dict):
+                        content = message.get("content")
+        if not isinstance(content, str):
+            raise ValueError("LLM response dictionary has no text content")
+        usage = response.get("usage")
+        tokens = usage.get("total_tokens", 0) if isinstance(usage, dict) else 0
+        return content, int(tokens)
+    choices = getattr(response, "choices", None)
+    if not choices:
+        raise ValueError(f"Unsupported LLM response type: {type(response).__name__}")
+    content = getattr(getattr(choices[0], "message", None), "content", None)
+    if not isinstance(content, str):
+        raise ValueError("LLM returned no text content")
+    usage = getattr(response, "usage", None)
+    return content, int(getattr(usage, "total_tokens", 0) if usage else 0)
 
 
 def _default_llm_call(agent: Agent, scenario: Scenario) -> tuple[str, int]:
@@ -66,10 +98,7 @@ def _default_llm_call(agent: Agent, scenario: Scenario) -> tuple[str, int]:
         ],
         response_format={"type": "json_object"},
     )
-    content = response.choices[0].message.content
-    if content is None:
-        raise ValueError("LLM returned no content")
-    return content, response.usage.total_tokens if response.usage else 0
+    return _extract_llm_response(response)
 
 
 def _parse_response(raw_content: str) -> tuple[dict[str, Any], SRRResponse | None]:
@@ -128,7 +157,8 @@ def execute_full_shcr_cycle(
     started_at = perf_counter()
     caller = llm_call or _default_llm_call
     emit = progress or (lambda _logs: None)
-    emit(["Executing SRR..."])
+    logs = [_log("INITIALIZE", "INFO", f"Starting SHCR cycle for scenario {scenario_id}.")]
+    emit(logs)
 
     with SessionLocal() as session:
         scenario = session.get(Scenario, scenario_id)
@@ -151,10 +181,30 @@ def execute_full_shcr_cycle(
         total_items = 0
 
         for agent in agents:
-            raw_content, token_usage = caller(agent, scenario)
+            logs.append(_log("SRR", "INFO", f"Calling {agent.name} using {agent.llm_model or 'environment default model'}."))
+            emit(logs)
+            try:
+                raw_content, token_usage = caller(agent, scenario)
+            except Exception as error:
+                logger.exception("LLM call failed for agent %s", agent.id)
+                logs.append(_log("SRR", "ERROR", f"{agent.name}: {type(error).__name__}: {error}"))
+                emit(logs)
+                session.add(
+                    ReasoningLog(
+                        agent_id=agent.id,
+                        scenario_id=scenario.id,
+                        raw_json={"error": str(error), "error_type": type(error).__name__},
+                        parsed_srr_objects={},
+                        is_schema_valid=False,
+                        provenance_count=0,
+                    )
+                )
+                continue
             total_tokens += token_usage
             raw_json, parsed = _parse_response(raw_content)
             if parsed is None:
+                logs.append(_log("SRR", "WARNING", f"{agent.name}: response failed JSON/schema validation."))
+                emit(logs)
                 session.add(
                     ReasoningLog(
                         agent_id=agent.id,
@@ -168,6 +218,8 @@ def execute_full_shcr_cycle(
                 continue
 
             tagged, count = _provenance_counts(parsed)
+            logs.append(_log("SRR", "SUCCESS", f"{agent.name}: valid SRR with {tagged}/{count} sourced artifacts and {token_usage} tokens."))
+            emit(logs)
             tagged_items += tagged
             total_items += count
             parsed_by_agent.append((agent, parsed))
@@ -182,7 +234,8 @@ def execute_full_shcr_cycle(
                 )
             )
 
-        emit(["Executing SRR...", "Calculating DDR vector..."])
+        logs.append(_log("DDR", "INFO", "Calculating disagreement vectors."))
+        emit(logs)
         agents_by_id = {agent.id: agent for agent in agents}
         influence_inputs: list[dict[str, float | int]] = []
         influence_observations: list[AgentInfluenceObservation] = []
@@ -228,6 +281,9 @@ def execute_full_shcr_cycle(
                 route = "Simulation Agent Requested" if vector["dP"] else None
                 if route:
                     logger.info(route)
+                active_conflicts = ", ".join(key for key, value in vector.items() if value) or "none"
+                logs.append(_log("DDR", "WARNING" if active_conflicts != "none" else "SUCCESS", f"{agent_i.name} vs {agent_j.name}: conflicts={active_conflicts}; route={route or 'none'}."))
+                emit(logs)
                 session.add(
                     DisagreementLog(
                         scenario_id=scenario.id,
@@ -238,11 +294,8 @@ def execute_full_shcr_cycle(
                     )
                 )
 
-        emit([
-            "Executing SRR...",
-            "Calculating DDR vector...",
-            "Applying CAR filter...",
-        ])
+        logs.append(_log("CAR", "INFO", f"Applying hard deficit constraint <= {scenario.max_deficit_constraint}%."))
+        emit(logs)
         parsed_responses = [response for _, response in parsed_by_agent]
         alternatives = [
             alternative
@@ -269,12 +322,9 @@ def execute_full_shcr_cycle(
         convergence_status = _determine_convergence(parsed_responses, feasible)
         latency_ms = (perf_counter() - started_at) * 1000.0
 
-        emit([
-            "Executing SRR...",
-            "Calculating DDR vector...",
-            "Applying CAR filter...",
-            "Persisting dissertation metrics...",
-        ])
+        logs.append(_log("CAR", "SUCCESS", f"{len(feasible)}/{len(alternatives)} alternatives feasible; violation rate={violation_rate}%."))
+        logs.append(_log("METRICS", "INFO", "Persisting convergence, provenance, latency, and token metrics."))
+        emit(logs)
         snapshot = MetricSnapshot(
             scenario_id=scenario.id,
             provenance_completeness_percent=provenance_completeness,
@@ -288,13 +338,8 @@ def execute_full_shcr_cycle(
         session.add(snapshot)
         session.commit()
         session.refresh(snapshot)
-        emit([
-            "Executing SRR...",
-            "Calculating DDR vector...",
-            "Applying CAR filter...",
-            "Persisting dissertation metrics...",
-            "SHCR cycle completed.",
-        ])
+        logs.append(_log("COMPLETE", "SUCCESS", f"Cycle completed with state {convergence_status.value}, {total_tokens} tokens, and {latency_ms:.2f} ms latency."))
+        emit(logs)
 
         return {
             "metric_snapshot_id": snapshot.id,

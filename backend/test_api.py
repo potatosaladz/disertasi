@@ -134,6 +134,32 @@ def test_agent_heterogeneous_llm_config_create_and_update(client: TestClient) ->
         session.commit()
 
 
+def test_template_loader_applies_per_agent_llm_configuration(client: TestClient) -> None:
+    response = client.post(
+        "/api/agents/load-templates",
+        json={
+            "configs": {
+                "revenue": {
+                    "llm_base_url": "https://revenue.example/v1",
+                    "llm_api_key": "secret",
+                    "llm_model": "gpt-4o",
+                    "temperature": 0.15,
+                    "max_tokens": 2100,
+                }
+            }
+        },
+    )
+    assert response.status_code == 200
+    with SessionLocal() as session:
+        agents = list(session.scalars(select(Agent).where(Agent.template_key.is_not(None))))
+        revenue = next(agent for agent in agents if agent.template_key == "revenue")
+        assert revenue.llm_model == "gpt-4o"
+        assert revenue.temperature == 0.15
+        for agent in agents:
+            session.delete(agent)
+        session.commit()
+
+
 def test_agent_can_be_deleted_before_research_records(client: TestClient) -> None:
     response = client.post(
         "/api/agents",
@@ -299,7 +325,7 @@ def test_run_status_success(client: TestClient, monkeypatch: pytest.MonkeyPatch)
     assert response.status_code == 200
     assert response.json()["status"] == "SUCCEEDED"
     assert response.json()["result"]["metric_snapshot_id"] == 9
-    assert "Applying CAR filter..." in response.json()["logs"]
+    assert any(log["stage"] == "CAR" for log in response.json()["logs"])
 
 
 def test_run_status_failure(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:

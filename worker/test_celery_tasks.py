@@ -14,7 +14,7 @@ from backend.models import (
     Scenario,
 )
 from backend.agent_templates import AGENTS
-from worker.celery_tasks import _default_llm_call, execute_full_shcr_cycle
+from worker.celery_tasks import _default_llm_call, _extract_llm_response, execute_full_shcr_cycle
 
 
 @pytest.fixture
@@ -116,6 +116,18 @@ def response_payload(
             "material_information_retention_macro_f1": 0.9,
         }
     )
+
+
+def test_extract_llm_response_accepts_raw_string_and_dict() -> None:
+    assert _extract_llm_response('{"evidence": []}') == ('{"evidence": []}', 0)
+    content, tokens = _extract_llm_response(
+        {
+            "choices": [{"message": {"content": '{"recommendation": {}}'}}],
+            "usage": {"total_tokens": 17},
+        }
+    )
+    assert content == '{"recommendation": {}}'
+    assert tokens == 17
 
 
 def test_default_llm_call_uses_canonical_template_mandate(monkeypatch: pytest.MonkeyPatch) -> None:

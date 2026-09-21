@@ -20,7 +20,7 @@ def health_check() -> dict[str, str]:
 
 @app.task(bind=True, name="shcr.run_full_shcr_cycle")
 def run_full_shcr_cycle_task(self: Any, scenario_id: int) -> dict[str, object]:
-    def report(logs: list[str]) -> None:
+    def report(logs: list[dict[str, str]]) -> None:
         self.update_state(state="PROGRESS", meta={"logs": logs})
 
     return execute_full_shcr_cycle(scenario_id, progress=report)
