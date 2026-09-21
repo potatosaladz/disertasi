@@ -3,19 +3,26 @@ import json
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from time import perf_counter
+from typing import Literal
 
 from fastapi import FastAPI, HTTPException, Response, status
-from openai import OpenAI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from openai import OpenAI
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select, text
 
 from .agent_templates import (
     get_agent_spec,
     load_standard_agent_templates,
+    mandate_seed,
     template_catalog,
 )
-from .core_algorithms import resolve_llm_runtime_config
+from .core_algorithms import (
+    build_mandate_synthesis_prompt,
+    extract_json_object,
+    resolve_llm_runtime_config,
+)
 from .dashboard import router as dashboard_router
 from .database import SessionLocal
 from .init_db import initialize_database
@@ -110,6 +117,12 @@ class LLMConnectionTestResponse(BaseModel):
     error: str | None = None
 
 
+class MandateSynthesisError(BaseModel):
+    code: Literal["CONFIGURATION_ERROR", "PROVIDER_ERROR", "EMPTY_CONTENT", "INVALID_JSON", "SCHEMA_ERROR"]
+    message: str
+    retryable: bool
+
+
 class AgentDomainRules(BaseModel):
     agent_id: int
     name: str
@@ -119,6 +132,18 @@ class AgentDomainRules(BaseModel):
     primary_sources: list[str]
     constraints: list[str]
     owned_checks: list[str]
+    synthesis_status: Literal["generated", "fallback"] = "fallback"
+    scenario_mandate: str | None = None
+    scenario_focus: list[str] = Field(default_factory=list)
+    priority_questions: list[str] = Field(default_factory=list)
+    required_evidence: list[str] = Field(default_factory=list)
+    applicable_primary_sources: list[str] = Field(default_factory=list)
+    applicable_constraints: list[str] = Field(default_factory=list)
+    applicable_owned_checks: list[str] = Field(default_factory=list)
+    llm_model: str | None = None
+    latency_ms: float | None = None
+    token_usage: int | None = None
+    error: MandateSynthesisError | None = None
 
 
 class DomainRulesResponse(BaseModel):
@@ -129,6 +154,10 @@ class DomainRulesResponse(BaseModel):
     agent_count: int
     rules: dict[str, object]
     agent_rules: list[AgentDomainRules]
+    status: Literal["success", "partial", "failed", "stale", "missing"] = "missing"
+    generated_count: int = 0
+    failure_count: int = 0
+    detail: str | None = None
 
 
 class ScenarioCreate(BaseModel):
@@ -337,23 +366,39 @@ def test_agent_connection(agent_id: int) -> LLMConnectionTestResponse:
             )
 
 
-def _agent_revision(agents: list[Agent]) -> str:
-    payload = [
-        {
-            "id": agent.id,
-            "template_key": agent.template_key,
-            "role": agent.role,
-            "llm_model": agent.llm_model,
-            "temperature": agent.temperature,
-            "max_tokens": agent.max_tokens,
-            "theta_x": agent.theta_x,
-            "theta_q": agent.theta_q,
-            "theta_h": agent.theta_h,
-            "theta_s": agent.theta_s,
-            "theta_u": agent.theta_u,
-        }
-        for agent in agents
-    ]
+def _agent_revision(agents: list[Agent], scenario: Scenario | None = None) -> str:
+    payload = {
+        "scenario": (
+            {
+                "id": scenario.id,
+                "description": scenario.description,
+                "program_cost": scenario.program_cost,
+                "max_deficit_constraint": scenario.max_deficit_constraint,
+            }
+            if scenario is not None
+            else None
+        ),
+        "agents": [
+            {
+                "id": agent.id,
+                "name": agent.name,
+                "template_key": agent.template_key,
+                "role": agent.role,
+                "seed": mandate_seed(agent),
+                "llm_base_url": agent.llm_base_url,
+                "llm_model": agent.llm_model,
+                "has_llm_api_key": bool(agent.llm_api_key),
+                "temperature": agent.temperature,
+                "max_tokens": agent.max_tokens,
+                "theta_x": agent.theta_x,
+                "theta_q": agent.theta_q,
+                "theta_h": agent.theta_h,
+                "theta_s": agent.theta_s,
+                "theta_u": agent.theta_u,
+            }
+            for agent in agents
+        ],
+    }
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:16]
 
 
@@ -368,42 +413,184 @@ def _combined_domain_rules(agents: list[Agent], scenario: Scenario) -> dict[str,
     }
 
 
-def _agent_domain_rules(agents: list[Agent]) -> list[AgentDomainRules]:
-    rules: list[AgentDomainRules] = []
-    for agent in agents:
-        spec = get_agent_spec(agent.template_key)
-        rules.append(
-            AgentDomainRules(
-                agent_id=agent.id,
-                name=agent.name,
-                role=agent.role,
-                template_key=agent.template_key,
-                mandate=spec.mandate if spec is not None else agent.system_prompt,
-                primary_sources=list(spec.primary_sources) if spec is not None else [],
-                constraints=list(spec.constraints) if spec is not None else [],
-                owned_checks=list(spec.owned_checks) if spec is not None else [],
-            )
+def _base_agent_domain_rules(agent: Agent) -> AgentDomainRules:
+    seed = mandate_seed(agent)
+    return AgentDomainRules(
+        agent_id=agent.id,
+        name=agent.name,
+        role=agent.role,
+        template_key=agent.template_key,
+        mandate=str(seed["mandate"]) or None,
+        primary_sources=list(seed["primary_sources"]),
+        constraints=list(seed["constraints"]),
+        owned_checks=list(seed["owned_checks"]),
+    )
+
+
+def _extract_completion(response: object) -> tuple[str, int]:
+    choices = getattr(response, "choices", None)
+    if not choices:
+        raise ValueError("LLM returned no completion choices")
+    content = getattr(getattr(choices[0], "message", None), "content", None)
+    if not isinstance(content, str) or not content.strip():
+        raise ValueError("LLM returned no text content")
+    usage = getattr(response, "usage", None)
+    tokens = getattr(usage, "total_tokens", None) if usage else None
+    return content, tokens if isinstance(tokens, int) and tokens >= 0 else 0
+
+
+def _synthesize_agent_domain_rules(agent: Agent, scenario: Scenario) -> AgentDomainRules:
+    base = _base_agent_domain_rules(agent)
+    started_at = perf_counter()
+    try:
+        config = resolve_llm_runtime_config(agent)
+        seed = mandate_seed(agent)
+        response = OpenAI(
+            api_key=config.api_key,
+            base_url=config.base_url,
+            timeout=60.0,
+            max_retries=2,
+        ).chat.completions.create(
+            model=config.model,
+            temperature=agent.temperature,
+            max_tokens=agent.max_tokens,
+            response_format={"type": "json_object"},
+            messages=[
+                {
+                    "role": "system",
+                    "content": "Expand an authoritative fiscal seed into a scenario-specific operating mandate.",
+                },
+                {
+                    "role": "user",
+                    "content": build_mandate_synthesis_prompt(
+                        agent.name,
+                        agent.role,
+                        scenario.description,
+                        scenario.program_cost,
+                        scenario.max_deficit_constraint,
+                        seed,
+                    ),
+                },
+            ],
         )
-    return rules
+        content, tokens = _extract_completion(response)
+        payload = extract_json_object(content)
+        scenario_mandate = payload.get("scenario_mandate")
+        scenario_focus = payload.get("scenario_focus")
+        priority_questions = payload.get("priority_questions")
+        required_evidence = payload.get("required_evidence")
+        if not isinstance(scenario_mandate, str) or not scenario_mandate.strip():
+            raise ValueError("scenario_mandate must be a non-empty string")
+        for field_name, value in {
+            "scenario_focus": scenario_focus,
+            "priority_questions": priority_questions,
+            "required_evidence": required_evidence,
+        }.items():
+            if not isinstance(value, list) or not all(isinstance(item, str) and item.strip() for item in value):
+                raise ValueError(f"{field_name} must contain non-empty strings")
+        return base.model_copy(
+            update={
+                "synthesis_status": "generated",
+                "scenario_mandate": scenario_mandate.strip(),
+                "scenario_focus": scenario_focus,
+                "priority_questions": priority_questions,
+                "required_evidence": required_evidence,
+                "applicable_primary_sources": base.primary_sources,
+                "applicable_constraints": base.constraints,
+                "applicable_owned_checks": base.owned_checks,
+                "llm_model": config.model,
+                "latency_ms": (perf_counter() - started_at) * 1000,
+                "token_usage": tokens,
+            }
+        )
+    except Exception as error:
+        code: Literal["CONFIGURATION_ERROR", "PROVIDER_ERROR", "EMPTY_CONTENT", "INVALID_JSON", "SCHEMA_ERROR"] = (
+            "CONFIGURATION_ERROR"
+            if isinstance(error, ValueError) and "configuration" in str(error)
+            else "PROVIDER_ERROR"
+        )
+        if isinstance(error, ValueError) and "JSON" in str(error):
+            code = "INVALID_JSON"
+        elif isinstance(error, ValueError) and ("scenario_" in str(error) or "required_evidence" in str(error)):
+            code = "SCHEMA_ERROR"
+        elif isinstance(error, ValueError) and "text content" in str(error):
+            code = "EMPTY_CONTENT"
+        return base.model_copy(
+            update={
+                "latency_ms": (perf_counter() - started_at) * 1000,
+                "error": MandateSynthesisError(
+                    code=code,
+                    message=f"{type(error).__name__}: mandate synthesis failed",
+                    retryable=code in {"PROVIDER_ERROR", "EMPTY_CONTENT"},
+                ),
+            }
+        )
 
 
-@app.post("/api/scenarios/{scenario_id}/domain-rules", response_model=DomainRulesResponse)
-def generate_domain_rules(scenario_id: int) -> DomainRulesResponse:
-    with SessionLocal() as session:
-        scenario = session.get(Scenario, scenario_id)
-        if scenario is None:
-            raise HTTPException(status_code=404, detail="Scenario not found")
-        agents = list(session.scalars(select(Agent).order_by(Agent.id)))
-        if not agents:
-            raise HTTPException(status_code=409, detail="At least one agent is required")
-        return DomainRulesResponse(
-            scenario_id=scenario_id,
-            revision=_agent_revision(agents),
-            generated=True,
-            stale=False,
-            agent_count=len(agents),
-            rules=_combined_domain_rules(agents, scenario),
-            agent_rules=_agent_domain_rules(agents),
+@app.post(
+    "/api/scenarios/{scenario_id}/domain-rules",
+    response_model=DomainRulesResponse,
+    responses={
+        404: {"content": {"application/json": {}}},
+        409: {"content": {"application/json": {}}},
+        502: {"content": {"application/json": {}}},
+        500: {"content": {"application/json": {}}},
+    },
+)
+def generate_domain_rules(scenario_id: int) -> DomainRulesResponse | JSONResponse:
+    try:
+        with SessionLocal() as session:
+            scenario = session.get(Scenario, scenario_id)
+            if scenario is None:
+                return JSONResponse(
+                    status_code=404,
+                    content={"success": False, "detail": "Scenario not found"},
+                )
+            agents = list(session.scalars(select(Agent).order_by(Agent.id)))
+            if not agents:
+                return JSONResponse(
+                    status_code=409,
+                    content={"success": False, "detail": "At least one agent is required"},
+                )
+            agent_rules = [_synthesize_agent_domain_rules(agent, scenario) for agent in agents]
+            generated_count = sum(rule.synthesis_status == "generated" for rule in agent_rules)
+            failure_count = len(agent_rules) - generated_count
+            if generated_count == 0:
+                return JSONResponse(
+                    status_code=502,
+                    content={
+                        "success": False,
+                        "detail": "All agent mandate synthesis calls failed",
+                        "agent_rules": [rule.model_dump(mode="json") for rule in agent_rules],
+                    },
+                )
+            response_status: Literal["success", "partial"] = (
+                "partial" if failure_count else "success"
+            )
+            return DomainRulesResponse(
+                scenario_id=scenario_id,
+                revision=_agent_revision(agents, scenario),
+                generated=True,
+                stale=False,
+                agent_count=len(agents),
+                rules=_combined_domain_rules(agents, scenario),
+                agent_rules=agent_rules,
+                status=response_status,
+                generated_count=generated_count,
+                failure_count=failure_count,
+                detail=(
+                    f"Generated {generated_count} scenario mandates; {failure_count} agents use local fallback."
+                    if failure_count
+                    else f"Generated {generated_count} scenario-specific mandates."
+                ),
+            )
+    except Exception as error:
+        return JSONResponse(
+            status_code=500,
+            content={
+                "success": False,
+                "detail": f"Mandate generation failed: {type(error).__name__}",
+            },
         )
 
 
@@ -440,12 +627,16 @@ def get_domain_rules(scenario_id: int) -> DomainRulesResponse:
         agents = list(session.scalars(select(Agent).order_by(Agent.id)))
         return DomainRulesResponse(
             scenario_id=scenario_id,
-            revision=_agent_revision(agents),
+            revision=_agent_revision(agents, scenario),
             generated=False,
             stale=True,
             agent_count=len(agents),
             rules={},
             agent_rules=[],
+            status="missing",
+            generated_count=0,
+            failure_count=0,
+            detail="Generate scenario-specific mandates before starting deliberation.",
         )
 
 

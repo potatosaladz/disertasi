@@ -1,3 +1,4 @@
+import json
 import uuid
 from collections.abc import Iterator
 from typing import Any
@@ -209,13 +210,37 @@ def test_agent_can_be_deleted_before_research_records(client: TestClient) -> Non
     assert client.delete(f"/api/agents/{response.json()['id']}").status_code == 404
 
 
-def test_domain_rules_aggregate_template_agents(client: TestClient) -> None:
+def test_domain_rules_aggregate_template_agents(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class FakeCompletions:
+        def create(self, **_kwargs: object) -> object:
+            content = json.dumps(
+                {
+                    "scenario_mandate": "Evaluate scenario-specific revenue legality and timing.",
+                    "scenario_focus": ["Revenue timing"],
+                    "priority_questions": ["Is the offset verified?"],
+                    "required_evidence": ["Collection schedule"],
+                }
+            )
+            message = type("Message", (), {"content": content})()
+            choice = type("Choice", (), {"message": message})()
+            return type("Response", (), {"choices": [choice], "usage": None})()
+
+    class FakeClient:
+        def __init__(self, **_kwargs: object) -> None:
+            self.chat = type("Chat", (), {"completions": FakeCompletions()})()
+
+    monkeypatch.setattr("backend.main.OpenAI", FakeClient)
     template_agent = client.post(
         "/api/agents",
         json={
             "name": f"rules-revenue-{uuid.uuid4()}",
             "role": "Penerimaan Negara",
             "template_key": "revenue",
+            "llm_base_url": "https://revenue.example/v1",
+            "llm_api_key": "revenue-secret",
+            "llm_model": "revenue-model",
         },
     )
     scenario = client.post(
@@ -249,7 +274,21 @@ def test_domain_rules_aggregate_template_agents(client: TestClient) -> None:
         "primary_sources": list(STANDARD_APBN_AGENT_TEMPLATES[0].primary_sources),
         "constraints": list(STANDARD_APBN_AGENT_TEMPLATES[0].constraints),
         "owned_checks": list(STANDARD_APBN_AGENT_TEMPLATES[0].owned_checks),
+        "synthesis_status": "generated",
+        "scenario_mandate": "Evaluate scenario-specific revenue legality and timing.",
+        "scenario_focus": ["Revenue timing"],
+        "priority_questions": ["Is the offset verified?"],
+        "required_evidence": ["Collection schedule"],
+        "applicable_primary_sources": list(STANDARD_APBN_AGENT_TEMPLATES[0].primary_sources),
+        "applicable_constraints": list(STANDARD_APBN_AGENT_TEMPLATES[0].constraints),
+        "applicable_owned_checks": list(STANDARD_APBN_AGENT_TEMPLATES[0].owned_checks),
+        "llm_model": "revenue-model",
+        "latency_ms": pytest.approx(revenue_rules["latency_ms"]),
+        "token_usage": 0,
+        "error": None,
     }
+    assert payload["status"] == "success"
+    assert payload["generated_count"] == 1
 
     with SessionLocal() as session:
         session.delete(session.get(Scenario, scenario.json()["id"]))
@@ -257,13 +296,77 @@ def test_domain_rules_aggregate_template_agents(client: TestClient) -> None:
         session.commit()
 
 
-def test_domain_rules_include_custom_agent_mandate(client: TestClient) -> None:
+def test_domain_rules_returns_json_when_all_synthesis_calls_fail(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class FailingCompletions:
+        def create(self, **_kwargs: object) -> object:
+            raise RuntimeError("provider unavailable")
+
+    class FailingClient:
+        def __init__(self, **_kwargs: object) -> None:
+            self.chat = type("Chat", (), {"completions": FailingCompletions()})()
+
+    monkeypatch.setattr("backend.main.OpenAI", FailingClient)
+    agent = client.post(
+        "/api/agents",
+        json={
+            "name": f"failed-rules-{uuid.uuid4()}",
+            "role": "Failure Test",
+            "llm_base_url": "https://failed.example/v1",
+            "llm_api_key": "failed-secret",
+            "llm_model": "failed-model",
+        },
+    )
+    scenario = client.post(
+        "/api/scenarios",
+        json={"description": "Provider failure scenario"},
+    )
+
+    response = client.post(f"/api/scenarios/{scenario.json()['id']}/domain-rules")
+
+    assert response.status_code == 502
+    assert response.headers["content-type"].startswith("application/json")
+    assert response.json()["success"] is False
+    assert response.json()["detail"] == "All agent mandate synthesis calls failed"
+
+    with SessionLocal() as session:
+        session.delete(session.get(Scenario, scenario.json()["id"]))
+        session.delete(session.get(Agent, agent.json()["id"]))
+        session.commit()
+
+
+def test_domain_rules_include_custom_agent_mandate(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class FakeCompletions:
+        def create(self, **_kwargs: object) -> object:
+            content = json.dumps(
+                {
+                    "scenario_mandate": "Review scenario distributional impacts.",
+                    "scenario_focus": ["Beneficiary distribution"],
+                    "priority_questions": ["Who bears the cost?"],
+                    "required_evidence": ["Distributional data"],
+                }
+            )
+            message = type("Message", (), {"content": content})()
+            choice = type("Choice", (), {"message": message})()
+            return type("Response", (), {"choices": [choice], "usage": None})()
+
+    class FakeClient:
+        def __init__(self, **_kwargs: object) -> None:
+            self.chat = type("Chat", (), {"completions": FakeCompletions()})()
+
+    monkeypatch.setattr("backend.main.OpenAI", FakeClient)
     custom_agent = client.post(
         "/api/agents",
         json={
             "name": f"rules-custom-{uuid.uuid4()}",
             "role": "Custom Reviewer",
             "system_prompt": "Review distributional effects and cite supplied evidence.",
+            "llm_base_url": "https://custom.example/v1",
+            "llm_api_key": "custom-secret",
+            "llm_model": "custom-model",
         },
     )
     scenario = client.post(

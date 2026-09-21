@@ -7,6 +7,7 @@ from backend.core_algorithms import (
     HardConstraints,
     build_agent_user_prompt,
     build_consensus_prompt,
+    build_mandate_synthesis_prompt,
     calculate_dynamic_influence,
     build_agent_system_prompt,
     calculate_violation_rate,
@@ -37,6 +38,21 @@ def test_extract_json_object_cleans_markdown_and_surrounding_text() -> None:
     assert extract_json_object('Result follows: {"status": "ok"} done') == {"status": "ok"}
     with pytest.raises(ValueError, match="does not contain"):
         extract_json_object("not-json")
+
+
+def test_mandate_synthesis_prompt_contains_seed_and_scenario() -> None:
+    prompt = build_mandate_synthesis_prompt(
+        "Revenue Agent",
+        "Revenue",
+        "Assess a targeted support programme.",
+        25.0,
+        3.0,
+        {"constraints": ["Verified offsets only"], "primary_sources": ["LAW-1"]},
+    )
+    assert "LOCAL SEED CONTRACT" in prompt
+    assert "targeted support programme" in prompt
+    assert "Verified offsets only" in prompt
+    assert "never invent" in prompt
 
 
 def test_build_agent_system_prompt_injects_mandate() -> None:

@@ -327,6 +327,33 @@ STANDARD_APBN_AGENT_TEMPLATES = tuple(AGENTS)
 _AGENT_SPECS_BY_KEY = {agent.key: agent for agent in AGENTS}
 
 
+def mandate_seed(agent: Agent) -> dict[str, Any]:
+    template = _AGENT_SPECS_BY_KEY.get(agent.template_key) if agent.template_key else None
+    if template is not None:
+        return {
+            "mandate": template.mandate,
+            "primary_sources": list(template.primary_sources),
+            "owned_checks": list(template.owned_checks),
+            "parameters": list(template.parameters),
+            "constraints": list(template.constraints),
+            "impact_dimensions": list(template.impact_dimensions),
+            "risk_dimensions": list(template.risk_dimensions),
+            "uncertainty_dimensions": list(template.uncertainty_dimensions),
+            "decision_principles": list(template.decision_principles),
+        }
+    return {
+        "mandate": agent.system_prompt or "",
+        "primary_sources": [],
+        "owned_checks": [],
+        "parameters": [],
+        "constraints": [],
+        "impact_dimensions": [],
+        "risk_dimensions": [],
+        "uncertainty_dimensions": [],
+        "decision_principles": [],
+    }
+
+
 def get_agent_spec(template_key: str | None) -> AgentSpec | None:
     if template_key is None:
         return None

@@ -120,17 +120,16 @@ def response_payload(
     )
 
 
-def test_extract_llm_response_requires_provider_usage() -> None:
-    with pytest.raises(ValueError, match="usage metadata"):
-        _extract_llm_response('{"evidence": []}')
-    content, tokens = _extract_llm_response(
-        {
-            "choices": [{"message": {"content": '{"recommendation": {}}'}}],
-            "usage": {"total_tokens": 17},
-        }
-    )
-    assert content == '{"recommendation": {}}'
-    assert tokens == 17
+def test_extract_llm_response_accepts_missing_usage_metadata() -> None:
+    assert _extract_llm_response('{"evidence": []}') == ('{"evidence": []}', 0)
+    content, tokens = _extract_llm_response({"choices": [{"message": {"content": "{}"}}]})
+    assert content == "{}"
+    assert tokens == 0
+
+
+def test_extract_llm_response_rejects_missing_content() -> None:
+    with pytest.raises(ValueError, match="no text content"):
+        _extract_llm_response({})
 
 
 def test_sparse_srr_response_uses_defaults_and_allows_extra_fields() -> None:

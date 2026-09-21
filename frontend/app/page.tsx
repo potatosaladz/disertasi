@@ -79,8 +79,8 @@ type Dashboard = {
 };
 type RunLog = { stage: string; level: string; message: string };
 type RunState = { task_id: string; status: string; logs: RunLog[]; result?: { metric_snapshot_id: number } | null; error?: string };
-type AgentDomainRules = { agent_id: number; name: string; role: string; template_key: string | null; mandate: string | null; primary_sources: string[]; constraints: string[]; owned_checks: string[] };
-type DomainRules = { scenario_id: number; revision: string; generated: boolean; stale: boolean; agent_count: number; rules: { hard_constraints?: string[]; owned_checks?: string[]; principles?: string[]; primary_sources?: string[]; automatic_deficit_ceiling?: number }; agent_rules: AgentDomainRules[] };
+type AgentDomainRules = { agent_id: number; name: string; role: string; template_key: string | null; mandate: string | null; primary_sources: string[]; constraints: string[]; owned_checks: string[]; synthesis_status: "generated" | "fallback"; scenario_mandate: string | null; scenario_focus: string[]; priority_questions: string[]; required_evidence: string[]; llm_model: string | null; token_usage: number | null; error: { code: string; message: string } | null };
+type DomainRules = { scenario_id: number; revision: string; generated: boolean; stale: boolean; agent_count: number; rules: { hard_constraints?: string[]; owned_checks?: string[]; principles?: string[]; primary_sources?: string[]; automatic_deficit_ceiling?: number }; agent_rules: AgentDomainRules[]; status: "success" | "partial" | "failed" | "stale" | "missing"; generated_count: number; failure_count: number; detail: string | null };
 type AgentForm = Omit<Agent, "id" | "has_llm_api_key" | "template_key" | "system_prompt"> & { llm_api_key: string };
 type ScenarioForm = Omit<Scenario, "id" | "max_deficit_constraint">;
 
@@ -119,7 +119,7 @@ function RuleList({ title, items, empty }: { title: string; items: string[]; emp
 }
 
 function AgentMandateCard({ rules, index }: { rules: AgentDomainRules; index: number }) {
-  return <details className="agent-mandate-card" open={index === 0}><summary><div><span>{String(index + 1).padStart(2, "0")} / {rules.template_key?.toUpperCase() ?? "CUSTOM"}</span><strong>{rules.name}</strong><small>{rules.role}</small></div><b>{rules.primary_sources.length} sources · {rules.constraints.length} constraints</b></summary><div className="agent-mandate-body"><section className="mandate-copy"><span>MANDATE</span><p>{rules.mandate ?? "Mandat terstruktur belum tersedia untuk agen ini."}</p></section><div className="agent-rule-columns"><RuleList title="PRIMARY SOURCES" items={rules.primary_sources} empty="Tidak ada sumber primer terstruktur." /><RuleList title="CONSTRAINTS" items={rules.constraints} empty="Tidak ada constraint terstruktur." /><RuleList title="OWNED CHECKS" items={rules.owned_checks} empty="Tidak ada owned checks terstruktur." /></div></div></details>;
+  return <details className="agent-mandate-card" open={index === 0}><summary><div><span>{String(index + 1).padStart(2, "0")} / {rules.template_key?.toUpperCase() ?? "CUSTOM"} / {rules.synthesis_status.toUpperCase()}</span><strong>{rules.name}</strong><small>{rules.role}</small></div><b>{rules.primary_sources.length} sources · {rules.constraints.length} constraints</b></summary><div className="agent-mandate-body">{rules.scenario_mandate && <section className="mandate-copy"><span>LLM SCENARIO MANDATE</span><p>{rules.scenario_mandate}</p></section>}<section className="mandate-copy"><span>AUTHORITATIVE LOCAL SEED</span><p>{rules.mandate ?? "Mandat terstruktur belum tersedia untuk agen ini."}</p></section>{rules.error && <section className="mandate-copy"><span>{rules.error.code}</span><p>{rules.error.message}</p></section>}<div className="agent-rule-columns"><RuleList title="SCENARIO FOCUS" items={rules.scenario_focus} empty="LLM synthesis fallback aktif." /><RuleList title="PRIORITY QUESTIONS" items={rules.priority_questions} empty="Belum ada pertanyaan hasil sintesis." /><RuleList title="REQUIRED EVIDENCE" items={rules.required_evidence} empty="Belum ada bukti tambahan hasil sintesis." /><RuleList title="PRIMARY SOURCES" items={rules.primary_sources} empty="Tidak ada sumber primer terstruktur." /><RuleList title="CONSTRAINTS" items={rules.constraints} empty="Tidak ada constraint terstruktur." /><RuleList title="OWNED CHECKS" items={rules.owned_checks} empty="Tidak ada owned checks terstruktur." /></div></div></details>;
 }
 
 export default function Home() {
@@ -291,9 +291,33 @@ export default function Home() {
     setRulesBusy(true);
     try {
       const response = await fetch(`${apiUrl}/api/scenarios/${selectedScenario}/domain-rules`, { method: "POST" });
-      const payload = await response.json(); if (!response.ok) throw new Error(payload.detail ?? "Mandat gagal dibuat");
-      setDomainRules(payload); setMandateLogs((current) => [...current, { stage: "MANDATE", level: "SUCCESS", message: `Revision ${payload.revision} generated from ${payload.agent_count} agents.` }, { stage: "CONSTRAINTS", level: "INFO", message: `${payload.rules.hard_constraints?.length ?? 0} constraints and ${payload.rules.owned_checks?.length ?? 0} owned checks consolidated.` }]); setNotice(`Mandat terstruktur dibuat untuk ${payload.agent_count} agen.`);
-    } catch (error) { const message = error instanceof Error ? error.message : "Mandat gagal dibuat"; setMandateLogs((current) => [...current, { stage: "MANDATE", level: "ERROR", message }]); setNotice(message); } finally { setRulesBusy(false); }
+      if (!response.ok) {
+        const rawError = await response.text();
+        let message = rawError || `Mandat gagal dibuat (${response.status})`;
+        try {
+          const parsedError = JSON.parse(rawError);
+          message = typeof parsedError.detail === "string" ? parsedError.detail : parsedError.detail?.message ?? parsedError.message ?? message;
+        } catch {}
+        throw new Error(message);
+      }
+      const rawPayload = await response.text();
+      let payload: DomainRules;
+      try {
+        payload = JSON.parse(rawPayload) as DomainRules;
+      } catch {
+        throw new Error(rawPayload || "Respons sukses generate mandat bukan JSON yang valid");
+      }
+      if (!payload.generated) throw new Error(payload.detail ?? "Backend tidak menandai mandat sebagai generated");
+      setDomainRules({ ...payload, generated: true, stale: false });
+      setMandateLogs((current) => [...current, { stage: "MANDATE", level: payload.status === "partial" ? "WARNING" : "SUCCESS", message: payload.detail ?? `Generated ${payload.generated_count ?? 0} mandates.` }]);
+      setNotice(payload.detail ?? "Mandat dinamis berhasil dibuat.");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Mandat gagal dibuat";
+      setMandateLogs((current) => [...current, { stage: "MANDATE", level: "ERROR", message }]);
+      setNotice(message);
+    } finally {
+      setRulesBusy(false);
+    }
   }
 
   async function submitScenario(event: FormEvent<HTMLFormElement>) {
@@ -328,7 +352,7 @@ export default function Home() {
   const activeLogs = trackerHistory.length ? trackerHistory : [{ stage: "IDLE", level: "INFO", message: "Awaiting task dispatch." }];
   const selectedTemplateData = templates.find((item) => item.key === selectedTemplate);
   const canGenerateRules = selectedScenario !== null && agents.length > 0;
-  const rulesAreStale = canGenerateRules && (!domainRules || domainRules.agent_count !== agents.length);
+  const rulesAreStale = canGenerateRules && (!domainRules || !domainRules.generated || domainRules.stale || domainRules.agent_count !== agents.length);
   const activeInfluence = useMemo(() => [...(dashboard?.influence_observations ?? [])].sort((a, b) => (b.normalized_weight ?? 0) - (a.normalized_weight ?? 0)), [dashboard]);
 
   return <main className="shell dashboard-shell">

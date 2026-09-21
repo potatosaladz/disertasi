@@ -44,9 +44,13 @@ def _log(stage: str, level: str, message: str) -> dict[str, str]:
     return {"stage": stage, "level": level, "message": message}
 
 
+def _safe_token_usage(value: object) -> int:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
+
+
 def _extract_llm_response(response: object) -> tuple[str, int]:
     if isinstance(response, str):
-        raise ValueError("LLM SDK response omitted provider usage metadata")
+        return response, 0
     if isinstance(response, dict):
         content = response.get("content")
         if content is None:
@@ -61,9 +65,7 @@ def _extract_llm_response(response: object) -> tuple[str, int]:
             raise ValueError("LLM response dictionary has no text content")
         usage = response.get("usage")
         tokens = usage.get("total_tokens") if isinstance(usage, dict) else None
-        if not isinstance(tokens, int) or tokens <= 0:
-            raise ValueError("LLM response omitted positive total token usage")
-        return content, tokens
+        return content, _safe_token_usage(tokens)
     choices = getattr(response, "choices", None)
     if not choices:
         raise ValueError(f"Unsupported LLM response type: {type(response).__name__}")
@@ -72,9 +74,7 @@ def _extract_llm_response(response: object) -> tuple[str, int]:
         raise ValueError("LLM returned no text content")
     usage = getattr(response, "usage", None)
     tokens = getattr(usage, "total_tokens", None) if usage else None
-    if not isinstance(tokens, int) or tokens <= 0:
-        raise ValueError("LLM response omitted positive total token usage")
-    return content, tokens
+    return content, _safe_token_usage(tokens)
 
 
 def _create_llm_completion(
