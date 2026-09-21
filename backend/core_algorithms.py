@@ -1,4 +1,5 @@
 import json
+import logging
 import math
 import os
 import re
@@ -6,6 +7,15 @@ import warnings
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, TypeVar
+from urllib.parse import urlsplit, urlunsplit
+
+LLM_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+LLM_HEADERS = {
+    "Content-Type": "application/json",
+    "User-Agent": LLM_USER_AGENT,
+    "Accept": "application/json",
+}
+logger = logging.getLogger(__name__)
 
 DDR_COMPONENT_FIELDS = {
     "dE": "E",
@@ -62,6 +72,71 @@ def extract_json_object(raw_content: str) -> dict[str, Any]:
     return payload
 
 
+def llm_request_headers() -> dict[str, str]:
+    return dict(LLM_HEADERS)
+
+
+def safe_llm_target(base_url: str) -> str:
+    parsed = urlsplit(base_url)
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
+
+
+def log_llm_outbound(
+    operation: str,
+    agent_name: str,
+    base_url: str,
+    model: str,
+    payload: Mapping[str, object],
+) -> None:
+    logger.info(
+        "Outbound LLM request operation=%s agent=%s target=%s model=%s payload=%s",
+        operation,
+        agent_name,
+        safe_llm_target(base_url),
+        model,
+        json.dumps(dict(payload), ensure_ascii=False, default=str),
+    )
+
+
+def extract_llm_completion(response: object) -> tuple[str, int]:
+    content: object = None
+    usage_value: object = None
+    if isinstance(response, str):
+        content = response
+    elif isinstance(response, Mapping):
+        content = response.get("content")
+        if content is None:
+            choices = response.get("choices")
+            if isinstance(choices, Sequence) and not isinstance(choices, (str, bytes)) and choices:
+                choice = choices[0]
+                if isinstance(choice, Mapping):
+                    message = choice.get("message")
+                    if isinstance(message, Mapping):
+                        content = message.get("content")
+        usage = response.get("usage")
+        usage_value = usage.get("total_tokens") if isinstance(usage, Mapping) else None
+    else:
+        choices = getattr(response, "choices", None)
+        if not choices:
+            direct_content = getattr(response, "content", None)
+            if isinstance(direct_content, str):
+                content = direct_content
+            else:
+                raise ValueError(f"Unsupported LLM response type: {type(response).__name__}")
+        else:
+            content = getattr(getattr(choices[0], "message", None), "content", None)
+        usage = getattr(response, "usage", None)
+        usage_value = getattr(usage, "total_tokens", None) if usage else None
+    if not isinstance(content, str) or not content.strip():
+        raise ValueError("LLM returned no text content")
+    token_usage = (
+        usage_value
+        if isinstance(usage_value, int) and not isinstance(usage_value, bool) and usage_value >= 0
+        else 0
+    )
+    return content, token_usage
+
+
 @dataclass(frozen=True)
 class LLMRuntimeConfig:
     base_url: str
@@ -116,8 +191,8 @@ def resolve_llm_runtime_config(agent: object) -> LLMRuntimeConfig:
         raise ValueError("LLM base_url must use http:// or https://")
     return LLMRuntimeConfig(
         base_url=base_url,
-        api_key=resolved["api_key"],
-        model=resolved["model"],
+        api_key=str(resolved["api_key"]),
+        model=str(resolved["model"]),
     )
 
 

@@ -18,6 +18,9 @@ from backend.core_algorithms import (
     calculate_violation_rate,
     detect_divergence_vector,
     extract_json_object,
+    extract_llm_completion,
+    llm_request_headers,
+    log_llm_outbound,
     neuro_symbolic_filter,
     resolve_llm_runtime_config,
     validate_decision_artifacts,
@@ -44,49 +47,34 @@ def _log(stage: str, level: str, message: str) -> dict[str, str]:
     return {"stage": stage, "level": level, "message": message}
 
 
-def _safe_token_usage(value: object) -> int:
-    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
-
-
 def _extract_llm_response(response: object) -> tuple[str, int]:
-    if isinstance(response, str):
-        return response, 0
-    if isinstance(response, dict):
-        content = response.get("content")
-        if content is None:
-            choices = response.get("choices")
-            if isinstance(choices, list) and choices:
-                choice = choices[0]
-                if isinstance(choice, dict):
-                    message = choice.get("message")
-                    if isinstance(message, dict):
-                        content = message.get("content")
-        if not isinstance(content, str):
-            raise ValueError("LLM response dictionary has no text content")
-        usage = response.get("usage")
-        tokens = usage.get("total_tokens") if isinstance(usage, dict) else None
-        return content, _safe_token_usage(tokens)
-    choices = getattr(response, "choices", None)
-    if not choices:
-        raise ValueError(f"Unsupported LLM response type: {type(response).__name__}")
-    content = getattr(getattr(choices[0], "message", None), "content", None)
-    if not isinstance(content, str):
-        raise ValueError("LLM returned no text content")
-    usage = getattr(response, "usage", None)
-    tokens = getattr(usage, "total_tokens", None) if usage else None
-    return content, _safe_token_usage(tokens)
+    return extract_llm_completion(response)
 
 
 def _create_llm_completion(
     agent: Agent,
     messages: list[ChatCompletionMessageParam],
+    operation: str,
 ) -> tuple[str, int]:
     config = resolve_llm_runtime_config(agent)
+    log_llm_outbound(
+        operation,
+        agent.name,
+        config.base_url,
+        config.model,
+        {
+            "temperature": agent.temperature,
+            "max_tokens": agent.max_tokens,
+            "messages": messages,
+            "response_format": {"type": "json_object"},
+        },
+    )
     response = OpenAI(
         api_key=config.api_key,
         base_url=config.base_url,
         timeout=60.0,
         max_retries=2,
+        default_headers=llm_request_headers(),
     ).chat.completions.create(
         model=config.model,
         temperature=agent.temperature,
@@ -118,6 +106,7 @@ def _default_llm_call(agent: Agent, scenario: Scenario) -> tuple[str, int]:
                 ),
             },
         ],
+        "agent_reasoning",
     )
 
 
@@ -152,6 +141,7 @@ def _default_consensus_call(
                 ),
             },
         ],
+        "consensus_review",
     )
 
 

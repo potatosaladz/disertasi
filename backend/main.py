@@ -5,7 +5,7 @@ import warnings
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from time import perf_counter
-from typing import Literal
+from typing import Any, Literal
 
 from fastapi import FastAPI, HTTPException, Response, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -23,6 +23,9 @@ from .agent_templates import (
 from .core_algorithms import (
     build_mandate_synthesis_prompt,
     extract_json_object,
+    extract_llm_completion,
+    llm_request_headers,
+    log_llm_outbound,
     resolve_llm_runtime_config,
 )
 from .dashboard import router as dashboard_router
@@ -337,21 +340,30 @@ def test_agent_connection(agent_id: int) -> LLMConnectionTestResponse:
             config = resolve_llm_runtime_config(agent)
             model = config.model
             base_url = config.base_url
+            messages: list[Any] = [
+                {"role": "system", "content": "Reply with exactly: OK"},
+                {"role": "user", "content": "Connection test"},
+            ]
+            log_llm_outbound(
+                "connection_test",
+                agent.name,
+                config.base_url,
+                config.model,
+                {"messages": messages, "temperature": 0, "max_tokens": 8},
+            )
             response = OpenAI(
                 api_key=config.api_key,
                 base_url=config.base_url,
                 timeout=60.0,
                 max_retries=2,
+                default_headers=llm_request_headers(),
             ).chat.completions.create(
                 model=config.model,
-                messages=[
-                    {"role": "system", "content": "Reply with exactly: OK"},
-                    {"role": "user", "content": "Connection test"},
-                ],
+                messages=messages,
                 temperature=0,
                 max_tokens=8,
             )
-            content = response if isinstance(response, str) else response.choices[0].message.content
+            content, _ = extract_llm_completion(response)
             return LLMConnectionTestResponse(
                 agent_id=agent.id,
                 ok=True,
@@ -432,18 +444,6 @@ def _base_agent_domain_rules(agent: Agent) -> AgentDomainRules:
     )
 
 
-def _extract_completion(response: object) -> tuple[str, int]:
-    choices = getattr(response, "choices", None)
-    if not choices:
-        raise ValueError("LLM returned no completion choices")
-    content = getattr(getattr(choices[0], "message", None), "content", None)
-    if not isinstance(content, str) or not content.strip():
-        raise ValueError("LLM returned no text content")
-    usage = getattr(response, "usage", None)
-    tokens = getattr(usage, "total_tokens", None) if usage else None
-    return content, tokens if isinstance(tokens, int) and tokens >= 0 else 0
-
-
 def _synthesize_agent_domain_rules(agent: Agent, scenario: Scenario) -> AgentDomainRules:
     base = _base_agent_domain_rules(agent)
     started_at = perf_counter()
@@ -454,17 +454,11 @@ def _synthesize_agent_domain_rules(agent: Agent, scenario: Scenario) -> AgentDom
         for warning in configuration_warnings:
             logger.warning("Mandate synthesis configuration: %s", warning.message)
         seed = mandate_seed(agent)
-        response = OpenAI(
-            api_key=config.api_key,
-            base_url=config.base_url,
-            timeout=60.0,
-            max_retries=2,
-        ).chat.completions.create(
-            model=config.model,
-            temperature=agent.temperature,
-            max_tokens=agent.max_tokens,
-            response_format={"type": "json_object"},
-            messages=[
+        request_payload: dict[str, Any] = {
+            "temperature": agent.temperature,
+            "max_tokens": agent.max_tokens,
+            "response_format": {"type": "json_object"},
+            "messages": [
                 {
                     "role": "system",
                     "content": "Expand an authoritative fiscal seed into a scenario-specific operating mandate.",
@@ -481,8 +475,28 @@ def _synthesize_agent_domain_rules(agent: Agent, scenario: Scenario) -> AgentDom
                     ),
                 },
             ],
+        }
+        log_llm_outbound(
+            "mandate_synthesis",
+            agent.name,
+            config.base_url,
+            config.model,
+            request_payload,
         )
-        content, tokens = _extract_completion(response)
+        response = OpenAI(
+            api_key=config.api_key,
+            base_url=config.base_url,
+            timeout=60.0,
+            max_retries=2,
+            default_headers=llm_request_headers(),
+        ).chat.completions.create(
+            model=config.model,
+            temperature=agent.temperature,
+            max_tokens=agent.max_tokens,
+            response_format={"type": "json_object"},
+            messages=request_payload["messages"],
+        )
+        content, tokens = extract_llm_completion(response)
         payload = extract_json_object(content)
         scenario_mandate = payload.get("scenario_mandate")
         scenario_focus = payload.get("scenario_focus")

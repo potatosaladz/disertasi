@@ -295,6 +295,11 @@ def test_domain_rules_aggregate_template_agents(
         "base_url": "https://revenue.example/v1",
         "timeout": 60.0,
         "max_retries": 2,
+        "default_headers": {
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "application/json",
+        },
     }
     assert payload["status"] == "success"
     assert payload["generated_count"] == 1
@@ -351,6 +356,11 @@ def test_domain_rules_uses_environment_fallback(
         "base_url": "https://environment.example/v1",
         "timeout": 60.0,
         "max_retries": 2,
+        "default_headers": {
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "application/json",
+        },
     }
     assert response.json()["agent_rules"][0]["llm_model"] == "environment-model"
 

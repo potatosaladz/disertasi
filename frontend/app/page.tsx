@@ -153,6 +153,11 @@ export default function Home() {
     if (additions.length) setTrackerHistory((current) => [...current, ...additions]);
   }
 
+  function appendQueueLog(taskId: string, logs: RunLog[]) {
+    setTrackerHistory((current) => [...current, ...logs]);
+    trackerLogCounts.current[taskId] = 0;
+  }
+
   async function loadTemplates() {
     const response = await fetch("/api/agent-templates", { cache: "no-store" });
     if (!response.ok) throw new Error(`Template API returned ${response.status}`);
@@ -336,7 +341,7 @@ export default function Home() {
     const payload = await response.json();
     if (!response.ok) { setNotice(payload.detail ?? "Could not queue cycle"); return; }
     setRun({ task_id: payload.task_id, status: payload.status, logs: payload.logs });
-    appendTrackerLogs(payload.task_id, payload.logs);
+    appendQueueLog(payload.task_id, payload.logs);
     setNotice(`Task ${payload.task_id.slice(0, 8)} queued on Celery.`);
   }
 

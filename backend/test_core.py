@@ -9,6 +9,8 @@ from backend.core_algorithms import (
     build_consensus_prompt,
     build_mandate_synthesis_prompt,
     calculate_dynamic_influence,
+    extract_llm_completion,
+    llm_request_headers,
     build_agent_system_prompt,
     calculate_violation_rate,
     detect_divergence_vector,
@@ -38,6 +40,19 @@ def test_extract_json_object_cleans_markdown_and_surrounding_text() -> None:
     assert extract_json_object('Result follows: {"status": "ok"} done') == {"status": "ok"}
     with pytest.raises(ValueError, match="does not contain"):
         extract_json_object("not-json")
+
+
+def test_llm_headers_and_completion_extraction() -> None:
+    headers = llm_request_headers()
+    assert headers["Content-Type"] == "application/json"
+    assert headers["Accept"] == "application/json"
+    assert headers["User-Agent"].startswith("Mozilla/5.0")
+    assert extract_llm_completion("direct response") == ("direct response", 0)
+    assert extract_llm_completion({"content": "mapping response"}) == ("mapping response", 0)
+    direct = type("DirectResponse", (), {"content": "provider direct content", "usage": None})()
+    assert extract_llm_completion(direct) == ("provider direct content", 0)
+    with pytest.raises(ValueError, match="no text content"):
+        extract_llm_completion({"choices": []})
 
 
 def test_runtime_config_uses_environment_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
