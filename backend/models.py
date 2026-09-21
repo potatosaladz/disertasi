@@ -32,6 +32,13 @@ class ConvergenceStatus(str, enum.Enum):
 
 class Agent(Base):
     __tablename__ = "agents"
+    __table_args__ = (
+        CheckConstraint(
+            "temperature >= 0 AND temperature <= 2",
+            name="ck_agent_temperature_range",
+        ),
+        CheckConstraint("max_tokens > 0", name="ck_agent_max_tokens_positive"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     name: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
@@ -41,6 +48,12 @@ class Agent(Base):
     theta_h: Mapped[float] = mapped_column(Float, nullable=False, default=1.0, server_default="1.0")
     theta_s: Mapped[float] = mapped_column(Float, nullable=False, default=1.0, server_default="1.0")
     theta_u: Mapped[float] = mapped_column(Float, nullable=False, default=1.0, server_default="1.0")
+    llm_base_url: Mapped[str | None] = mapped_column(String(2048))
+    llm_api_key: Mapped[str | None] = mapped_column(String(4096))
+    llm_model: Mapped[str | None] = mapped_column(String(255))
+    system_prompt: Mapped[str | None] = mapped_column(Text)
+    temperature: Mapped[float] = mapped_column(Float, nullable=False, default=0.2, server_default="0.2")
+    max_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=4000, server_default="4000")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 

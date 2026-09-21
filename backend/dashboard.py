@@ -7,6 +7,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import aliased
 
 from .celery_client import celery_client
+from .core_algorithms import build_agent_system_prompt
 from .database import SessionLocal
 from .models import (
     Agent,
@@ -221,13 +222,19 @@ def reproducibility_manifest(scenario_id: int) -> JSONResponse:
                     "theta_h": agent.theta_h,
                     "theta_s": agent.theta_s,
                     "theta_u": agent.theta_u,
+                    "llm_base_url": agent.llm_base_url,
+                    "llm_model": agent.llm_model,
+                    "system_prompt": agent.system_prompt,
+                    "temperature": agent.temperature,
+                    "max_tokens": agent.max_tokens,
+                    "has_llm_api_key": bool(agent.llm_api_key),
                 }
                 for agent in agents
             ],
             "prompts": [
                 {
                     "agent_id": agent.id,
-                    "system": "Return only a typed SRR JSON object with source-tagged artifacts.",
+                    "system": build_agent_system_prompt(agent.role, agent.system_prompt),
                     "user": f"Agent role: {agent.role}\nScenario: {dashboard['scenario']['description']}",
                 }
                 for agent in agents

@@ -15,6 +15,24 @@ DDR_COMPONENT_FIELDS = {
 }
 T = TypeVar("T")
 
+SRR_OUTPUT_INSTRUCTIONS = (
+    "Return only an SRR JSON object containing evidence, assumptions, predictions, risks, "
+    "uncertainties, objectives, constraints, alternatives, recommendation, confidence, and "
+    "material_information_retention_macro_f1. Every typed item must contain content and an "
+    "optional source_tag. Every alternative must contain name, deficit, utility, and optional "
+    "source_tag. Analyze impacts, risks, uncertainties, objections, conditions, and adjustments "
+    "within the agent's fiscal mandate. Do not reveal hidden chain-of-thought; provide only typed, "
+    "inspectable artifacts."
+)
+
+
+def build_agent_system_prompt(role: str, mandate: str | None) -> str:
+    sections = [f"Functional fiscal role: {role}."]
+    if mandate and mandate.strip():
+        sections.append(f"Agent-specific mandate and decision principles:\n{mandate.strip()}")
+    sections.append(SRR_OUTPUT_INSTRUCTIONS)
+    return "\n\n".join(sections)
+
 
 @dataclass(frozen=True)
 class Alternative:

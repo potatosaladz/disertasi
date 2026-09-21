@@ -29,6 +29,64 @@ def test_agent_theta_u_zero_persists(client: TestClient) -> None:
         session.commit()
 
 
+def test_agent_heterogeneous_llm_config_create_and_update(client: TestClient) -> None:
+    name = f"heterogeneous-{uuid.uuid4()}"
+    response = client.post(
+        "/agents",
+        json={
+            "name": name,
+            "role": "State Revenue Agent",
+            "llm_base_url": "https://revenue-llm.example/v1",
+            "llm_api_key": "revenue-secret",
+            "llm_model": "revenue-specialist-v2",
+            "system_prompt": "Prioritize sustainable state revenue and tax compliance.",
+            "temperature": 0.1,
+            "max_tokens": 2500,
+        },
+    )
+    assert response.status_code == 201
+    payload = response.json()
+    assert payload["llm_model"] == "revenue-specialist-v2"
+    assert payload["has_llm_api_key"] is True
+    assert "llm_api_key" not in payload
+
+    updated = client.put(
+        f"/agents/{payload['id']}",
+        json={
+            "llm_base_url": "https://revenue-llm.example/v2",
+            "llm_api_key": "rotated-secret",
+            "llm_model": "revenue-specialist-v3",
+            "system_prompt": "Evaluate impacts, risks, objections, conditions, and adjustments.",
+            "temperature": 0.3,
+            "max_tokens": 3200,
+        },
+    )
+    assert updated.status_code == 200
+    assert updated.json()["llm_base_url"].endswith("/v2")
+    assert updated.json()["temperature"] == 0.3
+
+    with SessionLocal() as session:
+        saved = session.get(Agent, payload["id"])
+        assert saved is not None
+        assert saved.llm_api_key == "rotated-secret"
+        assert saved.max_tokens == 3200
+        session.delete(saved)
+        session.commit()
+
+
+def test_agent_rejects_invalid_generation_settings(client: TestClient) -> None:
+    response = client.post(
+        "/agents",
+        json={
+            "name": f"invalid-generation-{uuid.uuid4()}",
+            "role": "Invalid",
+            "temperature": 2.1,
+            "max_tokens": 0,
+        },
+    )
+    assert response.status_code == 422
+
+
 def test_scenario_hard_constraint_persists(client: TestClient) -> None:
     response = client.post("/api/scenarios", json={"description": "Phase 4 API verification scenario", "max_deficit_constraint": 3.25})
     assert response.status_code == 201

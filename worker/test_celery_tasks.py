@@ -13,7 +13,7 @@ from backend.models import (
     ReasoningLog,
     Scenario,
 )
-from worker.celery_tasks import execute_full_shcr_cycle
+from worker.celery_tasks import _default_llm_call, execute_full_shcr_cycle
 
 
 @pytest.fixture
@@ -115,6 +115,54 @@ def response_payload(
             "material_information_retention_macro_f1": 0.9,
         }
     )
+
+
+def test_default_llm_call_uses_agent_configuration(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeCompletions:
+        def create(self, **kwargs: object) -> object:
+            captured["request"] = kwargs
+            message = type("Message", (), {"content": "{}"})()
+            choice = type("Choice", (), {"message": message})()
+            usage = type("Usage", (), {"total_tokens": 42})()
+            return type("Response", (), {"choices": [choice], "usage": usage})()
+
+    class FakeClient:
+        def __init__(self, **kwargs: object) -> None:
+            captured["client"] = kwargs
+            self.chat = type("Chat", (), {"completions": FakeCompletions()})()
+
+    monkeypatch.setattr("worker.celery_tasks.OpenAI", FakeClient)
+    agent = Agent(
+        name="heterogeneous-test",
+        role="Government Expenditure Agent",
+        llm_base_url="https://expenditure.example/v1",
+        llm_api_key="agent-secret",
+        llm_model="fiscal-model-xl",
+        system_prompt="Protect spending quality and evaluate fiscal adjustment options.",
+        temperature=0.35,
+        max_tokens=1800,
+    )
+    scenario = Scenario(description="Evaluate subsidy reform", max_deficit_constraint=3.0)
+
+    content, tokens = _default_llm_call(agent, scenario)
+
+    assert content == "{}"
+    assert tokens == 42
+    assert captured["client"] == {
+        "api_key": "agent-secret",
+        "base_url": "https://expenditure.example/v1",
+    }
+    request = captured["request"]
+    assert isinstance(request, dict)
+    assert request["model"] == "fiscal-model-xl"
+    assert request["temperature"] == 0.35
+    assert request["max_tokens"] == 1800
+    messages = request["messages"]
+    assert isinstance(messages, list)
+    assert "Government Expenditure Agent" in messages[0]["content"]
+    assert "fiscal adjustment options" in messages[0]["content"]
 
 
 def test_run_full_shcr_cycle_populates_postgres(scenario_id: int) -> None:

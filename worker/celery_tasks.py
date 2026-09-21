@@ -3,7 +3,7 @@ import logging
 import os
 from collections.abc import Callable
 from time import perf_counter
-from typing import Any
+from typing import Any, cast
 
 from openai import OpenAI
 from pydantic import ValidationError
@@ -11,6 +11,7 @@ from sqlalchemy import select
 
 from backend.core_algorithms import (
     HardConstraints,
+    build_agent_system_prompt,
     calculate_dynamic_influence,
     calculate_violation_rate,
     detect_divergence_vector,
@@ -34,22 +35,20 @@ ProgressReporter = Callable[[list[str]], None]
 
 
 def _default_llm_call(agent: Agent, scenario: Scenario) -> tuple[str, int]:
-    client = OpenAI(
-        api_key=os.getenv("OPENAI_API_KEY", "local-llm"),
-        base_url=os.getenv("OPENAI_BASE_URL", "http://host.docker.internal:11434/v1"),
+    base_url = agent.llm_base_url or os.getenv(
+        "OPENAI_BASE_URL", "http://host.docker.internal:11434/v1"
     )
+    api_key = agent.llm_api_key or os.getenv("OPENAI_API_KEY", "local-llm")
+    model = cast(str, agent.llm_model or os.getenv("OPENAI_MODEL") or "local-model")
+    client = OpenAI(api_key=api_key, base_url=base_url)
     response = client.chat.completions.create(
-        model=os.getenv("OPENAI_MODEL", "local-model"),
+        model=model,
+        temperature=agent.temperature,
+        max_tokens=agent.max_tokens,
         messages=[
             {
                 "role": "system",
-                "content": (
-                    "Return only an SRR JSON object containing evidence, assumptions, "
-                    "predictions, risks, uncertainties, objectives, constraints, alternatives, "
-                    "recommendation, confidence, and material_information_retention_macro_f1. "
-                    "Every typed item must contain content and an optional source_tag. Every "
-                    "alternative must contain name, deficit, utility, and optional source_tag."
-                ),
+                "content": build_agent_system_prompt(agent.role, agent.system_prompt),
             },
             {
                 "role": "user",

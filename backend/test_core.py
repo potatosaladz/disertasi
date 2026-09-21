@@ -6,6 +6,7 @@ from backend.core_algorithms import (
     Alternative,
     HardConstraints,
     calculate_dynamic_influence,
+    build_agent_system_prompt,
     calculate_violation_rate,
     detect_divergence_vector,
     neuro_symbolic_filter,
@@ -26,6 +27,18 @@ def make_agent(*, uncertainty: float = 0.0, gate: int = 1) -> dict[str, float | 
         "U": uncertainty,
         "g_i": gate,
     }
+
+
+def test_build_agent_system_prompt_injects_mandate() -> None:
+    prompt = build_agent_system_prompt(
+        "State Revenue Agent",
+        "Prioritize revenue resilience and evaluate objections.",
+    )
+
+    assert "State Revenue Agent" in prompt
+    assert "revenue resilience" in prompt
+    assert "impacts, risks, uncertainties, objections, conditions, and adjustments" in prompt
+    assert "Do not reveal hidden chain-of-thought" in prompt
 
 
 def test_rar_dai_zero_gate() -> None:

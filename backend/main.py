@@ -22,10 +22,47 @@ class AgentCreate(BaseModel):
     theta_h: float = Field(default=1.0, ge=0.0, allow_inf_nan=False)
     theta_s: float = Field(default=1.0, ge=0.0, allow_inf_nan=False)
     theta_u: float = Field(default=1.0, ge=0.0, allow_inf_nan=False)
+    llm_base_url: str | None = Field(default=None, max_length=2048)
+    llm_api_key: str | None = Field(default=None, max_length=4096)
+    llm_model: str | None = Field(default=None, max_length=255)
+    system_prompt: str | None = None
+    temperature: float = Field(default=0.2, ge=0.0, le=2.0, allow_inf_nan=False)
+    max_tokens: int = Field(default=4000, gt=0)
 
 
-class AgentResponse(AgentCreate):
+class AgentUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str | None = Field(default=None, min_length=1, max_length=255)
+    role: str | None = Field(default=None, min_length=1, max_length=255)
+    theta_x: float | None = Field(default=None, ge=0.0, allow_inf_nan=False)
+    theta_q: float | None = Field(default=None, ge=0.0, allow_inf_nan=False)
+    theta_h: float | None = Field(default=None, ge=0.0, allow_inf_nan=False)
+    theta_s: float | None = Field(default=None, ge=0.0, allow_inf_nan=False)
+    theta_u: float | None = Field(default=None, ge=0.0, allow_inf_nan=False)
+    llm_base_url: str | None = Field(default=None, max_length=2048)
+    llm_api_key: str | None = Field(default=None, max_length=4096)
+    llm_model: str | None = Field(default=None, max_length=255)
+    system_prompt: str | None = None
+    temperature: float | None = Field(default=None, ge=0.0, le=2.0, allow_inf_nan=False)
+    max_tokens: int | None = Field(default=None, gt=0)
+
+
+class AgentResponse(BaseModel):
     id: int
+    name: str
+    role: str
+    theta_x: float
+    theta_q: float
+    theta_h: float
+    theta_s: float
+    theta_u: float
+    llm_base_url: str | None
+    llm_model: str | None
+    system_prompt: str | None
+    temperature: float
+    max_tokens: int
+    has_llm_api_key: bool
 
 
 class ScenarioCreate(BaseModel):
@@ -49,6 +86,12 @@ def agent_response(agent: Agent) -> AgentResponse:
         theta_h=agent.theta_h,
         theta_s=agent.theta_s,
         theta_u=agent.theta_u,
+        llm_base_url=agent.llm_base_url,
+        llm_model=agent.llm_model,
+        system_prompt=agent.system_prompt,
+        temperature=agent.temperature,
+        max_tokens=agent.max_tokens,
+        has_llm_api_key=bool(agent.llm_api_key),
     )
 
 
@@ -90,6 +133,7 @@ async def health() -> dict[str, str]:
 
 
 @app.post("/api/agents", response_model=AgentResponse, status_code=status.HTTP_201_CREATED)
+@app.post("/agents", response_model=AgentResponse, status_code=status.HTTP_201_CREATED)
 def create_agent(payload: AgentCreate) -> AgentResponse:
     with SessionLocal() as session:
         existing = session.scalar(select(Agent).where(Agent.name == payload.name))
@@ -97,6 +141,32 @@ def create_agent(payload: AgentCreate) -> AgentResponse:
             raise HTTPException(status_code=409, detail="Agent name already exists")
         agent = Agent(**payload.model_dump())
         session.add(agent)
+        session.commit()
+        session.refresh(agent)
+        return agent_response(agent)
+
+
+@app.put("/api/agents/{agent_id}", response_model=AgentResponse)
+@app.put("/agents/{agent_id}", response_model=AgentResponse)
+def update_agent(agent_id: int, payload: AgentUpdate) -> AgentResponse:
+    with SessionLocal() as session:
+        agent = session.get(Agent, agent_id)
+        if agent is None:
+            raise HTTPException(status_code=404, detail="Agent not found")
+        existing = (
+            session.scalar(
+                select(Agent).where(Agent.name == payload.name, Agent.id != agent_id)
+            )
+            if payload.name is not None
+            else None
+        )
+        if existing is not None:
+            raise HTTPException(status_code=409, detail="Agent name already exists")
+        updates = payload.model_dump(exclude_unset=True)
+        if updates.get("llm_api_key") == "":
+            updates.pop("llm_api_key")
+        for field, value in updates.items():
+            setattr(agent, field, value)
         session.commit()
         session.refresh(agent)
         return agent_response(agent)
