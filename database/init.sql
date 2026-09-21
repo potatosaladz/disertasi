@@ -1,6 +1,7 @@
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
 ALTER TABLE IF EXISTS agents
+    ADD COLUMN IF NOT EXISTS template_key VARCHAR(100),
     ADD COLUMN IF NOT EXISTS llm_base_url VARCHAR(2048),
     ADD COLUMN IF NOT EXISTS llm_api_key VARCHAR(4096),
     ADD COLUMN IF NOT EXISTS llm_model VARCHAR(255),
@@ -11,6 +12,8 @@ ALTER TABLE IF EXISTS agents
 DO $$
 BEGIN
     IF to_regclass('public.agents') IS NOT NULL THEN
+        CREATE UNIQUE INDEX IF NOT EXISTS ix_agents_template_key
+            ON agents (template_key) WHERE template_key IS NOT NULL;
         IF NOT EXISTS (
             SELECT 1 FROM pg_constraint WHERE conname = 'ck_agent_temperature_range'
         ) THEN

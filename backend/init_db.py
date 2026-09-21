@@ -5,6 +5,7 @@ from .models import Agent
 
 _AGENT_COLUMNS: dict[str, str] = {
     "llm_base_url": "VARCHAR(2048)",
+    "template_key": "VARCHAR(100) UNIQUE",
     "llm_api_key": "VARCHAR(4096)",
     "llm_model": "VARCHAR(255)",
     "system_prompt": "TEXT",
@@ -22,6 +23,10 @@ def _upgrade_agents_table() -> None:
         for name, definition in _AGENT_COLUMNS.items():
             if name not in existing:
                 connection.execute(text(f'ALTER TABLE agents ADD COLUMN "{name}" {definition}'))
+        connection.execute(text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS ix_agents_template_key "
+            "ON agents (template_key) WHERE template_key IS NOT NULL"
+        ))
         connection.execute(
             text(
                 """

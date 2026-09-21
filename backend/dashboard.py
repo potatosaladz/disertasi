@@ -217,6 +217,7 @@ def reproducibility_manifest(scenario_id: int) -> JSONResponse:
                     "id": agent.id,
                     "name": agent.name,
                     "role": agent.role,
+                    "template_key": agent.template_key,
                     "theta_x": agent.theta_x,
                     "theta_q": agent.theta_q,
                     "theta_h": agent.theta_h,

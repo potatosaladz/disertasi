@@ -6,6 +6,7 @@ type Agent = {
   id: number;
   name: string;
   role: string;
+  template_key: string | null;
   theta_x: number;
   theta_q: number;
   theta_h: number;
@@ -17,6 +18,20 @@ type Agent = {
   temperature: number;
   max_tokens: number;
   has_llm_api_key: boolean;
+};
+type AgentTemplate = {
+  key: string;
+  name: string;
+  role: string;
+  description: string;
+  system_prompt: string;
+  temperature: number;
+  max_tokens: number;
+  theta_x: number;
+  theta_q: number;
+  theta_h: number;
+  theta_s: number;
+  theta_u: number;
 };
 type Scenario = { id: number; description: string; max_deficit_constraint: number };
 type Metric = {
@@ -55,7 +70,7 @@ type Dashboard = {
   influence_observations: Influence[];
 };
 type RunState = { task_id: string; status: string; logs: string[]; result?: { metric_snapshot_id: number } | null; error?: string };
-type AgentForm = Omit<Agent, "id" | "has_llm_api_key"> & { llm_api_key: string };
+type AgentForm = Omit<Agent, "id" | "has_llm_api_key" | "template_key"> & { llm_api_key: string };
 type ScenarioForm = Omit<Scenario, "id">;
 
 const apiUrl = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
@@ -78,7 +93,7 @@ const initialAgent: AgentForm = {
 const initialScenario: ScenarioForm = { description: "", max_deficit_constraint: 3 };
 
 function NumericField({ label, value, onChange, hint }: { label: string; value: number; onChange: (value: number) => void; hint: string }) {
-  return <label className="field"><span>{label}</span><input type="number" min="0" step="0.01" value={value} onChange={(event) => onChange(Number(event.target.value))} required /><small>{hint}</small></label>;
+  return <label className="form-field"><strong>{label}</strong><input type="number" min="0" step="0.01" value={value} onChange={(event) => onChange(Number(event.target.value))} required /><small>{hint}</small></label>;
 }
 
 function MetricCard({ label, value, unit, tone }: { label: string; value: string; unit?: string; tone?: string }) {
@@ -89,6 +104,8 @@ export default function Home() {
   const [agent, setAgent] = useState<AgentForm>(initialAgent);
   const [scenario, setScenario] = useState<ScenarioForm>(initialScenario);
   const [agents, setAgents] = useState<Agent[]>([]);
+  const [templates, setTemplates] = useState<AgentTemplate[]>([]);
+  const [selectedTemplate, setSelectedTemplate] = useState("");
   const [scenarios, setScenarios] = useState<Scenario[]>([]);
   const [selectedScenario, setSelectedScenario] = useState<number | null>(null);
   const [dashboard, setDashboard] = useState<Dashboard | null>(null);
@@ -97,12 +114,18 @@ export default function Home() {
   const [busy, setBusy] = useState(false);
 
   async function loadSetup() {
-    const [agentResponse, scenarioResponse] = await Promise.all([fetch(`${apiUrl}/api/agents`), fetch(`${apiUrl}/api/scenarios`)]);
-    if (!agentResponse.ok || !scenarioResponse.ok) throw new Error("API unavailable");
+    const [agentResponse, scenarioResponse, templateResponse] = await Promise.all([
+      fetch(`${apiUrl}/api/agents`),
+      fetch(`${apiUrl}/api/scenarios`),
+      fetch(`${apiUrl}/api/agent-templates`),
+    ]);
+    if (!agentResponse.ok || !scenarioResponse.ok || !templateResponse.ok) throw new Error("API unavailable");
     const nextAgents: Agent[] = await agentResponse.json();
     const nextScenarios: Scenario[] = await scenarioResponse.json();
+    const nextTemplates: AgentTemplate[] = await templateResponse.json();
     setAgents(nextAgents);
     setScenarios(nextScenarios);
+    setTemplates(nextTemplates);
     if (selectedScenario === null && nextScenarios.length > 0) setSelectedScenario(nextScenarios[nextScenarios.length - 1].id);
   }
 
@@ -130,6 +153,40 @@ export default function Home() {
     return () => window.clearInterval(timer);
   }, [run, selectedScenario]);
 
+  function applyTemplate(key: string) {
+    setSelectedTemplate(key);
+    const template = templates.find((item) => item.key === key);
+    if (!template) return;
+    setAgent({
+      ...agent,
+      name: template.name,
+      role: template.role,
+      system_prompt: template.system_prompt,
+      temperature: template.temperature,
+      max_tokens: template.max_tokens,
+      theta_x: template.theta_x,
+      theta_q: template.theta_q,
+      theta_h: template.theta_h,
+      theta_s: template.theta_s,
+      theta_u: template.theta_u,
+    });
+  }
+
+  async function loadAllTemplates() {
+    setBusy(true);
+    try {
+      const response = await fetch(`${apiUrl}/api/agents/load-templates`, { method: "POST" });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.detail ?? "Template agents could not be loaded");
+      await loadSetup();
+      setNotice(`${payload.created} template baru dimuat; ${payload.total} template APBN siap digunakan.`);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "Template agents could not be loaded");
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function submitAgent(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); setBusy(true);
     try {
@@ -142,7 +199,7 @@ export default function Home() {
       };
       const response = await fetch(`${apiUrl}/api/agents`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(agentPayload) });
       const payload = await response.json(); if (!response.ok) throw new Error(payload.detail ?? "Agent could not be saved");
-      setAgent(initialAgent); await loadSetup(); setNotice(`Agent ${payload.name} committed. ΘU = ${payload.theta_u}.`);
+      setAgent(initialAgent); setSelectedTemplate(""); await loadSetup(); setNotice(`Agent ${payload.name} committed. ΘU = ${payload.theta_u}.`);
     } catch (error) { setNotice(error instanceof Error ? error.message : "Agent could not be saved"); } finally { setBusy(false); }
   }
 
@@ -191,7 +248,53 @@ export default function Home() {
 
     <section id="analytics" className="analytics-section"><div className="section-header"><div><span className="section-number">05</span><h2>Decision Analytics</h2></div><button className="export-button" onClick={exportManifest}>↓ Export reproducibility manifest</button></div><div className="convergence-banner"><div><span>FINAL CONVERGENCE STATE</span><strong>{latest?.convergence_status ?? "AWAITING CYCLE"}</strong></div><div className="convergence-meta"><span>FEASIBLE ALTERNATIVES</span><b>{latest?.feasible_alternatives_count ?? "—"}</b></div></div><div className="metric-grid"><MetricCard label="Hard-constraint violation rate" value={latest ? latest.hard_constraint_violation_rate.toFixed(2) : "—"} unit="%" tone="rust" /><MetricCard label="Provenance completeness" value={latest ? latest.provenance_completeness_percent.toFixed(2) : "—"} unit="%" /><MetricCard label="Schema validity" value={dashboard ? dashboard.schema_validity_percent.toFixed(2) : "—"} unit="%" tone="mint" /><MetricCard label="Latency / token usage" value={latest ? latest.latency_ms.toFixed(0) : "—"} unit={latest ? `ms · ${latest.token_usage} tok` : ""} /></div><div className="analytics-lower"><div className="history-block"><div className="subhead"><span>METRIC SNAPSHOT HISTORY</span><b>{dashboard?.metric_history.length ?? 0} RUNS</b></div>{dashboard?.metric_history.length ? dashboard.metric_history.slice(0, 5).map((metric) => <div className="history-row" key={metric.id}><span>#{metric.id}</span><strong>{metric.convergence_status}</strong><i>{metric.provenance_completeness_percent.toFixed(1)}% provenance</i><b>{new Date(metric.created_at).toLocaleTimeString()}</b></div>) : <p className="empty">Metric history will appear after the first completed cycle.</p>}</div><div className="influence-block"><div className="subhead"><span>RAR-DAI INFLUENCE RANKING</span><b>{activeInfluence.length} OBSERVATIONS</b></div>{activeInfluence.length ? activeInfluence.slice(0, 4).map((item, index) => <div className="weight-row" key={`${item.agent}-${item.proposition}`}><span>{String(index + 1).padStart(2, "0")}</span><div><strong>{item.agent}</strong><small>{item.proposition}</small></div><b>{item.normalized_weight === null ? "—" : `${(item.normalized_weight * 100).toFixed(1)}%`}</b></div>) : <p className="empty">No influence observations recorded for this scenario.</p>}</div></div></section>
 
-    <section id="setup" className="setup-summary"><div><span className="section-number">01 / 02</span><h2>Heterogeneous Agent Setup</h2><p>Each agent can use its own OpenAI-compatible endpoint, model, mandate, and generation policy.</p></div><div className="setup-actions"><form onSubmit={submitAgent}><input placeholder="Agent name" value={agent.name} onChange={(event) => setAgent({ ...agent, name: event.target.value })} required /><input placeholder="Role / APBN mandate" value={agent.role} onChange={(event) => setAgent({ ...agent, role: event.target.value })} required /><input placeholder="Custom LLM Base URL" value={agent.llm_base_url ?? ""} onChange={(event) => setAgent({ ...agent, llm_base_url: event.target.value })} /><input placeholder="Model name" value={agent.llm_model ?? ""} onChange={(event) => setAgent({ ...agent, llm_model: event.target.value })} /><input placeholder="API key (stored securely)" type="password" value={agent.llm_api_key} onChange={(event) => setAgent({ ...agent, llm_api_key: event.target.value })} /><input aria-label="Temperature" type="number" min="0" max="2" step="0.01" value={agent.temperature} onChange={(event) => setAgent({ ...agent, temperature: Number(event.target.value) })} /><input aria-label="Max tokens" type="number" min="1" step="1" value={agent.max_tokens} onChange={(event) => setAgent({ ...agent, max_tokens: Number(event.target.value) })} /><input aria-label="Theta U" type="number" min="0" step="0.01" value={agent.theta_u} onChange={(event) => setAgent({ ...agent, theta_u: Number(event.target.value) })} /><textarea className="mandate-input" placeholder="System prompt / mandate / domain principles" value={agent.system_prompt ?? ""} onChange={(event) => setAgent({ ...agent, system_prompt: event.target.value })} rows={4} /><button className="secondary-button" disabled={busy}>Add heterogeneous agent</button></form><form onSubmit={submitScenario}><input placeholder="Scenario description" value={scenario.description} onChange={(event) => setScenario({ ...scenario, description: event.target.value })} required /><input aria-label="Maximum deficit" type="number" min="0" step="0.01" value={scenario.max_deficit_constraint} onChange={(event) => setScenario({ ...scenario, max_deficit_constraint: Number(event.target.value) })} /><button className="secondary-button" disabled={busy}>Add scenario / C_H</button></form></div></section>
+    <section id="setup" className="setup-section">
+      <div className="section-header"><div><span className="section-number">01 / 02</span><h2>Heterogeneous Agent Studio</h2></div><button type="button" className="template-load-button" onClick={loadAllTemplates} disabled={busy}>Muat 5 template APBN</button></div>
+      <p className="setup-intro">Pilih template untuk mengisi mandat otomatis, lalu sesuaikan identitas, koneksi model, kebijakan generasi, dan bobot RAR-DAI sebelum menyimpan agen.</p>
+      <form className="agent-config-form" onSubmit={submitAgent}>
+        <fieldset className="form-card">
+          <legend><span>01</span> Identitas &amp; Peran Agen</legend>
+          <div className="form-grid two-column">
+            <label className="form-field"><strong>Template Agen APBN</strong><select value={selectedTemplate} onChange={(event) => applyTemplate(event.target.value)}><option value="">Mulai dari konfigurasi kosong</option>{templates.map((template) => <option key={template.key} value={template.key}>{template.name}</option>)}</select><small>Pilih mandat standar APBN atau isi konfigurasi agen secara mandiri.</small></label>
+            <label className="form-field"><strong>Nama Agen</strong><input value={agent.name} onChange={(event) => setAgent({ ...agent, name: event.target.value })} required /><small>Nama unik yang tampil pada deliberasi dan matriks DDR.</small></label>
+            <label className="form-field full-width"><strong>Peran Fungsional</strong><input value={agent.role} onChange={(event) => setAgent({ ...agent, role: event.target.value })} required /><small>Contoh: Penerimaan Negara, Belanja Pemerintah, atau Stabilisasi Makro-Fiskal.</small></label>
+          </div>
+          {selectedTemplate && <div className="template-note">{templates.find((item) => item.key === selectedTemplate)?.description}</div>}
+        </fieldset>
+
+        <fieldset className="form-card">
+          <legend><span>02</span> Konfigurasi LLM Mandiri</legend>
+          <div className="form-grid two-column">
+            <label className="form-field full-width"><strong>Custom LLM Base URL</strong><input type="url" value={agent.llm_base_url ?? ""} onChange={(event) => setAgent({ ...agent, llm_base_url: event.target.value })} /><small>Masukkan base URL OpenAI-compatible; biarkan kosong untuk menggunakan default dari .env.</small></label>
+            <label className="form-field"><strong>API Key Agen</strong><input type="password" autoComplete="new-password" value={agent.llm_api_key} onChange={(event) => setAgent({ ...agent, llm_api_key: event.target.value })} /><small>Kredensial khusus agen. Nilai tidak pernah dikembalikan oleh API.</small></label>
+            <label className="form-field"><strong>Model Name</strong><input value={agent.llm_model ?? ""} onChange={(event) => setAgent({ ...agent, llm_model: event.target.value })} /><small>Nama model provider; kosong berarti memakai OPENAI_MODEL default.</small></label>
+            <label className="form-field"><strong>Temperature</strong><input type="number" min="0" max="2" step="0.01" value={agent.temperature} onChange={(event) => setAgent({ ...agent, temperature: Number(event.target.value) })} required /><small>0 untuk stabilitas maksimum; rentang valid 0 sampai 2.</small></label>
+            <label className="form-field"><strong>Max Tokens</strong><input type="number" min="1" step="1" value={agent.max_tokens} onChange={(event) => setAgent({ ...agent, max_tokens: Number(event.target.value) })} required /><small>Batas token keluaran untuk satu respons deliberasi agen.</small></label>
+          </div>
+        </fieldset>
+
+        <fieldset className="form-card mandate-card">
+          <legend><span>03</span> Mandate / System Prompt</legend>
+          <label className="form-field"><strong>Mandat, Aturan Domain, dan Prinsip Penalaran</strong><textarea value={agent.system_prompt ?? ""} onChange={(event) => setAgent({ ...agent, system_prompt: event.target.value })} rows={9} required /><small>Instruksi ini diinjeksi ke system message untuk menjaga analisis dampak, risiko, ketidakpastian, keberatan, kondisi, dan penyesuaian sesuai fungsi APBN.</small></label>
+        </fieldset>
+
+        <fieldset className="form-card">
+          <legend><span>04</span> Bobot RAR-DAI</legend>
+          <div className="theta-form-grid">
+            <NumericField label="Theta X — Expertise" value={agent.theta_x} hint="Bobot kompetensi domain." onChange={(value) => setAgent({ ...agent, theta_x: value })} />
+            <NumericField label="Theta Q — Evidence" value={agent.theta_q} hint="Bobot kualitas bukti." onChange={(value) => setAgent({ ...agent, theta_q: value })} />
+            <NumericField label="Theta H — History" value={agent.theta_h} hint="Bobot rekam historis." onChange={(value) => setAgent({ ...agent, theta_h: value })} />
+            <NumericField label="Theta S — Relevance" value={agent.theta_s} hint="Bobot relevansi skenario." onChange={(value) => setAgent({ ...agent, theta_s: value })} />
+            <NumericField label="Theta U — Uncertainty" value={agent.theta_u} hint="Penalti ketidakpastian; isi 0 untuk A6." onChange={(value) => setAgent({ ...agent, theta_u: value })} />
+          </div>
+        </fieldset>
+        <button className="primary-button agent-submit" disabled={busy} type="submit">Simpan konfigurasi agen<span>↗</span></button>
+      </form>
+
+      <div className="agent-register"><div className="subhead"><span>AGEN TERSIMPAN</span><b>{agents.length} AGENTS</b></div>{agents.length ? agents.map((item) => <div className="agent-register-row" key={item.id}><div><strong>{item.name}</strong><small>{item.role}</small></div><span>{item.template_key ? "TEMPLATE" : "CUSTOM"}</span><b>{item.llm_model ?? "ENV DEFAULT"}</b></div>) : <p className="empty">Belum ada agen. Muat template APBN atau buat agen baru.</p>}</div>
+
+      <form className="scenario-config-form" onSubmit={submitScenario}><div><span className="section-number">SCENARIO</span><h3>Konfigurasi batas fiskal</h3></div><label className="form-field"><strong>Deskripsi Skenario</strong><textarea value={scenario.description} onChange={(event) => setScenario({ ...scenario, description: event.target.value })} rows={4} required /><small>Jelaskan keputusan fiskal, horizon waktu, dan ketegangan strategis.</small></label><label className="form-field"><strong>Maximum Deficit Constraint (%)</strong><input type="number" min="0" step="0.01" value={scenario.max_deficit_constraint} onChange={(event) => setScenario({ ...scenario, max_deficit_constraint: Number(event.target.value) })} required /><small>Kendala keras CAR; alternatif di atas nilai ini dinyatakan tidak feasible.</small></label><button className="secondary-button" disabled={busy}>Simpan skenario</button></form>
+    </section>
     <footer><span>STRUCTURED CONSENSUS / RESEARCH INSTRUMENT</span><span>SRR + (RAR → DAI) + DDR + CAR</span></footer>
   </main>;
 }

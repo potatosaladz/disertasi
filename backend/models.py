@@ -43,6 +43,7 @@ class Agent(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     name: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
     role: Mapped[str] = mapped_column(String(255), nullable=False)
+    template_key: Mapped[str | None] = mapped_column(String(100), unique=True)
     theta_x: Mapped[float] = mapped_column(Float, nullable=False, default=1.0, server_default="1.0")
     theta_q: Mapped[float] = mapped_column(Float, nullable=False, default=1.0, server_default="1.0")
     theta_h: Mapped[float] = mapped_column(Float, nullable=False, default=1.0, server_default="1.0")

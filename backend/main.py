@@ -6,6 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select, text
 
+from .agent_templates import load_standard_agent_templates, template_catalog
 from .dashboard import router as dashboard_router
 from .database import SessionLocal
 from .init_db import initialize_database
@@ -17,6 +18,7 @@ class AgentCreate(BaseModel):
 
     name: str = Field(min_length=1, max_length=255)
     role: str = Field(min_length=1, max_length=255)
+    template_key: str | None = Field(default=None, max_length=100)
     theta_x: float = Field(default=1.0, ge=0.0, allow_inf_nan=False)
     theta_q: float = Field(default=1.0, ge=0.0, allow_inf_nan=False)
     theta_h: float = Field(default=1.0, ge=0.0, allow_inf_nan=False)
@@ -35,6 +37,7 @@ class AgentUpdate(BaseModel):
 
     name: str | None = Field(default=None, min_length=1, max_length=255)
     role: str | None = Field(default=None, min_length=1, max_length=255)
+    template_key: str | None = Field(default=None, max_length=100)
     theta_x: float | None = Field(default=None, ge=0.0, allow_inf_nan=False)
     theta_q: float | None = Field(default=None, ge=0.0, allow_inf_nan=False)
     theta_h: float | None = Field(default=None, ge=0.0, allow_inf_nan=False)
@@ -52,6 +55,7 @@ class AgentResponse(BaseModel):
     id: int
     name: str
     role: str
+    template_key: str | None
     theta_x: float
     theta_q: float
     theta_h: float
@@ -81,6 +85,7 @@ def agent_response(agent: Agent) -> AgentResponse:
         id=agent.id,
         name=agent.name,
         role=agent.role,
+        template_key=agent.template_key,
         theta_x=agent.theta_x,
         theta_q=agent.theta_q,
         theta_h=agent.theta_h,
@@ -130,6 +135,22 @@ async def health() -> dict[str, str]:
     with SessionLocal() as session:
         session.execute(text("SELECT 1"))
     return {"status": "healthy", "database": "connected"}
+
+
+@app.get("/api/agent-templates")
+def list_agent_templates() -> list[dict[str, str | float | int]]:
+    return template_catalog()
+
+
+@app.post("/api/agents/load-templates")
+def load_agent_templates() -> dict[str, object]:
+    with SessionLocal() as session:
+        agents, created = load_standard_agent_templates(session)
+        return {
+            "created": created,
+            "total": len(agents),
+            "agents": [agent_response(agent).model_dump() for agent in agents],
+        }
 
 
 @app.post("/api/agents", response_model=AgentResponse, status_code=status.HTTP_201_CREATED)

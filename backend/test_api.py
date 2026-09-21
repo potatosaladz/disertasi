@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import delete, select
 
 from backend.celery_client import celery_client
+from backend.agent_templates import STANDARD_APBN_AGENT_TEMPLATES
 from backend.database import SessionLocal
 from backend.main import app
 from backend.models import Agent, DisagreementLog, MetricSnapshot, ReasoningLog, Scenario
@@ -26,6 +27,33 @@ def test_agent_theta_u_zero_persists(client: TestClient) -> None:
         saved = session.scalar(select(Agent).where(Agent.name == name))
         assert saved is not None and saved.theta_u == 0.0
         session.execute(delete(Agent).where(Agent.id == saved.id))
+        session.commit()
+
+
+def test_agent_templates_are_available_and_idempotent(client: TestClient) -> None:
+    response = client.get("/api/agent-templates")
+    assert response.status_code == 200
+    templates = response.json()
+    assert len(templates) == 5
+    assert {item["key"] for item in templates} == {
+        template.key for template in STANDARD_APBN_AGENT_TEMPLATES
+    }
+    assert all(item["system_prompt"] for item in templates)
+
+    first = client.post("/api/agents/load-templates")
+    second = client.post("/api/agents/load-templates")
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.json()["total"] == 5
+    assert second.json()["created"] == 0
+
+    with SessionLocal() as session:
+        template_names = [template.name for template in STANDARD_APBN_AGENT_TEMPLATES]
+        template_agents = list(session.scalars(select(Agent).where(Agent.name.in_(template_names))))
+        assert len(template_agents) == 5
+        assert all(agent.system_prompt for agent in template_agents)
+        for agent in template_agents:
+            session.execute(delete(Agent).where(Agent.id == agent.id))
         session.commit()
 
 
@@ -156,6 +184,7 @@ def test_dashboard_matrix_and_manifest(client: TestClient) -> None:
     assert manifest.status_code == 200
     manifest_payload = manifest.json()
     assert manifest_payload["agents"][0]["theta_u"] == 1.0
+    assert "llm_api_key" not in manifest_payload["agents"][0]
     assert manifest_payload["llm_outputs"][0]["raw_json"]["prompt"] in {"i", "j"}
     assert manifest_payload["metrics"][0]["convergence_status"] == "INFEASIBLE"
 
