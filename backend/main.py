@@ -6,7 +6,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select, text
 
-from .agent_templates import load_standard_agent_templates, template_catalog
+from .agent_templates import (
+    get_agent_spec,
+    load_standard_agent_templates,
+    template_catalog,
+)
 from .dashboard import router as dashboard_router
 from .database import SessionLocal
 from .init_db import initialize_database
@@ -73,7 +77,8 @@ class ScenarioCreate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     description: str = Field(min_length=1)
-    max_deficit_constraint: float = Field(ge=0.0, allow_inf_nan=False)
+    program_cost: float | None = Field(default=None, ge=0.0, allow_inf_nan=False)
+    max_deficit_constraint: float = Field(default=3.0, ge=0.0, allow_inf_nan=False)
 
 
 class ScenarioResponse(ScenarioCreate):
@@ -104,6 +109,7 @@ def scenario_response(scenario: Scenario) -> ScenarioResponse:
     return ScenarioResponse(
         id=scenario.id,
         description=scenario.description,
+        program_cost=scenario.program_cost,
         max_deficit_constraint=scenario.max_deficit_constraint,
     )
 
@@ -160,7 +166,13 @@ def create_agent(payload: AgentCreate) -> AgentResponse:
         existing = session.scalar(select(Agent).where(Agent.name == payload.name))
         if existing is not None:
             raise HTTPException(status_code=409, detail="Agent name already exists")
-        agent = Agent(**payload.model_dump())
+        values = payload.model_dump()
+        template = get_agent_spec(payload.template_key)
+        if payload.template_key is not None and template is None:
+            raise HTTPException(status_code=422, detail="Unknown agent template")
+        if template is not None:
+            values["system_prompt"] = template.system_prompt
+        agent = Agent(**values)
         session.add(agent)
         session.commit()
         session.refresh(agent)
@@ -184,6 +196,11 @@ def update_agent(agent_id: int, payload: AgentUpdate) -> AgentResponse:
         if existing is not None:
             raise HTTPException(status_code=409, detail="Agent name already exists")
         updates = payload.model_dump(exclude_unset=True)
+        template = get_agent_spec(updates.get("template_key", agent.template_key))
+        if updates.get("template_key") is not None and template is None:
+            raise HTTPException(status_code=422, detail="Unknown agent template")
+        if template is not None:
+            updates["system_prompt"] = template.system_prompt
         if updates.get("llm_api_key") == "":
             updates.pop("llm_api_key")
         for field, value in updates.items():

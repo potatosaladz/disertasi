@@ -3,6 +3,10 @@ from sqlalchemy import inspect, text
 from .database import engine
 from .models import Agent
 
+_SCENARIO_COLUMNS: dict[str, str] = {
+    "program_cost": "DOUBLE PRECISION",
+}
+
 _AGENT_COLUMNS: dict[str, str] = {
     "llm_base_url": "VARCHAR(2048)",
     "template_key": "VARCHAR(100) UNIQUE",
@@ -52,9 +56,36 @@ def _upgrade_agents_table() -> None:
         )
 
 
+def _upgrade_scenarios_table() -> None:
+    inspector = inspect(engine)
+    if "scenarios" not in inspector.get_table_names():
+        return
+    existing = {column["name"] for column in inspector.get_columns("scenarios")}
+    with engine.begin() as connection:
+        for name, definition in _SCENARIO_COLUMNS.items():
+            if name not in existing:
+                connection.execute(text(f'ALTER TABLE scenarios ADD COLUMN "{name}" {definition}'))
+        connection.execute(
+            text("ALTER TABLE scenarios ALTER COLUMN max_deficit_constraint SET DEFAULT 3.0")
+        )
+        connection.execute(
+            text(
+                "ALTER TABLE scenarios DROP CONSTRAINT IF EXISTS "
+                "ck_scenario_program_cost_nonnegative"
+            )
+        )
+        connection.execute(
+            text(
+                "ALTER TABLE scenarios ADD CONSTRAINT ck_scenario_program_cost_nonnegative "
+                "CHECK (program_cost IS NULL OR program_cost >= 0)"
+            )
+        )
+
+
 def initialize_database() -> None:
     Agent.metadata.create_all(bind=engine)
     _upgrade_agents_table()
+    _upgrade_scenarios_table()
 
 
 if __name__ == "__main__":

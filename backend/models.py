@@ -83,11 +83,16 @@ class Scenario(Base):
     __tablename__ = "scenarios"
     __table_args__ = (
         CheckConstraint("max_deficit_constraint >= 0", name="ck_scenario_max_deficit_nonnegative"),
+        CheckConstraint(
+            "program_cost IS NULL OR program_cost >= 0",
+            name="ck_scenario_program_cost_nonnegative",
+        ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     description: Mapped[str] = mapped_column(Text, nullable=False)
-    max_deficit_constraint: Mapped[float] = mapped_column(Float, nullable=False)
+    program_cost: Mapped[float | None] = mapped_column(Float)
+    max_deficit_constraint: Mapped[float] = mapped_column(Float, nullable=False, default=3.0, server_default="3.0")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 

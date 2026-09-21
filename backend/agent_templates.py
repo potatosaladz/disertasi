@@ -324,6 +324,18 @@ AGENTS: list[AgentSpec] = [
 ]
 
 STANDARD_APBN_AGENT_TEMPLATES = tuple(AGENTS)
+_AGENT_SPECS_BY_KEY = {agent.key: agent for agent in AGENTS}
+
+
+def get_agent_spec(template_key: str | None) -> AgentSpec | None:
+    if template_key is None:
+        return None
+    return _AGENT_SPECS_BY_KEY.get(template_key)
+
+
+def resolve_agent_system_prompt(agent: Agent) -> str | None:
+    template = get_agent_spec(agent.template_key)
+    return template.system_prompt if template is not None else agent.system_prompt
 
 
 def template_catalog() -> list[dict[str, Any]]:

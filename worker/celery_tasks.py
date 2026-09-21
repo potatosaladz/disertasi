@@ -9,6 +9,7 @@ from openai import OpenAI
 from pydantic import ValidationError
 from sqlalchemy import select
 
+from backend.agent_templates import resolve_agent_system_prompt
 from backend.core_algorithms import (
     HardConstraints,
     build_agent_system_prompt,
@@ -48,11 +49,19 @@ def _default_llm_call(agent: Agent, scenario: Scenario) -> tuple[str, int]:
         messages=[
             {
                 "role": "system",
-                "content": build_agent_system_prompt(agent.role, agent.system_prompt),
+                "content": build_agent_system_prompt(
+                    agent.role,
+                    resolve_agent_system_prompt(agent),
+                ),
             },
             {
                 "role": "user",
-                "content": f"Agent role: {agent.role}\nScenario: {scenario.description}",
+                "content": (
+                    f"Agent role: {agent.role}\n"
+                    f"Policy goal: {scenario.description}\n"
+                    f"Program cost: {scenario.program_cost if scenario.program_cost is not None else 'UNKNOWN'}\n"
+                    f"Automatic legal deficit ceiling: {scenario.max_deficit_constraint}%"
+                ),
             },
         ],
         response_format={"type": "json_object"},

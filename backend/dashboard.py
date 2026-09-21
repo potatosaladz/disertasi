@@ -6,6 +6,7 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import select
 from sqlalchemy.orm import aliased
 
+from .agent_templates import resolve_agent_system_prompt
 from .celery_client import celery_client
 from .core_algorithms import build_agent_system_prompt
 from .database import SessionLocal
@@ -102,6 +103,7 @@ def _dashboard_payload(scenario_id: int) -> dict[str, Any]:
             "scenario": {
                 "id": scenario.id,
                 "description": scenario.description,
+                "program_cost": scenario.program_cost,
                 "max_deficit_constraint": scenario.max_deficit_constraint,
             },
             "latest_metric": _metric_payload(snapshots[0]) if snapshots else None,
@@ -235,8 +237,17 @@ def reproducibility_manifest(scenario_id: int) -> JSONResponse:
             "prompts": [
                 {
                     "agent_id": agent.id,
-                    "system": build_agent_system_prompt(agent.role, agent.system_prompt),
-                    "user": f"Agent role: {agent.role}\nScenario: {dashboard['scenario']['description']}",
+                    "system": build_agent_system_prompt(
+                        agent.role,
+                        resolve_agent_system_prompt(agent),
+                    ),
+                    "user": (
+                        f"Agent role: {agent.role}\n"
+                        f"Policy goal: {dashboard['scenario']['description']}\n"
+                        f"Program cost: {dashboard['scenario']['program_cost']}\n"
+                        f"Automatic legal deficit ceiling: "
+                        f"{dashboard['scenario']['max_deficit_constraint']}%"
+                    ),
                 }
                 for agent in agents
             ],

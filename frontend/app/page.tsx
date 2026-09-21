@@ -41,7 +41,7 @@ type AgentTemplate = {
   theta_s: number;
   theta_u: number;
 };
-type Scenario = { id: number; description: string; max_deficit_constraint: number };
+type Scenario = { id: number; description: string; program_cost: number | null; max_deficit_constraint: number };
 type Metric = {
   id: number;
   hard_constraint_violation_rate: number;
@@ -78,8 +78,8 @@ type Dashboard = {
   influence_observations: Influence[];
 };
 type RunState = { task_id: string; status: string; logs: string[]; result?: { metric_snapshot_id: number } | null; error?: string };
-type AgentForm = Omit<Agent, "id" | "has_llm_api_key" | "template_key"> & { llm_api_key: string };
-type ScenarioForm = Omit<Scenario, "id">;
+type AgentForm = Omit<Agent, "id" | "has_llm_api_key" | "template_key" | "system_prompt"> & { llm_api_key: string };
+type ScenarioForm = Omit<Scenario, "id" | "max_deficit_constraint">;
 
 const apiUrl = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 const components = ["dE", "dA", "dP", "dR", "dU", "dO", "dC", "dREC"] as const;
@@ -94,11 +94,10 @@ const initialAgent: AgentForm = {
   llm_base_url: "",
   llm_api_key: "",
   llm_model: "",
-  system_prompt: "",
   temperature: 0.2,
   max_tokens: 4000,
 };
-const initialScenario: ScenarioForm = { description: "", max_deficit_constraint: 3 };
+const initialScenario: ScenarioForm = { description: "", program_cost: null };
 
 function NumericField({ label, value, onChange, hint }: { label: string; value: number; onChange: (value: number) => void; hint: string }) {
   return <label className="form-field"><strong>{label}</strong><input type="number" min="0" step="0.01" value={value} onChange={(event) => onChange(Number(event.target.value))} required /><small>{hint}</small></label>;
@@ -173,7 +172,6 @@ export default function Home() {
       ...agent,
       name: template.name,
       role: template.role,
-      system_prompt: template.system_prompt,
       temperature: template.temperature,
       max_tokens: template.max_tokens,
       theta_x: template.theta_x,
@@ -204,10 +202,10 @@ export default function Home() {
     try {
       const agentPayload = {
         ...agent,
+        template_key: selectedTemplate || null,
         llm_base_url: agent.llm_base_url || null,
         llm_api_key: agent.llm_api_key || null,
         llm_model: agent.llm_model || null,
-        system_prompt: agent.system_prompt || null,
       };
       const response = await fetch(`${apiUrl}/api/agents`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(agentPayload) });
       const payload = await response.json(); if (!response.ok) throw new Error(payload.detail ?? "Agent could not be saved");
@@ -220,7 +218,7 @@ export default function Home() {
     try {
       const response = await fetch(`${apiUrl}/api/scenarios`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(scenario) });
       const payload = await response.json(); if (!response.ok) throw new Error(payload.detail ?? "Scenario could not be saved");
-      setScenario(initialScenario); await loadSetup(); setSelectedScenario(payload.id); setNotice(`Scenario ${payload.id} committed with C_H = ${payload.max_deficit_constraint}%.`);
+      setScenario(initialScenario); await loadSetup(); setSelectedScenario(payload.id); setNotice(`Skenario ${payload.id} tersimpan; aturan hukum dan batas defisit diterapkan otomatis.`);
     } catch (error) { setNotice(error instanceof Error ? error.message : "Scenario could not be saved"); } finally { setBusy(false); }
   }
 
@@ -286,8 +284,8 @@ export default function Home() {
         </fieldset>
 
         <fieldset className="form-card mandate-card">
-          <legend><span>03</span> Mandate / System Prompt</legend>
-          <label className="form-field"><strong>Mandat, Aturan Domain, dan Prinsip Penalaran</strong><textarea value={agent.system_prompt ?? ""} onChange={(event) => setAgent({ ...agent, system_prompt: event.target.value })} rows={9} required /><small>Instruksi ini diinjeksi ke system message untuk menjaga analisis dampak, risiko, ketidakpastian, keberatan, kondisi, dan penyesuaian sesuai fungsi APBN.</small></label>
+          <legend><span>03</span> Mandat &amp; Aturan Domain Otomatis</legend>
+          <div className="automatic-rules"><strong>{selectedTemplate ? "Kontrak domain template aktif" : "Pilih template untuk mengaktifkan mandat domain"}</strong><p>Mandat, sumber primer, hard checks, constraint, dimensi dampak, risiko, ketidakpastian, dan prinsip keputusan dirakit otomatis oleh backend. Pengguna tidak perlu menulis system prompt manual.</p></div>
         </fieldset>
 
         <fieldset className="form-card">
@@ -305,7 +303,7 @@ export default function Home() {
 
       <div className="agent-register"><div className="subhead"><span>AGEN TERSIMPAN</span><b>{agents.length} AGENTS</b></div>{agents.length ? agents.map((item) => <div className="agent-register-row" key={item.id}><div><strong>{item.name}</strong><small>{item.role}</small></div><span>{item.template_key ? "TEMPLATE" : "CUSTOM"}</span><b>{item.llm_model ?? "ENV DEFAULT"}</b></div>) : <p className="empty">Belum ada agen. Muat template APBN atau buat agen baru.</p>}</div>
 
-      <form className="scenario-config-form" onSubmit={submitScenario}><div><span className="section-number">SCENARIO</span><h3>Konfigurasi batas fiskal</h3></div><label className="form-field"><strong>Deskripsi Skenario</strong><textarea value={scenario.description} onChange={(event) => setScenario({ ...scenario, description: event.target.value })} rows={4} required /><small>Jelaskan keputusan fiskal, horizon waktu, dan ketegangan strategis.</small></label><label className="form-field"><strong>Maximum Deficit Constraint (%)</strong><input type="number" min="0" step="0.01" value={scenario.max_deficit_constraint} onChange={(event) => setScenario({ ...scenario, max_deficit_constraint: Number(event.target.value) })} required /><small>Kendala keras CAR; alternatif di atas nilai ini dinyatakan tidak feasible.</small></label><button className="secondary-button" disabled={busy}>Simpan skenario</button></form>
+      <form className="scenario-config-form" onSubmit={submitScenario}><div><span className="section-number">SCENARIO</span><h3>Uji kebijakan fiskal</h3><small>Constraint hukum dan batas defisit diterapkan otomatis oleh agen.</small></div><label className="form-field"><strong>Goal / Deskripsi Kebijakan</strong><textarea value={scenario.description} onChange={(event) => setScenario({ ...scenario, description: event.target.value })} rows={4} required /><small>Jelaskan tujuan kebijakan, program yang diuji, horizon waktu, dan hasil yang diharapkan.</small></label><label className="form-field"><strong>Program Cost / Parameter Finansial</strong><input type="number" min="0" step="0.01" value={scenario.program_cost ?? ""} onChange={(event) => setScenario({ ...scenario, program_cost: event.target.value === "" ? null : Number(event.target.value) })} /><small>Opsional. Gunakan satuan fiskal yang konsisten dengan alternatif; kosongkan bila belum diketahui.</small></label><button className="secondary-button" disabled={busy}>Simpan skenario</button></form>
     </section>
     <footer><span>STRUCTURED CONSENSUS / RESEARCH INSTRUMENT</span><span>SRR + (RAR → DAI) + DDR + CAR</span></footer>
   </main>;

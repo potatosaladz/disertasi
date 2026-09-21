@@ -13,6 +13,7 @@ from backend.models import (
     ReasoningLog,
     Scenario,
 )
+from backend.agent_templates import AGENTS
 from worker.celery_tasks import _default_llm_call, execute_full_shcr_cycle
 
 
@@ -115,6 +116,45 @@ def response_payload(
             "material_information_retention_macro_f1": 0.9,
         }
     )
+
+
+def test_default_llm_call_uses_canonical_template_mandate(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeCompletions:
+        def create(self, **kwargs: object) -> object:
+            captured.update(kwargs)
+            message = type("Message", (), {"content": "{}"})()
+            choice = type("Choice", (), {"message": message})()
+            usage = type("Usage", (), {"total_tokens": 1})()
+            return type("Response", (), {"choices": [choice], "usage": usage})()
+
+    class FakeClient:
+        def __init__(self, **_kwargs: object) -> None:
+            self.chat = type("Chat", (), {"completions": FakeCompletions()})()
+
+    monkeypatch.setattr("worker.celery_tasks.OpenAI", FakeClient)
+    agent = Agent(
+        name="Revenue template",
+        role="Penerimaan Negara",
+        template_key="revenue",
+        system_prompt="Manual text must not override the canonical template.",
+    )
+    scenario = Scenario(
+        description="Evaluate revenue reform",
+        program_cost=25.0,
+        max_deficit_constraint=3.0,
+    )
+
+    _default_llm_call(agent, scenario)
+
+    messages = captured["messages"]
+    assert isinstance(messages, list)
+    assert AGENTS[0].mandate in messages[0]["content"]
+    assert "VERIFIED_OFFSETS_ONLY" in messages[0]["content"]
+    assert "Manual text must not override" not in messages[0]["content"]
+    assert "Program cost: 25.0" in messages[1]["content"]
+    assert "Automatic legal deficit ceiling: 3.0%" in messages[1]["content"]
 
 
 def test_default_llm_call_uses_agent_configuration(monkeypatch: pytest.MonkeyPatch) -> None:

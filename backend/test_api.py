@@ -67,6 +67,27 @@ def test_agent_templates_are_available_and_idempotent(client: TestClient) -> Non
         session.commit()
 
 
+def test_template_selection_automates_system_prompt(client: TestClient) -> None:
+    name = f"template-derived-{uuid.uuid4()}"
+    response = client.post(
+        "/api/agents",
+        json={
+            "name": name,
+            "role": "Penerimaan Negara",
+            "template_key": "revenue",
+        },
+    )
+    assert response.status_code == 201
+    assert "VERIFIED_OFFSETS_ONLY" in response.json()["system_prompt"]
+    with SessionLocal() as session:
+        saved = session.get(Agent, response.json()["id"])
+        assert saved is not None
+        assert saved.template_key == "revenue"
+        assert "Never invent a tax base" in saved.system_prompt
+        session.delete(saved)
+        session.commit()
+
+
 def test_agent_heterogeneous_llm_config_create_and_update(client: TestClient) -> None:
     name = f"heterogeneous-{uuid.uuid4()}"
     response = client.post(
@@ -125,13 +146,23 @@ def test_agent_rejects_invalid_generation_settings(client: TestClient) -> None:
     assert response.status_code == 422
 
 
-def test_scenario_hard_constraint_persists(client: TestClient) -> None:
-    response = client.post("/api/scenarios", json={"description": "Phase 4 API verification scenario", "max_deficit_constraint": 3.25})
+def test_scenario_uses_automatic_constraint_and_program_cost(client: TestClient) -> None:
+    response = client.post(
+        "/api/scenarios",
+        json={
+            "description": "Evaluate a targeted fiscal support programme",
+            "program_cost": 125.5,
+        },
+    )
     assert response.status_code == 201
     scenario_id = response.json()["id"]
+    assert response.json()["max_deficit_constraint"] == 3.0
+    assert response.json()["program_cost"] == 125.5
     with SessionLocal() as session:
         saved = session.get(Scenario, scenario_id)
-        assert saved is not None and saved.max_deficit_constraint == 3.25
+        assert saved is not None
+        assert saved.max_deficit_constraint == 3.0
+        assert saved.program_cost == 125.5
         session.delete(saved)
         session.commit()
 
@@ -141,8 +172,11 @@ def test_agent_rejects_negative_theta(client: TestClient) -> None:
     assert response.status_code == 422
 
 
-def test_scenario_rejects_negative_constraint(client: TestClient) -> None:
-    response = client.post("/api/scenarios", json={"description": "Invalid scenario", "max_deficit_constraint": -0.1})
+def test_scenario_rejects_negative_program_cost(client: TestClient) -> None:
+    response = client.post(
+        "/api/scenarios",
+        json={"description": "Invalid scenario", "program_cost": -0.1},
+    )
     assert response.status_code == 422
 
 
