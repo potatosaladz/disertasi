@@ -541,6 +541,8 @@ def _synthesize_agent_domain_rules(agent: Agent, scenario: Scenario) -> AgentDom
             config.model,
             request_payload,
         )
+        print("--- OUTBOUND PROMPT ---", flush=True)
+        print(json.dumps(request_payload, indent=2, ensure_ascii=False, default=str), flush=True)
         response = OpenAI(
             api_key=config.api_key,
             base_url=config.base_url,
@@ -555,6 +557,8 @@ def _synthesize_agent_domain_rules(agent: Agent, scenario: Scenario) -> AgentDom
             messages=request_payload["messages"],
         )
         content, tokens = extract_llm_completion(response)
+        print("--- RAW LLM RESPONSE ---", flush=True)
+        print(content, flush=True)
         payload = extract_json_object(content)
         fallback_values = _synthesis_fallbacks(agent, scenario)
         scenario_mandate = payload.get("scenario_mandate")
