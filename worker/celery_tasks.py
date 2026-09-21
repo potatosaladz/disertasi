@@ -30,6 +30,7 @@ from worker.srr_models import SRRResponse
 
 logger = logging.getLogger(__name__)
 LLMCaller = Callable[[Agent, Scenario], tuple[str, int]]
+ProgressReporter = Callable[[list[str]], None]
 
 
 def _default_llm_call(agent: Agent, scenario: Scenario) -> tuple[str, int]:
@@ -114,9 +115,12 @@ def _determine_convergence(
 def execute_full_shcr_cycle(
     scenario_id: int,
     llm_call: LLMCaller | None = None,
+    progress: ProgressReporter | None = None,
 ) -> dict[str, Any]:
     started_at = perf_counter()
     caller = llm_call or _default_llm_call
+    emit = progress or (lambda _logs: None)
+    emit(["Executing SRR..."])
 
     with SessionLocal() as session:
         scenario = session.get(Scenario, scenario_id)
@@ -170,6 +174,7 @@ def execute_full_shcr_cycle(
                 )
             )
 
+        emit(["Executing SRR...", "Calculating DDR vector..."])
         agents_by_id = {agent.id: agent for agent in agents}
         influence_inputs: list[dict[str, float | int]] = []
         influence_observations: list[AgentInfluenceObservation] = []
@@ -225,6 +230,11 @@ def execute_full_shcr_cycle(
                     )
                 )
 
+        emit([
+            "Executing SRR...",
+            "Calculating DDR vector...",
+            "Applying CAR filter...",
+        ])
         parsed_responses = [response for _, response in parsed_by_agent]
         alternatives = [
             alternative
@@ -251,6 +261,12 @@ def execute_full_shcr_cycle(
         convergence_status = _determine_convergence(parsed_responses, feasible)
         latency_ms = (perf_counter() - started_at) * 1000.0
 
+        emit([
+            "Executing SRR...",
+            "Calculating DDR vector...",
+            "Applying CAR filter...",
+            "Persisting dissertation metrics...",
+        ])
         snapshot = MetricSnapshot(
             scenario_id=scenario.id,
             provenance_completeness_percent=provenance_completeness,
@@ -264,6 +280,13 @@ def execute_full_shcr_cycle(
         session.add(snapshot)
         session.commit()
         session.refresh(snapshot)
+        emit([
+            "Executing SRR...",
+            "Calculating DDR vector...",
+            "Applying CAR filter...",
+            "Persisting dissertation metrics...",
+            "SHCR cycle completed.",
+        ])
 
         return {
             "metric_snapshot_id": snapshot.id,

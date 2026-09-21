@@ -2,8 +2,8 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "SHCR / Experiment Control",
-  description: "Structured consensus research control surface",
+  title: "SHCR / Research Analytics",
+  description: "Live consensus, divergence, and reproducibility dashboard",
 };
 
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {

@@ -6,6 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select, text
 
+from .dashboard import router as dashboard_router
 from .database import SessionLocal
 from .init_db import initialize_database
 from .models import Agent, Scenario
@@ -73,6 +74,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.include_router(dashboard_router)
 
 
 @app.get("/")

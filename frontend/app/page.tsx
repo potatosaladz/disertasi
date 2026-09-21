@@ -1,6 +1,6 @@
 "use client";
 
-import { FormEvent, useEffect, useState } from "react";
+import { FormEvent, useEffect, useMemo, useState } from "react";
 
 type Agent = {
   id: number;
@@ -12,57 +12,57 @@ type Agent = {
   theta_s: number;
   theta_u: number;
 };
-
-type Scenario = {
+type Scenario = { id: number; description: string; max_deficit_constraint: number };
+type Metric = {
   id: number;
-  description: string;
-  max_deficit_constraint: number;
+  hard_constraint_violation_rate: number;
+  provenance_completeness_percent: number;
+  material_information_retention_macro_f1: number;
+  feasible_alternatives_count: number;
+  convergence_status: string;
+  latency_ms: number;
+  token_usage: number;
+  created_at: string;
 };
-
+type Disagreement = {
+  id: number;
+  agent_i: string;
+  agent_j: string;
+  dE: boolean;
+  dA: boolean;
+  dP: boolean;
+  dR: boolean;
+  dU: boolean;
+  dO: boolean;
+  dC: boolean;
+  dREC: boolean;
+  resolution_mechanism: string;
+};
+type Influence = { agent: string; proposition: string; normalized_weight: number | null; raw_score: number | null; gate: number };
+type Dashboard = {
+  scenario: Scenario;
+  latest_metric: Metric | null;
+  metric_history: Metric[];
+  schema_validity_percent: number;
+  reasoning_log_count: number;
+  disagreements: Disagreement[];
+  influence_observations: Influence[];
+};
+type RunState = { task_id: string; status: string; logs: string[]; result?: { metric_snapshot_id: number } | null; error?: string };
 type AgentForm = Omit<Agent, "id">;
 type ScenarioForm = Omit<Scenario, "id">;
 
 const apiUrl = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
-const initialAgent: AgentForm = {
-  name: "",
-  role: "",
-  theta_x: 1,
-  theta_q: 1,
-  theta_h: 1,
-  theta_s: 1,
-  theta_u: 1,
-};
-const initialScenario: ScenarioForm = {
-  description: "",
-  max_deficit_constraint: 3,
-};
+const components = ["dE", "dA", "dP", "dR", "dU", "dO", "dC", "dREC"] as const;
+const initialAgent: AgentForm = { name: "", role: "", theta_x: 1, theta_q: 1, theta_h: 1, theta_s: 1, theta_u: 1 };
+const initialScenario: ScenarioForm = { description: "", max_deficit_constraint: 3 };
 
-function NumericField({
-  label,
-  value,
-  onChange,
-  hint,
-}: {
-  label: string;
-  value: number;
-  onChange: (value: number) => void;
-  hint: string;
-}) {
-  return (
-    <label className="field">
-      <span>{label}</span>
-      <input
-        type="number"
-        min="0"
-        max="100"
-        step="0.01"
-        value={value}
-        onChange={(event) => onChange(Number(event.target.value))}
-        required
-      />
-      <small>{hint}</small>
-    </label>
-  );
+function NumericField({ label, value, onChange, hint }: { label: string; value: number; onChange: (value: number) => void; hint: string }) {
+  return <label className="field"><span>{label}</span><input type="number" min="0" step="0.01" value={value} onChange={(event) => onChange(Number(event.target.value))} required /><small>{hint}</small></label>;
+}
+
+function MetricCard({ label, value, unit, tone }: { label: string; value: string; unit?: string; tone?: string }) {
+  return <div className={`metric-card ${tone ?? ""}`}><span>{label}</span><strong>{value}<small>{unit}</small></strong></div>;
 }
 
 export default function Home() {
@@ -70,128 +70,101 @@ export default function Home() {
   const [scenario, setScenario] = useState<ScenarioForm>(initialScenario);
   const [agents, setAgents] = useState<Agent[]>([]);
   const [scenarios, setScenarios] = useState<Scenario[]>([]);
-  const [notice, setNotice] = useState("Ready for a controlled experiment.");
+  const [selectedScenario, setSelectedScenario] = useState<number | null>(null);
+  const [dashboard, setDashboard] = useState<Dashboard | null>(null);
+  const [run, setRun] = useState<RunState | null>(null);
+  const [notice, setNotice] = useState("Research console ready. Select a scenario to activate the tracker.");
   const [busy, setBusy] = useState(false);
 
-  async function loadData() {
-    const [agentResponse, scenarioResponse] = await Promise.all([
-      fetch(`${apiUrl}/api/agents`),
-      fetch(`${apiUrl}/api/scenarios`),
-    ]);
+  async function loadSetup() {
+    const [agentResponse, scenarioResponse] = await Promise.all([fetch(`${apiUrl}/api/agents`), fetch(`${apiUrl}/api/scenarios`)]);
     if (!agentResponse.ok || !scenarioResponse.ok) throw new Error("API unavailable");
-    setAgents(await agentResponse.json());
-    setScenarios(await scenarioResponse.json());
+    const nextAgents: Agent[] = await agentResponse.json();
+    const nextScenarios: Scenario[] = await scenarioResponse.json();
+    setAgents(nextAgents);
+    setScenarios(nextScenarios);
+    if (selectedScenario === null && nextScenarios.length > 0) setSelectedScenario(nextScenarios[nextScenarios.length - 1].id);
   }
 
+  async function loadDashboard(id: number) {
+    const response = await fetch(`${apiUrl}/api/scenarios/${id}/dashboard`, { cache: "no-store" });
+    if (!response.ok) throw new Error("Dashboard unavailable");
+    setDashboard(await response.json());
+  }
+
+  useEffect(() => { loadSetup().catch(() => setNotice("API connection pending. Check the backend URL.")); }, []);
+  useEffect(() => { if (selectedScenario !== null) loadDashboard(selectedScenario).catch(() => setNotice("No dashboard data for this scenario yet.")); }, [selectedScenario]);
+
   useEffect(() => {
-    loadData().catch(() => setNotice("API connection pending. Check the backend URL."));
-  }, []);
+    if (!run || ["SUCCEEDED", "FAILED"].includes(run.status)) return;
+    const timer = window.setInterval(async () => {
+      const response = await fetch(`${apiUrl}/api/runs/${run.task_id}`, { cache: "no-store" });
+      if (!response.ok) return;
+      const nextRun: RunState = await response.json();
+      setRun(nextRun);
+      if (nextRun.status === "SUCCEEDED" && selectedScenario !== null) {
+        await loadDashboard(selectedScenario);
+        setNotice("Cycle complete. Dashboard metrics refreshed from PostgreSQL.");
+      }
+    }, 1200);
+    return () => window.clearInterval(timer);
+  }, [run, selectedScenario]);
 
   async function submitAgent(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    if (!agent.name.trim() || !agent.role.trim()) {
-      setNotice("Agent name and role are required.");
-      return;
-    }
-    setBusy(true);
+    event.preventDefault(); setBusy(true);
     try {
-      const response = await fetch(`${apiUrl}/api/agents`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(agent),
-      });
-      const payload = await response.json();
-      if (!response.ok) throw new Error(payload.detail ?? "Agent could not be saved");
-      setAgents((current) => [...current, payload]);
-      setAgent(initialAgent);
-      setNotice(`Agent ${payload.name} committed. Theta_U = ${payload.theta_u}.`);
-    } catch (error) {
-      setNotice(error instanceof Error ? error.message : "Agent could not be saved");
-    } finally {
-      setBusy(false);
-    }
+      const response = await fetch(`${apiUrl}/api/agents`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(agent) });
+      const payload = await response.json(); if (!response.ok) throw new Error(payload.detail ?? "Agent could not be saved");
+      setAgent(initialAgent); await loadSetup(); setNotice(`Agent ${payload.name} committed. ΘU = ${payload.theta_u}.`);
+    } catch (error) { setNotice(error instanceof Error ? error.message : "Agent could not be saved"); } finally { setBusy(false); }
   }
 
   async function submitScenario(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    if (!scenario.description.trim() || scenario.max_deficit_constraint < 0) {
-      setNotice("Add a scenario description and non-negative deficit limit.");
-      return;
-    }
-    setBusy(true);
+    event.preventDefault(); setBusy(true);
     try {
-      const response = await fetch(`${apiUrl}/api/scenarios`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(scenario),
-      });
-      const payload = await response.json();
-      if (!response.ok) throw new Error(payload.detail ?? "Scenario could not be saved");
-      setScenarios((current) => [...current, payload]);
-      setScenario(initialScenario);
-      setNotice(`Scenario ${payload.id} committed with C_H = ${payload.max_deficit_constraint}%.`);
-    } catch (error) {
-      setNotice(error instanceof Error ? error.message : "Scenario could not be saved");
-    } finally {
-      setBusy(false);
-    }
+      const response = await fetch(`${apiUrl}/api/scenarios`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(scenario) });
+      const payload = await response.json(); if (!response.ok) throw new Error(payload.detail ?? "Scenario could not be saved");
+      setScenario(initialScenario); await loadSetup(); setSelectedScenario(payload.id); setNotice(`Scenario ${payload.id} committed with C_H = ${payload.max_deficit_constraint}%.`);
+    } catch (error) { setNotice(error instanceof Error ? error.message : "Scenario could not be saved"); } finally { setBusy(false); }
   }
 
-  return (
-    <main className="shell">
-      <header className="topbar">
-        <div className="brand"><span className="brand-mark">S</span><span>SHCR</span></div>
-        <div className="top-meta"><span className="live-dot" /> LOCAL RESEARCH NODE <b>v0.4</b></div>
-      </header>
+  async function startRun() {
+    if (selectedScenario === null) { setNotice("Select a scenario before starting a cycle."); return; }
+    const response = await fetch(`${apiUrl}/api/scenarios/${selectedScenario}/runs`, { method: "POST" });
+    const payload = await response.json();
+    if (!response.ok) { setNotice(payload.detail ?? "Could not queue cycle"); return; }
+    setRun({ task_id: payload.task_id, status: payload.status, logs: payload.logs });
+    setNotice(`Task ${payload.task_id.slice(0, 8)} queued on Celery.`);
+  }
 
-      <section className="hero">
-        <div className="eyebrow">PHASE 04 / EXPERIMENT CONTROL</div>
-        <h1>Shape the agents.<br /><em>Frame the decision.</em></h1>
-        <p>Configure heterogeneous reasoning agents and the fiscal boundary conditions they must respect before a consensus cycle begins.</p>
-        <div className="status-line"><span className="status-chip">MENU 01 — AGENT STUDIO</span><span>→</span><span className="status-chip muted">MENU 02 — SCENARIO BUILDER</span></div>
-      </section>
+  async function exportManifest() {
+    if (selectedScenario === null) { setNotice("Select a scenario before exporting."); return; }
+    const response = await fetch(`${apiUrl}/api/scenarios/${selectedScenario}/manifest`);
+    if (!response.ok) { setNotice("Manifest could not be generated."); return; }
+    const blob = await response.blob(); const url = URL.createObjectURL(blob); const anchor = document.createElement("a");
+    anchor.href = url; anchor.download = `shcr-scenario-${selectedScenario}-manifest.json`; anchor.click(); URL.revokeObjectURL(url); setNotice("Reproducibility manifest downloaded.");
+  }
 
-      <div className="notice"><span className="notice-label">SYSTEM NOTE</span><span>{notice}</span></div>
+  const latest = dashboard?.latest_metric ?? null;
+  const activeLogs = run?.logs ?? ["Awaiting task dispatch."];
+  const activeInfluence = useMemo(() => [...(dashboard?.influence_observations ?? [])].sort((a, b) => (b.normalized_weight ?? 0) - (a.normalized_weight ?? 0)), [dashboard]);
 
-      <section className="workspace">
-        <article className="panel agent-panel">
-          <div className="panel-heading"><div><span className="section-number">01</span><h2>Agent Studio</h2></div><span className="panel-code">RAR-DAI / Θ</span></div>
-          <p className="panel-intro">Every coefficient is exposed for ablation. Set all values to <strong>1.0</strong> for B5 baseline, or isolate a mechanism by setting its theta to <strong>0</strong>.</p>
-          <form onSubmit={submitAgent}>
-            <div className="two-up">
-              <label className="field"><span>Agent name</span><input value={agent.name} onChange={(e) => setAgent({ ...agent, name: e.target.value })} placeholder="e.g. Fiscal Analyst" required /></label>
-              <label className="field"><span>Role / domain</span><input value={agent.role} onChange={(e) => setAgent({ ...agent, role: e.target.value })} placeholder="e.g. Macro policy" required /></label>
-            </div>
-            <div className="theta-heading"><span>Influence coefficients</span><span>softmax inputs / gates downstream</span></div>
-            <div className="theta-grid">
-              <NumericField label="ΘX · Expertise" value={agent.theta_x} hint="X" onChange={(value) => setAgent({ ...agent, theta_x: value })} />
-              <NumericField label="ΘQ · Evidence" value={agent.theta_q} hint="Q" onChange={(value) => setAgent({ ...agent, theta_q: value })} />
-              <NumericField label="ΘH · History" value={agent.theta_h} hint="H" onChange={(value) => setAgent({ ...agent, theta_h: value })} />
-              <NumericField label="ΘS · Relevance" value={agent.theta_s} hint="S" onChange={(value) => setAgent({ ...agent, theta_s: value })} />
-              <NumericField label="ΘU · Uncertainty" value={agent.theta_u} hint="U / penalty" onChange={(value) => setAgent({ ...agent, theta_u: value })} />
-            </div>
-            <div className="ablation-callout"><span className="callout-icon">A6</span><span><strong>Uncertainty ablation</strong><br />Set ΘU to 0 to remove the explicit uncertainty penalty.</span></div>
-            <button className="primary-button" disabled={busy} type="submit">{busy ? "Committing…" : "Commit agent"}<span>↗</span></button>
-          </form>
-        </article>
+  return <main className="shell dashboard-shell">
+    <header className="topbar"><div className="brand"><span className="brand-mark">S</span><span>SHCR</span></div><div className="top-meta"><span className="live-dot" /> RESEARCH NODE / POSTGRES + CELERY <b>PHASE 05</b></div></header>
+    <section className="dashboard-hero"><div><div className="eyebrow">PHASE 05 / OBSERVATION LAYER</div><h1>Make disagreement<br /><em>inspectable.</em></h1><p>A live evidence surface for tracking execution, divergence, hard constraints, and the convergence states produced by each fiscal experiment.</p></div><div className="hero-orbit"><span>DDR</span><b>→</b><span>CAR</span><b>→</b><span>SHCR</span></div></section>
+    <div className="notice"><span className="notice-label">SYSTEM NOTE</span><span>{notice}</span></div>
 
-        <article className="panel scenario-panel">
-          <div className="panel-heading"><div><span className="section-number">02</span><h2>Scenario Builder</h2></div><span className="panel-code">CAR / C<sub>H</sub></span></div>
-          <p className="panel-intro">Define the decision context and the hard boundary that no reconciliation layer or language model may override.</p>
-          <form onSubmit={submitScenario}>
-            <label className="field"><span>Scenario description</span><textarea value={scenario.description} onChange={(e) => setScenario({ ...scenario, description: e.target.value })} placeholder="Describe the fiscal decision, horizon, and strategic tension…" rows={7} required /></label>
-            <div className="constraint-box"><div className="constraint-label"><span>HARD CONSTRAINT</span><b>C<sub>H</sub></b></div><NumericField label="Maximum deficit (%)" value={scenario.max_deficit_constraint} hint="Alternative fails when deficit > this limit" onChange={(value) => setScenario({ ...scenario, max_deficit_constraint: value })} /><div className="constraint-rule" /></div>
-            <button className="primary-button dark" disabled={busy} type="submit">{busy ? "Committing…" : "Commit scenario"}<span>↗</span></button>
-          </form>
-        </article>
-      </section>
+    <section className="control-strip"><div className="scenario-select"><label className="field"><span>Active scenario / experiment scope</span><select value={selectedScenario ?? ""} onChange={(event) => setSelectedScenario(Number(event.target.value))}><option value="" disabled>Select scenario</option>{scenarios.map((item) => <option key={item.id} value={item.id}>#{item.id} — {item.description}</option>)}</select></label></div><button className="primary-button run-button" onClick={startRun} disabled={run?.status === "RUNNING" || run?.status === "QUEUED"}>{run?.status === "RUNNING" ? "Cycle running…" : "Run SHCR cycle"}<span>↗</span></button></section>
 
-      <section className="ledger-grid">
-        <div className="ledger"><div className="ledger-head"><span>REGISTERED AGENTS</span><b>{String(agents.length).padStart(2, "0")}</b></div>{agents.length === 0 ? <p className="empty">No agents committed yet.</p> : agents.map((item) => <div className="ledger-row" key={item.id}><span className="row-index">{String(item.id).padStart(2, "0")}</span><div><strong>{item.name}</strong><small>{item.role}</small></div><span className="theta-value">ΘU {item.theta_u.toFixed(2)}</span></div>)}</div>
-        <div className="ledger"><div className="ledger-head"><span>SCENARIO REGISTER</span><b>{String(scenarios.length).padStart(2, "0")}</b></div>{scenarios.length === 0 ? <p className="empty">No scenarios committed yet.</p> : scenarios.map((item) => <div className="ledger-row" key={item.id}><span className="row-index">{String(item.id).padStart(2, "0")}</span><div><strong>{item.description}</strong><small>C<sub>H</sub> maximum deficit</small></div><span className="theta-value">{item.max_deficit_constraint.toFixed(2)}%</span></div>)}</div>
-      </section>
+    <nav className="menu-rail"><span className="menu-label">CONTROL MENUS</span><a href="#setup">01 / Setup</a><a href="#setup">02 / Scenario</a><a className="active" href="#tracker">03 / Live Tracker</a><a href="#ddr">04 / DDR Network</a><a href="#analytics">05 / Analytics</a></nav>
 
-      <footer><span>STRUCTURED CONSENSUS / RESEARCH INSTRUMENT</span><span>SRR + (RAR → DAI) + DDR + CAR</span></footer>
-    </main>
-  );
+    <section id="tracker" className="tracker-panel panel"><div className="section-header"><div><span className="section-number">03</span><h2>Live Tracker</h2></div><span className={`run-state ${run?.status?.toLowerCase() ?? "idle"}`}>{run?.status ?? "IDLE"}</span></div><div className="tracker-content"><div className="progress-console">{activeLogs.map((log, index) => <div className="console-line" key={`${log}-${index}`}><span>{String(index + 1).padStart(2, "0")}</span><i className={index === activeLogs.length - 1 && run?.status !== "SUCCEEDED" ? "pulse" : "done"} />{log}</div>)}</div><div className="task-readout"><span>TASK IDENTIFIER</span><strong>{run?.task_id ?? "—"}</strong><small>{run?.error ?? (run?.status === "SUCCEEDED" ? "Result persisted" : "Polling every 1.2 seconds")}</small></div></div></section>
+
+    <section id="ddr" className="panel"><div className="section-header"><div><span className="section-number">04</span><h2>DDR Network</h2></div><span className="panel-code">D<sub>ij</sub> / 8 COMPONENTS</span></div><div className="matrix-wrap">{dashboard?.disagreements.length ? <table className="ddr-table"><thead><tr><th>AGENT PAIR</th>{components.map((component) => <th key={component}>{component}</th>)}<th>RESOLUTION MECHANISM</th></tr></thead><tbody>{dashboard.disagreements.map((item) => <tr key={item.id}><td><strong>{item.agent_i}</strong><small>× {item.agent_j}</small></td>{components.map((component) => <td key={component}><span className={`bool ${item[component] ? "conflict" : "clear"}`}>{item[component] ? "1" : "0"}</span></td>)}<td className="resolution">{item.resolution_mechanism}</td></tr>)}</tbody></table> : <div className="empty-state"><strong>No DDR vectors yet.</strong><span>Run a cycle with at least two schema-valid agents to populate the matrix.</span></div>}</div></section>
+
+    <section id="analytics" className="analytics-section"><div className="section-header"><div><span className="section-number">05</span><h2>Decision Analytics</h2></div><button className="export-button" onClick={exportManifest}>↓ Export reproducibility manifest</button></div><div className="convergence-banner"><div><span>FINAL CONVERGENCE STATE</span><strong>{latest?.convergence_status ?? "AWAITING CYCLE"}</strong></div><div className="convergence-meta"><span>FEASIBLE ALTERNATIVES</span><b>{latest?.feasible_alternatives_count ?? "—"}</b></div></div><div className="metric-grid"><MetricCard label="Hard-constraint violation rate" value={latest ? latest.hard_constraint_violation_rate.toFixed(2) : "—"} unit="%" tone="rust" /><MetricCard label="Provenance completeness" value={latest ? latest.provenance_completeness_percent.toFixed(2) : "—"} unit="%" /><MetricCard label="Schema validity" value={dashboard ? dashboard.schema_validity_percent.toFixed(2) : "—"} unit="%" tone="mint" /><MetricCard label="Latency / token usage" value={latest ? latest.latency_ms.toFixed(0) : "—"} unit={latest ? `ms · ${latest.token_usage} tok` : ""} /></div><div className="analytics-lower"><div className="history-block"><div className="subhead"><span>METRIC SNAPSHOT HISTORY</span><b>{dashboard?.metric_history.length ?? 0} RUNS</b></div>{dashboard?.metric_history.length ? dashboard.metric_history.slice(0, 5).map((metric) => <div className="history-row" key={metric.id}><span>#{metric.id}</span><strong>{metric.convergence_status}</strong><i>{metric.provenance_completeness_percent.toFixed(1)}% provenance</i><b>{new Date(metric.created_at).toLocaleTimeString()}</b></div>) : <p className="empty">Metric history will appear after the first completed cycle.</p>}</div><div className="influence-block"><div className="subhead"><span>RAR-DAI INFLUENCE RANKING</span><b>{activeInfluence.length} OBSERVATIONS</b></div>{activeInfluence.length ? activeInfluence.slice(0, 4).map((item, index) => <div className="weight-row" key={`${item.agent}-${item.proposition}`}><span>{String(index + 1).padStart(2, "0")}</span><div><strong>{item.agent}</strong><small>{item.proposition}</small></div><b>{item.normalized_weight === null ? "—" : `${(item.normalized_weight * 100).toFixed(1)}%`}</b></div>) : <p className="empty">No influence observations recorded for this scenario.</p>}</div></div></section>
+
+    <section id="setup" className="setup-summary"><div><span className="section-number">01 / 02</span><h2>Experiment Setup</h2><p>Configuration remains available here for the next ablation run.</p></div><div className="setup-actions"><form onSubmit={submitAgent}><input placeholder="Agent name" value={agent.name} onChange={(event) => setAgent({ ...agent, name: event.target.value })} required /><input placeholder="Role" value={agent.role} onChange={(event) => setAgent({ ...agent, role: event.target.value })} required /><input aria-label="Theta U" type="number" min="0" step="0.01" value={agent.theta_u} onChange={(event) => setAgent({ ...agent, theta_u: Number(event.target.value) })} /><button className="secondary-button" disabled={busy}>Add agent / ΘU</button></form><form onSubmit={submitScenario}><input placeholder="Scenario description" value={scenario.description} onChange={(event) => setScenario({ ...scenario, description: event.target.value })} required /><input aria-label="Maximum deficit" type="number" min="0" step="0.01" value={scenario.max_deficit_constraint} onChange={(event) => setScenario({ ...scenario, max_deficit_constraint: Number(event.target.value) })} /><button className="secondary-button" disabled={busy}>Add scenario / C_H</button></form></div></section>
+    <footer><span>STRUCTURED CONSENSUS / RESEARCH INSTRUMENT</span><span>SRR + (RAR → DAI) + DDR + CAR</span></footer>
+  </main>;
 }
