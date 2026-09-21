@@ -2,10 +2,14 @@ FROM node:20-alpine
 
 WORKDIR /app
 
-COPY --chown=node:node server.js .
+COPY package*.json ./
+RUN npm install
+
+COPY . .
+RUN npm run build
 
 USER node
 
 EXPOSE 3000
 
-CMD ["node", "server.js"]
+CMD ["npm", "run", "start"]

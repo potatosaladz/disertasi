@@ -1,0 +1,12 @@
+backend/__pycache__
+backend/.mypy_cache
+backend/.pytest_cache
+backend/.ruff_cache
+worker/__pycache__
+worker/.mypy_cache
+worker/.pytest_cache
+worker/.ruff_cache
+frontend/node_modules
+frontend/.next
+.git
+.env

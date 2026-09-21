@@ -1,5 +1,5 @@
-from database import engine
-from models import Agent
+from .database import engine
+from .models import Agent
 
 
 def initialize_database() -> None:

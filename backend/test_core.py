@@ -2,7 +2,7 @@ import math
 
 import pytest
 
-from core_algorithms import (
+from backend.core_algorithms import (
     Alternative,
     HardConstraints,
     calculate_dynamic_influence,

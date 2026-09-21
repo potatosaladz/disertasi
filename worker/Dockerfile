@@ -5,12 +5,13 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+COPY worker/requirements.txt ./worker/requirements.txt
+RUN pip install --no-cache-dir -r worker/requirements.txt
 
-COPY celery_worker.py .
+COPY backend ./backend
+COPY worker ./worker
 
 RUN useradd --create-home --uid 10001 appuser
 USER appuser
 
-CMD ["celery", "-A", "celery_worker:app", "worker", "--loglevel=info"]
+CMD ["celery", "-A", "worker.celery_worker:app", "worker", "--loglevel=info"]
