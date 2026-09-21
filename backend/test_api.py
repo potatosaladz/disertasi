@@ -370,6 +370,63 @@ def test_domain_rules_uses_environment_fallback(
         session.commit()
 
 
+def test_domain_rules_accepts_flexible_response_keys(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class FlexibleCompletions:
+        def create(self, **_kwargs: object) -> object:
+            content = json.dumps(
+                {
+                    "data": {
+                        "scenarioMandate": "Autonomous expert mandate.",
+                        "focus_areas": "Fiscal sustainability; Revenue resilience",
+                        "key_questions": [
+                            {"question": "Is financing available?"},
+                            {"text": "Is the policy lawful?"},
+                        ],
+                        "evidence_requirements": "Current APBN baseline\nVerified implementation plan",
+                    }
+                }
+            )
+            message = type("Message", (), {"content": content})()
+            choice = type("Choice", (), {"message": message})()
+            return type("Response", (), {"choices": [choice], "usage": None})()
+
+    class FakeClient:
+        def __init__(self, **_kwargs: object) -> None:
+            self.chat = type("Chat", (), {"completions": FlexibleCompletions()})()
+
+    monkeypatch.setattr("backend.main.OpenAI", FakeClient)
+    agent = client.post(
+        "/api/agents",
+        json={
+            "name": f"flexible-response-{uuid.uuid4()}",
+            "role": "Revenue Expert",
+            "llm_base_url": "https://flexible.example/v1",
+            "llm_api_key": "flexible-secret",
+            "llm_model": "flexible-model",
+        },
+    )
+    scenario = client.post(
+        "/api/scenarios",
+        json={"description": "Review fiscal resilience"},
+    )
+
+    response = client.post(f"/api/scenarios/{scenario.json()['id']}/domain-rules")
+
+    assert response.status_code == 200
+    rule = response.json()["agent_rules"][0]
+    assert rule["scenario_mandate"] == "Autonomous expert mandate."
+    assert rule["scenario_focus"] == ["Fiscal sustainability", "Revenue resilience"]
+    assert rule["priority_questions"] == ["Is financing available?", "Is the policy lawful?"]
+    assert rule["required_evidence"] == ["Current APBN baseline", "Verified implementation plan"]
+
+    with SessionLocal() as session:
+        session.delete(session.get(Scenario, scenario.json()["id"]))
+        session.delete(session.get(Agent, agent.json()["id"]))
+        session.commit()
+
+
 def test_domain_rules_falls_back_when_scenario_mandate_is_empty(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:

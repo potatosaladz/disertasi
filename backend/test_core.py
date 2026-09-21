@@ -78,14 +78,13 @@ def test_mandate_synthesis_prompt_contains_seed_and_scenario() -> None:
         "Revenue Agent",
         "Revenue",
         "Assess a targeted support programme.",
-        25.0,
-        3.0,
-        {"constraints": ["Verified offsets only"], "primary_sources": ["LAW-1"]},
     )
-    assert "LOCAL SEED CONTRACT" in prompt
+    assert "Act autonomously as the expert Revenue" in prompt
     assert "targeted support programme" in prompt
-    assert "Verified offsets only" in prompt
-    assert "never invent" in prompt
+    assert "scenario_mandate" in prompt
+    assert "LOCAL SEED CONTRACT" not in prompt
+    assert "PROGRAM COST" not in prompt
+    assert "DEFICIT CEILING" not in prompt
 
 
 def test_build_agent_system_prompt_injects_mandate() -> None:

@@ -457,16 +457,51 @@ def _fallback_scenario_mandate(agent: Agent, scenario: Scenario) -> str:
     return f"Evaluate the active APBN policy scenario from the {agent.role} mandate: {description}"
 
 
+def _mandate_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    for wrapper_key in ("result", "data", "output", "mandate_result"):
+        wrapped = payload.get(wrapper_key)
+        if isinstance(wrapped, dict):
+            return wrapped
+    return payload
+
+
+def _response_value(payload: dict[str, Any], *keys: str) -> object:
+    for key in keys:
+        value = payload.get(key)
+        if value is not None:
+            return value
+    return None
+
+
 def _normalise_mandate_list(
     value: object,
     fallback: list[str],
     field_name: str,
     agent_id: int,
 ) -> list[str]:
-    if isinstance(value, list):
-        valid_items = [item.strip() for item in value if isinstance(item, str) and item.strip()]
-        if valid_items:
-            return list(dict.fromkeys(valid_items))
+    if isinstance(value, str):
+        valid_items = [item.strip(" -•\t") for item in value.replace(";", "\n").splitlines()]
+        valid_items = [item for item in valid_items if item]
+    elif isinstance(value, (list, tuple, set)):
+        valid_items = []
+        for item in value:
+            if isinstance(item, str) and item.strip():
+                valid_items.append(item.strip())
+            elif isinstance(item, dict):
+                text = next(
+                    (
+                        candidate.strip()
+                        for key in ("content", "text", "name", "question", "evidence")
+                        if isinstance((candidate := item.get(key)), str) and candidate.strip()
+                    ),
+                    None,
+                )
+                if text is not None:
+                    valid_items.append(text)
+    else:
+        valid_items = []
+    if valid_items:
+        return list(dict.fromkeys(valid_items))
     logger.warning(
         "Agent %s returned an empty or invalid %s; using safe fallback",
         agent_id,
@@ -511,7 +546,6 @@ def _synthesize_agent_domain_rules(agent: Agent, scenario: Scenario) -> AgentDom
             config = resolve_llm_runtime_config(agent)
         for warning in configuration_warnings:
             logger.warning("Mandate synthesis configuration: %s", warning.message)
-        seed = mandate_seed(agent)
         request_payload: dict[str, Any] = {
             "temperature": agent.temperature,
             "max_tokens": agent.max_tokens,
@@ -519,7 +553,10 @@ def _synthesize_agent_domain_rules(agent: Agent, scenario: Scenario) -> AgentDom
             "messages": [
                 {
                     "role": "system",
-                    "content": "Expand an authoritative fiscal seed into a scenario-specific operating mandate.",
+                    "content": (
+                        f"You are {agent.name}, an autonomous expert acting as {agent.role}. "
+                        "Generate a concise, decision-ready operating mandate in valid JSON."
+                    ),
                 },
                 {
                     "role": "user",
@@ -527,9 +564,6 @@ def _synthesize_agent_domain_rules(agent: Agent, scenario: Scenario) -> AgentDom
                         agent.name,
                         agent.role,
                         scenario.description,
-                        scenario.program_cost,
-                        scenario.max_deficit_constraint,
-                        seed,
                     ),
                 },
             ],
@@ -559,9 +593,15 @@ def _synthesize_agent_domain_rules(agent: Agent, scenario: Scenario) -> AgentDom
         content, tokens = extract_llm_completion(response)
         print("--- RAW LLM RESPONSE ---", flush=True)
         print(content, flush=True)
-        payload = extract_json_object(content)
+        payload = _mandate_payload(extract_json_object(content))
         fallback_values = _synthesis_fallbacks(agent, scenario)
-        scenario_mandate = payload.get("scenario_mandate")
+        scenario_mandate = _response_value(
+            payload,
+            "scenario_mandate",
+            "scenarioMandate",
+            "mandate",
+            "operating_mandate",
+        )
         if not isinstance(scenario_mandate, str) or not scenario_mandate.strip():
             scenario_mandate = fallback_values.scenario_mandate
             logger.warning(
@@ -569,19 +609,31 @@ def _synthesize_agent_domain_rules(agent: Agent, scenario: Scenario) -> AgentDom
                 agent.id,
             )
         scenario_focus = _normalise_mandate_list(
-            payload.get("scenario_focus"),
+            _response_value(payload, "scenario_focus", "scenarioFocus", "focus", "focus_areas"),
             fallback_values.scenario_focus,
             "scenario_focus",
             agent.id,
         )
         priority_questions = _normalise_mandate_list(
-            payload.get("priority_questions"),
+            _response_value(
+                payload,
+                "priority_questions",
+                "priorityQuestions",
+                "questions",
+                "key_questions",
+            ),
             fallback_values.priority_questions,
             "priority_questions",
             agent.id,
         )
         required_evidence = _normalise_mandate_list(
-            payload.get("required_evidence"),
+            _response_value(
+                payload,
+                "required_evidence",
+                "requiredEvidence",
+                "evidence",
+                "evidence_requirements",
+            ),
             fallback_values.required_evidence,
             "required_evidence",
             agent.id,
