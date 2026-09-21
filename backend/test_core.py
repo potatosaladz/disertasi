@@ -40,6 +40,20 @@ def test_extract_json_object_cleans_markdown_and_surrounding_text() -> None:
         extract_json_object("not-json")
 
 
+def test_runtime_config_uses_environment_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    from backend.core_algorithms import resolve_llm_runtime_config
+
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://env.example/v1")
+    monkeypatch.setenv("OPENAI_API_KEY", "env-secret")
+    monkeypatch.setenv("OPENAI_MODEL", "env-model")
+    config = resolve_llm_runtime_config(
+        {"name": "fallback-agent", "llm_base_url": None, "llm_api_key": None, "llm_model": None}
+    )
+    assert config.base_url == "https://env.example/v1"
+    assert config.api_key == "env-secret"
+    assert config.model == "env-model"
+
+
 def test_mandate_synthesis_prompt_contains_seed_and_scenario() -> None:
     prompt = build_mandate_synthesis_prompt(
         "Revenue Agent",

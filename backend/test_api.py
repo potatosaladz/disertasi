@@ -213,6 +213,8 @@ def test_agent_can_be_deleted_before_research_records(client: TestClient) -> Non
 def test_domain_rules_aggregate_template_agents(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    captured: dict[str, object] = {}
+
     class FakeCompletions:
         def create(self, **_kwargs: object) -> object:
             content = json.dumps(
@@ -228,7 +230,8 @@ def test_domain_rules_aggregate_template_agents(
             return type("Response", (), {"choices": [choice], "usage": None})()
 
     class FakeClient:
-        def __init__(self, **_kwargs: object) -> None:
+        def __init__(self, **kwargs: object) -> None:
+            captured["client"] = kwargs
             self.chat = type("Chat", (), {"completions": FakeCompletions()})()
 
     monkeypatch.setattr("backend.main.OpenAI", FakeClient)
@@ -287,12 +290,73 @@ def test_domain_rules_aggregate_template_agents(
         "token_usage": 0,
         "error": None,
     }
+    assert captured["client"] == {
+        "api_key": "revenue-secret",
+        "base_url": "https://revenue.example/v1",
+        "timeout": 60.0,
+        "max_retries": 2,
+    }
     assert payload["status"] == "success"
     assert payload["generated_count"] == 1
 
     with SessionLocal() as session:
         session.delete(session.get(Scenario, scenario.json()["id"]))
         session.delete(session.get(Agent, template_agent.json()["id"]))
+        session.commit()
+
+
+def test_domain_rules_uses_environment_fallback(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeCompletions:
+        def create(self, **kwargs: object) -> object:
+            captured["request"] = kwargs
+            content = json.dumps(
+                {
+                    "scenario_mandate": "Environment-backed scenario mandate.",
+                    "scenario_focus": ["Fallback configuration"],
+                    "priority_questions": ["Is the environment provider available?"],
+                    "required_evidence": ["Provider response"],
+                }
+            )
+            message = type("Message", (), {"content": content})()
+            choice = type("Choice", (), {"message": message})()
+            return type("Response", (), {"choices": [choice], "usage": None})()
+
+    class FakeClient:
+        def __init__(self, **kwargs: object) -> None:
+            captured["client"] = kwargs
+            self.chat = type("Chat", (), {"completions": FakeCompletions()})()
+
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://environment.example/v1")
+    monkeypatch.setenv("OPENAI_API_KEY", "environment-secret")
+    monkeypatch.setenv("OPENAI_MODEL", "environment-model")
+    monkeypatch.setattr("backend.main.OpenAI", FakeClient)
+    agent = client.post(
+        "/api/agents",
+        json={"name": f"fallback-rules-{uuid.uuid4()}", "role": "Fallback Test"},
+    )
+    scenario = client.post(
+        "/api/scenarios",
+        json={"description": "Environment fallback scenario"},
+    )
+
+    response = client.post(f"/api/scenarios/{scenario.json()['id']}/domain-rules")
+
+    assert response.status_code == 200
+    assert captured["client"] == {
+        "api_key": "environment-secret",
+        "base_url": "https://environment.example/v1",
+        "timeout": 60.0,
+        "max_retries": 2,
+    }
+    assert response.json()["agent_rules"][0]["llm_model"] == "environment-model"
+
+    with SessionLocal() as session:
+        session.delete(session.get(Scenario, scenario.json()["id"]))
+        session.delete(session.get(Agent, agent.json()["id"]))
         session.commit()
 
 

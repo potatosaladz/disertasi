@@ -1,5 +1,7 @@
 import hashlib
 import json
+import logging
+import warnings
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from time import perf_counter
@@ -33,6 +35,9 @@ from .models import (
     ReasoningLog,
     Scenario,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 class TemplateLLMConfig(BaseModel):
@@ -443,7 +448,11 @@ def _synthesize_agent_domain_rules(agent: Agent, scenario: Scenario) -> AgentDom
     base = _base_agent_domain_rules(agent)
     started_at = perf_counter()
     try:
-        config = resolve_llm_runtime_config(agent)
+        with warnings.catch_warnings(record=True) as configuration_warnings:
+            warnings.simplefilter("always", RuntimeWarning)
+            config = resolve_llm_runtime_config(agent)
+        for warning in configuration_warnings:
+            logger.warning("Mandate synthesis configuration: %s", warning.message)
         seed = mandate_seed(agent)
         response = OpenAI(
             api_key=config.api_key,
@@ -504,6 +513,7 @@ def _synthesize_agent_domain_rules(agent: Agent, scenario: Scenario) -> AgentDom
             }
         )
     except Exception as error:
+        logger.exception("Mandate synthesis failed for agent %s", agent.id)
         code: Literal["CONFIGURATION_ERROR", "PROVIDER_ERROR", "EMPTY_CONTENT", "INVALID_JSON", "SCHEMA_ERROR"] = (
             "CONFIGURATION_ERROR"
             if isinstance(error, ValueError) and "configuration" in str(error)
@@ -585,6 +595,7 @@ def generate_domain_rules(scenario_id: int) -> DomainRulesResponse | JSONRespons
                 ),
             )
     except Exception as error:
+        logger.exception("Unexpected domain mandate generation failure for scenario %s", scenario_id)
         return JSONResponse(
             status_code=500,
             content={

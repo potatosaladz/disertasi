@@ -1,6 +1,8 @@
 import json
 import math
+import os
 import re
+import warnings
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, TypeVar
@@ -78,31 +80,44 @@ class HardConstraints:
 
 
 def resolve_llm_runtime_config(agent: object) -> LLMRuntimeConfig:
-    fields = {
-        "base_url": _value(agent, "llm_base_url"),
-        "api_key": _value(agent, "llm_api_key"),
-        "model": _value(agent, "llm_model"),
+    agent_name = str(_value(agent, "name"))
+    field_sources = {
+        "base_url": (_value(agent, "llm_base_url"), os.getenv("OPENAI_BASE_URL")),
+        "api_key": (_value(agent, "llm_api_key"), os.getenv("OPENAI_API_KEY")),
+        "model": (_value(agent, "llm_model"), os.getenv("OPENAI_MODEL")),
     }
+    resolved: dict[str, str] = {}
+    fallback_fields: list[str] = []
     placeholder_values = {"local-model", "local-llm"}
+    for field, (agent_value, environment_value) in field_sources.items():
+        if isinstance(agent_value, str) and agent_value.strip():
+            resolved[field] = agent_value.strip()
+        elif isinstance(environment_value, str) and environment_value.strip():
+            resolved[field] = environment_value.strip()
+            fallback_fields.append(field)
     missing = [
-        name
-        for name, value in fields.items()
-        if not isinstance(value, str)
-        or not value.strip()
-        or value.strip().lower() in placeholder_values
+        field
+        for field in field_sources
+        if field not in resolved or resolved[field].lower() in placeholder_values
     ]
     if missing:
-        agent_name = str(_value(agent, "name"))
         raise ValueError(
-            f"Agent {agent_name!r} requires database LLM configuration: {', '.join(missing)}"
+            f"Agent {agent_name!r} requires database LLM configuration or valid environment fallback: "
+            f"{', '.join(missing)}"
         )
-    base_url = str(fields["base_url"]).strip()
+    if fallback_fields:
+        warnings.warn(
+            f"Agent {agent_name!r} uses environment fallback for: {', '.join(fallback_fields)}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    base_url = resolved["base_url"]
     if not base_url.startswith(("http://", "https://")):
         raise ValueError("LLM base_url must use http:// or https://")
     return LLMRuntimeConfig(
         base_url=base_url,
-        api_key=str(fields["api_key"]).strip(),
-        model=str(fields["model"]).strip(),
+        api_key=resolved["api_key"],
+        model=resolved["model"],
     )
 
 
