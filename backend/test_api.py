@@ -423,6 +423,54 @@ def test_domain_rules_falls_back_when_scenario_mandate_is_empty(
         session.commit()
 
 
+def test_domain_rules_falls_back_for_all_empty_synthesis_fields(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class EmptyFieldsCompletions:
+        def create(self, **_kwargs: object) -> object:
+            message = type("Message", (), {"content": json.dumps({})})()
+            choice = type("Choice", (), {"message": message})()
+            return type("Response", (), {"choices": [choice], "usage": None})()
+
+    class FakeClient:
+        def __init__(self, **_kwargs: object) -> None:
+            self.chat = type("Chat", (), {"completions": EmptyFieldsCompletions()})()
+
+    monkeypatch.setattr("backend.main.OpenAI", FakeClient)
+    agent = client.post(
+        "/api/agents",
+        json={
+            "name": f"empty-fields-{uuid.uuid4()}",
+            "role": "Macro Reviewer",
+            "llm_base_url": "https://empty-fields.example/v1",
+            "llm_api_key": "empty-fields-secret",
+            "llm_model": "empty-fields-model",
+        },
+    )
+    scenario = client.post(
+        "/api/scenarios",
+        json={"description": "General APBN policy review"},
+    )
+
+    response = client.post(f"/api/scenarios/{scenario.json()['id']}/domain-rules")
+
+    assert response.status_code == 200
+    rule = response.json()["agent_rules"][0]
+    assert rule["scenario_mandate"]
+    assert rule["scenario_focus"] == [
+        "Kebijakan Fiskal",
+        "Optimalisasi Penerimaan Negara",
+        "Makroekonomi",
+    ]
+    assert rule["priority_questions"]
+    assert rule["required_evidence"]
+
+    with SessionLocal() as session:
+        session.delete(session.get(Scenario, scenario.json()["id"]))
+        session.delete(session.get(Agent, agent.json()["id"]))
+        session.commit()
+
+
 def test_domain_rules_returns_json_when_all_synthesis_calls_fail(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:

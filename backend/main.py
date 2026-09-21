@@ -438,6 +438,56 @@ def _combined_domain_rules(agents: list[Agent], scenario: Scenario) -> dict[str,
     }
 
 
+class MandateSynthesisFallbacks(BaseModel):
+    scenario_mandate: str
+    scenario_focus: list[str]
+    priority_questions: list[str]
+    required_evidence: list[str]
+
+
+MANDATE_DEFAULT_FOCUS = [
+    "Kebijakan Fiskal",
+    "Optimalisasi Penerimaan Negara",
+    "Makroekonomi",
+]
+
+
+def _fallback_scenario_mandate(agent: Agent, scenario: Scenario) -> str:
+    description = scenario.description.strip() or "evaluasi kebijakan APBN umum"
+    return f"Evaluate the active APBN policy scenario from the {agent.role} mandate: {description}"
+
+
+def _normalise_mandate_list(
+    value: object,
+    fallback: list[str],
+    field_name: str,
+    agent_id: int,
+) -> list[str]:
+    if isinstance(value, list):
+        valid_items = [item.strip() for item in value if isinstance(item, str) and item.strip()]
+        if valid_items:
+            return list(dict.fromkeys(valid_items))
+    logger.warning(
+        "Agent %s returned an empty or invalid %s; using safe fallback",
+        agent_id,
+        field_name,
+    )
+    return fallback.copy()
+
+
+def _synthesis_fallbacks(agent: Agent, scenario: Scenario) -> MandateSynthesisFallbacks:
+    return MandateSynthesisFallbacks(
+        scenario_mandate=_fallback_scenario_mandate(agent, scenario),
+        scenario_focus=MANDATE_DEFAULT_FOCUS.copy(),
+        priority_questions=[
+            "What legal, fiscal, and implementation conditions must be verified before adoption?"
+        ],
+        required_evidence=[
+            "Current APBN baseline, source-linked fiscal assumptions, and implementation evidence"
+        ],
+    )
+
+
 def _base_agent_domain_rules(agent: Agent) -> AgentDomainRules:
     seed = mandate_seed(agent)
     return AgentDomainRules(
@@ -506,26 +556,32 @@ def _synthesize_agent_domain_rules(agent: Agent, scenario: Scenario) -> AgentDom
         )
         content, tokens = extract_llm_completion(response)
         payload = extract_json_object(content)
+        fallback_values = _synthesis_fallbacks(agent, scenario)
         scenario_mandate = payload.get("scenario_mandate")
-        scenario_focus = payload.get("scenario_focus")
-        priority_questions = payload.get("priority_questions")
-        required_evidence = payload.get("required_evidence")
         if not isinstance(scenario_mandate, str) or not scenario_mandate.strip():
-            scenario_mandate = (
-                f"Evaluate the active APBN policy scenario from the {agent.role} mandate: "
-                f"{scenario.description.strip()}"
-            )
+            scenario_mandate = fallback_values.scenario_mandate
             logger.warning(
                 "Agent %s returned an empty scenario_mandate; using scenario-aware fallback",
                 agent.id,
             )
-        for field_name, value in {
-            "scenario_focus": scenario_focus,
-            "priority_questions": priority_questions,
-            "required_evidence": required_evidence,
-        }.items():
-            if not isinstance(value, list) or not all(isinstance(item, str) and item.strip() for item in value):
-                raise ValueError(f"{field_name} must contain non-empty strings")
+        scenario_focus = _normalise_mandate_list(
+            payload.get("scenario_focus"),
+            fallback_values.scenario_focus,
+            "scenario_focus",
+            agent.id,
+        )
+        priority_questions = _normalise_mandate_list(
+            payload.get("priority_questions"),
+            fallback_values.priority_questions,
+            "priority_questions",
+            agent.id,
+        )
+        required_evidence = _normalise_mandate_list(
+            payload.get("required_evidence"),
+            fallback_values.required_evidence,
+            "required_evidence",
+            agent.id,
+        )
         return base.model_copy(
             update={
                 "synthesis_status": "generated",
