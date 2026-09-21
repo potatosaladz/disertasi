@@ -503,7 +503,14 @@ def _synthesize_agent_domain_rules(agent: Agent, scenario: Scenario) -> AgentDom
         priority_questions = payload.get("priority_questions")
         required_evidence = payload.get("required_evidence")
         if not isinstance(scenario_mandate, str) or not scenario_mandate.strip():
-            raise ValueError("scenario_mandate must be a non-empty string")
+            scenario_mandate = (
+                f"Evaluate the active APBN policy scenario from the {agent.role} mandate: "
+                f"{scenario.description.strip()}"
+            )
+            logger.warning(
+                "Agent %s returned an empty scenario_mandate; using scenario-aware fallback",
+                agent.id,
+            )
         for field_name, value in {
             "scenario_focus": scenario_focus,
             "priority_questions": priority_questions,

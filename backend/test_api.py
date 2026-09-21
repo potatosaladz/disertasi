@@ -370,6 +370,59 @@ def test_domain_rules_uses_environment_fallback(
         session.commit()
 
 
+def test_domain_rules_falls_back_when_scenario_mandate_is_empty(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class EmptyMandateCompletions:
+        def create(self, **_kwargs: object) -> object:
+            content = json.dumps(
+                {
+                    "scenario_mandate": "   ",
+                    "scenario_focus": ["Fiscal implementation"],
+                    "priority_questions": ["Is implementation feasible?"],
+                    "required_evidence": ["Implementation plan"],
+                }
+            )
+            message = type("Message", (), {"content": content})()
+            choice = type("Choice", (), {"message": message})()
+            return type("Response", (), {"choices": [choice], "usage": None})()
+
+    class FakeClient:
+        def __init__(self, **_kwargs: object) -> None:
+            self.chat = type("Chat", (), {"completions": EmptyMandateCompletions()})()
+
+    monkeypatch.setattr("backend.main.OpenAI", FakeClient)
+    agent = client.post(
+        "/api/agents",
+        json={
+            "name": f"empty-mandate-{uuid.uuid4()}",
+            "role": "Fiscal Reviewer",
+            "llm_base_url": "https://mandate.example/v1",
+            "llm_api_key": "mandate-secret",
+            "llm_model": "mandate-model",
+        },
+    )
+    scenario = client.post(
+        "/api/scenarios",
+        json={"description": "Assess targeted APBN assistance"},
+    )
+
+    response = client.post(f"/api/scenarios/{scenario.json()['id']}/domain-rules")
+
+    assert response.status_code == 200
+    rule = response.json()["agent_rules"][0]
+    assert rule["synthesis_status"] == "generated"
+    assert rule["scenario_mandate"] == (
+        "Evaluate the active APBN policy scenario from the Fiscal Reviewer mandate: "
+        "Assess targeted APBN assistance"
+    )
+
+    with SessionLocal() as session:
+        session.delete(session.get(Scenario, scenario.json()["id"]))
+        session.delete(session.get(Agent, agent.json()["id"]))
+        session.commit()
+
+
 def test_domain_rules_returns_json_when_all_synthesis_calls_fail(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
