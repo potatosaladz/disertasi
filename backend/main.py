@@ -1,7 +1,9 @@
+import hashlib
+import json
 from contextlib import asynccontextmanager
 from collections.abc import AsyncIterator
 
-from fastapi import FastAPI, HTTPException, status
+from fastapi import FastAPI, HTTPException, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select, text
@@ -14,7 +16,13 @@ from .agent_templates import (
 from .dashboard import router as dashboard_router
 from .database import SessionLocal
 from .init_db import initialize_database
-from .models import Agent, Scenario
+from .models import (
+    Agent,
+    AgentInfluenceObservation,
+    DisagreementLog,
+    ReasoningLog,
+    Scenario,
+)
 
 
 class AgentCreate(BaseModel):
@@ -71,6 +79,15 @@ class AgentResponse(BaseModel):
     temperature: float
     max_tokens: int
     has_llm_api_key: bool
+
+
+class DomainRulesResponse(BaseModel):
+    scenario_id: int
+    revision: str
+    generated: bool
+    stale: bool
+    agent_count: int
+    rules: dict[str, object]
 
 
 class ScenarioCreate(BaseModel):
@@ -214,6 +231,97 @@ def update_agent(agent_id: int, payload: AgentUpdate) -> AgentResponse:
 def list_agents() -> list[AgentResponse]:
     with SessionLocal() as session:
         return [agent_response(agent) for agent in session.scalars(select(Agent).order_by(Agent.id))]
+
+
+def _agent_revision(agents: list[Agent]) -> str:
+    payload = [
+        {
+            "id": agent.id,
+            "template_key": agent.template_key,
+            "role": agent.role,
+            "llm_model": agent.llm_model,
+            "temperature": agent.temperature,
+            "max_tokens": agent.max_tokens,
+            "theta_x": agent.theta_x,
+            "theta_q": agent.theta_q,
+            "theta_h": agent.theta_h,
+            "theta_s": agent.theta_s,
+            "theta_u": agent.theta_u,
+        }
+        for agent in agents
+    ]
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:16]
+
+
+def _combined_domain_rules(agents: list[Agent], scenario: Scenario) -> dict[str, object]:
+    specs = [spec for agent in agents if (spec := get_agent_spec(agent.template_key))]
+    return {
+        "hard_constraints": sorted({item for spec in specs for item in spec.constraints}),
+        "owned_checks": sorted({item for spec in specs for item in spec.owned_checks}),
+        "principles": sorted({item for spec in specs for item in spec.decision_principles}),
+        "primary_sources": sorted({item for spec in specs for item in spec.primary_sources}),
+        "automatic_deficit_ceiling": scenario.max_deficit_constraint,
+    }
+
+
+@app.post("/api/scenarios/{scenario_id}/domain-rules", response_model=DomainRulesResponse)
+def generate_domain_rules(scenario_id: int) -> DomainRulesResponse:
+    with SessionLocal() as session:
+        scenario = session.get(Scenario, scenario_id)
+        if scenario is None:
+            raise HTTPException(status_code=404, detail="Scenario not found")
+        agents = list(session.scalars(select(Agent).order_by(Agent.id)))
+        if not agents:
+            raise HTTPException(status_code=409, detail="At least one agent is required")
+        return DomainRulesResponse(
+            scenario_id=scenario_id,
+            revision=_agent_revision(agents),
+            generated=True,
+            stale=False,
+            agent_count=len(agents),
+            rules=_combined_domain_rules(agents, scenario),
+        )
+
+
+@app.delete("/api/agents/{agent_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_agent(agent_id: int) -> Response:
+    with SessionLocal() as session:
+        agent = session.get(Agent, agent_id)
+        if agent is None:
+            raise HTTPException(status_code=404, detail="Agent not found")
+        references = session.scalar(
+            select(ReasoningLog.id).where(ReasoningLog.agent_id == agent_id).limit(1)
+        ) or session.scalar(
+            select(DisagreementLog.id)
+            .where((DisagreementLog.agent_i == agent_id) | (DisagreementLog.agent_j == agent_id))
+            .limit(1)
+        ) or session.scalar(
+            select(AgentInfluenceObservation.id)
+            .where(AgentInfluenceObservation.agent_id == agent_id)
+            .limit(1)
+        )
+        if references is not None:
+            raise HTTPException(status_code=409, detail="Agent is referenced by research records")
+        session.delete(agent)
+        session.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@app.get("/api/scenarios/{scenario_id}/domain-rules", response_model=DomainRulesResponse)
+def get_domain_rules(scenario_id: int) -> DomainRulesResponse:
+    with SessionLocal() as session:
+        scenario = session.get(Scenario, scenario_id)
+        if scenario is None:
+            raise HTTPException(status_code=404, detail="Scenario not found")
+        agents = list(session.scalars(select(Agent).order_by(Agent.id)))
+        return DomainRulesResponse(
+            scenario_id=scenario_id,
+            revision=_agent_revision(agents),
+            generated=False,
+            stale=True,
+            agent_count=len(agents),
+            rules={},
+        )
 
 
 @app.post("/api/scenarios", response_model=ScenarioResponse, status_code=status.HTTP_201_CREATED)

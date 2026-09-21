@@ -78,6 +78,7 @@ type Dashboard = {
   influence_observations: Influence[];
 };
 type RunState = { task_id: string; status: string; logs: string[]; result?: { metric_snapshot_id: number } | null; error?: string };
+type DomainRules = { scenario_id: number; revision: string; generated: boolean; stale: boolean; agent_count: number; rules: { hard_constraints?: string[]; owned_checks?: string[]; principles?: string[]; primary_sources?: string[]; automatic_deficit_ceiling?: number } };
 type AgentForm = Omit<Agent, "id" | "has_llm_api_key" | "template_key" | "system_prompt"> & { llm_api_key: string };
 type ScenarioForm = Omit<Scenario, "id" | "max_deficit_constraint">;
 
@@ -122,7 +123,10 @@ export default function Home() {
   const [dashboard, setDashboard] = useState<Dashboard | null>(null);
   const [run, setRun] = useState<RunState | null>(null);
   const [notice, setNotice] = useState("Research console ready. Select a scenario to activate the tracker.");
+  const [domainRules, setDomainRules] = useState<DomainRules | null>(null);
+  const [rulesBusy, setRulesBusy] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [editingAgentId, setEditingAgentId] = useState<number | null>(null);
 
   async function loadTemplates() {
     const response = await fetch("/api/agent-templates", { cache: "no-store" });
@@ -212,13 +216,38 @@ export default function Home() {
         ...agent,
         template_key: selectedTemplate || null,
         llm_base_url: agent.llm_base_url || null,
-        llm_api_key: agent.llm_api_key || null,
+        llm_api_key: agent.llm_api_key || undefined,
         llm_model: agent.llm_model || null,
       };
-      const response = await fetch(`${apiUrl}/api/agents`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(agentPayload) });
+      const endpoint = editingAgentId ? `${apiUrl}/api/agents/${editingAgentId}` : `${apiUrl}/api/agents`;
+      const response = await fetch(endpoint, { method: editingAgentId ? "PUT" : "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(agentPayload) });
       const payload = await response.json(); if (!response.ok) throw new Error(payload.detail ?? "Agent could not be saved");
-      setAgent(initialAgent); setSelectedTemplate(""); await loadSetup(); setNotice(`Agent ${payload.name} committed. ΘU = ${payload.theta_u}.`);
+      setAgent(initialAgent); setSelectedTemplate(""); setEditingAgentId(null); setDomainRules(null); await loadSetup(); setNotice(`Agent ${payload.name} berhasil disimpan.`);
     } catch (error) { setNotice(error instanceof Error ? error.message : "Agent could not be saved"); } finally { setBusy(false); }
+  }
+
+  function editAgent(item: Agent) {
+    setEditingAgentId(item.id);
+    setSelectedTemplate(item.template_key ?? "");
+    setAgent({ name: item.name, role: item.role, theta_x: item.theta_x, theta_q: item.theta_q, theta_h: item.theta_h, theta_s: item.theta_s, theta_u: item.theta_u, llm_base_url: item.llm_base_url ?? "", llm_api_key: "", llm_model: item.llm_model ?? "", temperature: item.temperature, max_tokens: item.max_tokens });
+    document.getElementById("setup")?.scrollIntoView({ behavior: "smooth" });
+  }
+
+  async function deleteAgent(item: Agent) {
+    if (!window.confirm(`Hapus agen ${item.name}?`)) return;
+    const response = await fetch(`${apiUrl}/api/agents/${item.id}`, { method: "DELETE" });
+    if (!response.ok) { const payload = await response.json(); setNotice(payload.detail ?? "Agent tidak dapat dihapus"); return; }
+    setDomainRules(null); await loadSetup(); setNotice(`Agent ${item.name} dihapus.`);
+  }
+
+  async function generateMandate() {
+    if (selectedScenario === null || agents.length === 0) return;
+    setRulesBusy(true);
+    try {
+      const response = await fetch(`${apiUrl}/api/scenarios/${selectedScenario}/domain-rules`, { method: "POST" });
+      const payload = await response.json(); if (!response.ok) throw new Error(payload.detail ?? "Mandat gagal dibuat");
+      setDomainRules(payload); setNotice(`Mandat gabungan dibuat dari ${payload.agent_count} agen.`);
+    } catch (error) { setNotice(error instanceof Error ? error.message : "Mandat gagal dibuat"); } finally { setRulesBusy(false); }
   }
 
   async function submitScenario(event: FormEvent<HTMLFormElement>) {
@@ -232,6 +261,7 @@ export default function Home() {
 
   async function startRun() {
     if (selectedScenario === null) { setNotice("Select a scenario before starting a cycle."); return; }
+    if (rulesAreStale) { setNotice("Generate ulang mandat setelah perubahan agen sebelum memulai diskusi."); return; }
     const response = await fetch(`${apiUrl}/api/scenarios/${selectedScenario}/runs`, { method: "POST" });
     const payload = await response.json();
     if (!response.ok) { setNotice(payload.detail ?? "Could not queue cycle"); return; }
@@ -250,6 +280,8 @@ export default function Home() {
   const latest = dashboard?.latest_metric ?? null;
   const activeLogs = run?.logs ?? ["Awaiting task dispatch."];
   const selectedTemplateData = templates.find((item) => item.key === selectedTemplate);
+  const canGenerateRules = selectedScenario !== null && agents.length > 0;
+  const rulesAreStale = canGenerateRules && (!domainRules || domainRules.agent_count !== agents.length);
   const activeInfluence = useMemo(() => [...(dashboard?.influence_observations ?? [])].sort((a, b) => (b.normalized_weight ?? 0) - (a.normalized_weight ?? 0)), [dashboard]);
 
   return <main className="shell dashboard-shell">
@@ -257,7 +289,7 @@ export default function Home() {
     <section className="dashboard-hero"><div><div className="eyebrow">PHASE 05 / OBSERVATION LAYER</div><h1>Make disagreement<br /><em>inspectable.</em></h1><p>A live evidence surface for tracking execution, divergence, hard constraints, and the convergence states produced by each fiscal experiment.</p></div><div className="hero-orbit"><span>DDR</span><b>→</b><span>CAR</span><b>→</b><span>SHCR</span></div></section>
     <div className="notice"><span className="notice-label">SYSTEM NOTE</span><span>{notice}</span></div>
 
-    <section className="control-strip"><div className="scenario-select"><label className="field"><span>Active scenario / experiment scope</span><select value={selectedScenario ?? ""} onChange={(event) => setSelectedScenario(Number(event.target.value))}><option value="" disabled>Select scenario</option>{scenarios.map((item) => <option key={item.id} value={item.id}>#{item.id} — {item.description}</option>)}</select></label></div><button className="primary-button run-button" onClick={startRun} disabled={run?.status === "RUNNING" || run?.status === "QUEUED"}>{run?.status === "RUNNING" ? "Cycle running…" : "Run SHCR cycle"}<span>↗</span></button></section>
+    <section className="control-strip"><div className="scenario-select"><label className="field"><span>Active scenario / experiment scope</span><select value={selectedScenario ?? ""} onChange={(event) => { setSelectedScenario(Number(event.target.value)); setDomainRules(null); }}><option value="" disabled>Select scenario</option>{scenarios.map((item) => <option key={item.id} value={item.id}>#{item.id} — {item.description}</option>)}</select></label></div><button className="primary-button run-button" onClick={startRun} disabled={run?.status === "RUNNING" || run?.status === "QUEUED" || rulesAreStale}>{run?.status === "RUNNING" ? "Diskusi berjalan…" : "Mulai Diskusi"}<span>↗</span></button></section>
 
     <nav className="menu-rail"><span className="menu-label">CONTROL MENUS</span><a href="#setup">01 / Setup</a><a href="#setup">02 / Scenario</a><a className="active" href="#tracker">03 / Live Tracker</a><a href="#ddr">04 / DDR Network</a><a href="#analytics">05 / Analytics</a></nav>
 
@@ -294,7 +326,7 @@ export default function Home() {
 
         <fieldset className="form-card mandate-card">
           <legend><span>03</span> Mandat &amp; Aturan Domain Otomatis</legend>
-          <div className="automatic-rules"><strong>{selectedTemplate ? "Kontrak domain template aktif" : "Pilih template untuk mengaktifkan mandat domain"}</strong><p>Mandat, sumber primer, hard checks, constraint, dimensi dampak, risiko, ketidakpastian, dan prinsip keputusan dirakit otomatis oleh backend. Pengguna tidak perlu menulis system prompt manual.</p></div>
+          <div className="automatic-rules"><strong>{selectedTemplate ? "Kontrak domain template aktif" : "Pilih template untuk mengaktifkan mandat domain"}</strong><p>Mandat, sumber primer, hard checks, constraint, dimensi dampak, risiko, ketidakpastian, dan prinsip keputusan dirakit otomatis oleh backend. Pengguna tidak perlu menulis system prompt manual.</p><button type="button" className="template-load-button" onClick={generateMandate} disabled={!canGenerateRules || rulesBusy}>{rulesBusy ? "Generating…" : "Generate Otomatis Mandat"}</button>{rulesAreStale && <small className="stale-rules">Konfigurasi agen berubah; generate ulang wajib dilakukan sebelum diskusi.</small>}{domainRules && !domainRules.stale && <small>Revision {domainRules.revision} · {domainRules.rules.owned_checks?.length ?? 0} hard checks · {domainRules.rules.hard_constraints?.length ?? 0} constraints</small>}</div>
         </fieldset>
 
         <fieldset className="form-card">
@@ -307,10 +339,10 @@ export default function Home() {
             <NumericField label="Theta U — Uncertainty" value={agent.theta_u} hint="Penalti ketidakpastian; isi 0 untuk A6." onChange={(value) => setAgent({ ...agent, theta_u: value })} />
           </div>
         </fieldset>
-        <button className="primary-button agent-submit" disabled={busy} type="submit">Simpan konfigurasi agen<span>↗</span></button>
+        <button className="primary-button agent-submit" disabled={busy} type="submit">{editingAgentId ? "Simpan perubahan agen" : "Simpan konfigurasi agen"}<span>↗</span></button>
       </form>
 
-      <div className="agent-register"><div className="subhead"><span>AGEN TERSIMPAN</span><b>{agents.length} AGENTS</b></div>{agents.length ? agents.map((item) => <div className="agent-register-row" key={item.id}><div><strong>{item.name}</strong><small>{item.role}</small></div><span>{item.template_key ? "TEMPLATE" : "CUSTOM"}</span><b>{item.llm_model ?? "ENV DEFAULT"}</b></div>) : <p className="empty">Belum ada agen. Muat template APBN atau buat agen baru.</p>}</div>
+      <div className="agent-register"><div className="subhead"><span>AGEN TERSIMPAN</span><b>{agents.length} AGENTS</b></div>{agents.length ? agents.map((item) => <div className="agent-register-row" key={item.id}><div><strong>{item.name}</strong><small>{item.role}</small></div><span>{item.template_key ? "TEMPLATE" : "CUSTOM"}</span><b>{item.llm_model ?? "ENV DEFAULT"}</b><div className="agent-actions"><button type="button" onClick={() => editAgent(item)}>Edit</button><button type="button" className="danger" onClick={() => deleteAgent(item)}>Delete</button></div></div>) : <p className="empty">Belum ada agen. Muat template APBN atau buat agen baru.</p>}</div>
 
       <form className="scenario-config-form" onSubmit={submitScenario}><div><span className="section-number">SCENARIO</span><h3>Uji kebijakan fiskal</h3><small>Constraint hukum dan batas defisit diterapkan otomatis oleh agen.</small></div><label className="form-field"><strong>Goal / Deskripsi Kebijakan</strong><textarea value={scenario.description} onChange={(event) => setScenario({ ...scenario, description: event.target.value })} rows={4} required /><small>Jelaskan tujuan kebijakan, program yang diuji, horizon waktu, dan hasil yang diharapkan.</small></label><label className="form-field"><strong>Program Cost / Parameter Finansial</strong><input type="number" min="0" step="0.01" value={scenario.program_cost ?? ""} onChange={(event) => setScenario({ ...scenario, program_cost: event.target.value === "" ? null : Number(event.target.value) })} /><small>Opsional. Gunakan satuan fiskal yang konsisten dengan alternatif; kosongkan bila belum diketahui.</small></label><button className="secondary-button" disabled={busy}>Simpan skenario</button></form>
     </section>

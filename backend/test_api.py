@@ -134,6 +134,46 @@ def test_agent_heterogeneous_llm_config_create_and_update(client: TestClient) ->
         session.commit()
 
 
+def test_agent_can_be_deleted_before_research_records(client: TestClient) -> None:
+    response = client.post(
+        "/api/agents",
+        json={"name": f"delete-{uuid.uuid4()}", "role": "Temporary"},
+    )
+    assert response.status_code == 201
+    deleted = client.delete(f"/api/agents/{response.json()['id']}")
+    assert deleted.status_code == 204
+    assert client.delete(f"/api/agents/{response.json()['id']}").status_code == 404
+
+
+def test_domain_rules_aggregate_template_agents(client: TestClient) -> None:
+    template_agent = client.post(
+        "/api/agents",
+        json={
+            "name": f"rules-revenue-{uuid.uuid4()}",
+            "role": "Penerimaan Negara",
+            "template_key": "revenue",
+        },
+    )
+    scenario = client.post(
+        "/api/scenarios",
+        json={"description": "Generate domain rules", "program_cost": 10.0},
+    )
+    generated = client.post(
+        f"/api/scenarios/{scenario.json()['id']}/domain-rules"
+    )
+    assert generated.status_code == 200
+    payload = generated.json()
+    assert payload["generated"] is True
+    assert payload["stale"] is False
+    assert "VERIFIED_OFFSETS_ONLY" in payload["rules"]["owned_checks"]
+    assert payload["rules"]["automatic_deficit_ceiling"] == 3.0
+
+    with SessionLocal() as session:
+        session.delete(session.get(Scenario, scenario.json()["id"]))
+        session.delete(session.get(Agent, template_agent.json()["id"]))
+        session.commit()
+
+
 def test_agent_rejects_invalid_generation_settings(client: TestClient) -> None:
     response = client.post(
         "/agents",
