@@ -33,6 +33,7 @@ def test_agent_theta_u_zero_persists(client: TestClient) -> None:
 def test_agent_templates_are_available_and_idempotent(client: TestClient) -> None:
     response = client.get("/api/agent-templates")
     assert response.status_code == 200
+    assert response.headers["content-type"].startswith("application/json")
     templates = response.json()
     assert len(templates) == 5
     assert [item["key"] for item in templates] == [

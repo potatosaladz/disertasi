@@ -81,7 +81,7 @@ type RunState = { task_id: string; status: string; logs: string[]; result?: { me
 type AgentForm = Omit<Agent, "id" | "has_llm_api_key" | "template_key" | "system_prompt"> & { llm_api_key: string };
 type ScenarioForm = Omit<Scenario, "id" | "max_deficit_constraint">;
 
-const apiUrl = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
+const apiUrl = "";
 const components = ["dE", "dA", "dP", "dR", "dU", "dO", "dC", "dREC"] as const;
 const initialAgent: AgentForm = {
   name: "",
@@ -124,19 +124,24 @@ export default function Home() {
   const [notice, setNotice] = useState("Research console ready. Select a scenario to activate the tracker.");
   const [busy, setBusy] = useState(false);
 
+  async function loadTemplates() {
+    const response = await fetch("/api/agent-templates", { cache: "no-store" });
+    if (!response.ok) throw new Error(`Template API returned ${response.status}`);
+    const payload: AgentTemplate[] = await response.json();
+    if (!Array.isArray(payload) || payload.length !== 5) throw new Error("Template API returned invalid data");
+    setTemplates(payload);
+  }
+
   async function loadSetup() {
-    const [agentResponse, scenarioResponse, templateResponse] = await Promise.all([
+    const [agentResponse, scenarioResponse] = await Promise.all([
       fetch(`${apiUrl}/api/agents`),
       fetch(`${apiUrl}/api/scenarios`),
-      fetch(`${apiUrl}/api/agent-templates`),
     ]);
-    if (!agentResponse.ok || !scenarioResponse.ok || !templateResponse.ok) throw new Error("API unavailable");
+    if (!agentResponse.ok || !scenarioResponse.ok) throw new Error("API unavailable");
     const nextAgents: Agent[] = await agentResponse.json();
     const nextScenarios: Scenario[] = await scenarioResponse.json();
-    const nextTemplates: AgentTemplate[] = await templateResponse.json();
     setAgents(nextAgents);
     setScenarios(nextScenarios);
-    setTemplates(nextTemplates);
     if (selectedScenario === null && nextScenarios.length > 0) setSelectedScenario(nextScenarios[nextScenarios.length - 1].id);
   }
 
@@ -146,7 +151,10 @@ export default function Home() {
     setDashboard(await response.json());
   }
 
-  useEffect(() => { loadSetup().catch(() => setNotice("API connection pending. Check the backend URL.")); }, []);
+  useEffect(() => {
+    loadTemplates().catch((error) => setNotice(`Template agen gagal dimuat: ${error.message}`));
+    loadSetup().catch(() => setNotice("API connection pending. Check the backend URL."));
+  }, []);
   useEffect(() => { if (selectedScenario !== null) loadDashboard(selectedScenario).catch(() => setNotice("No dashboard data for this scenario yet.")); }, [selectedScenario]);
 
   useEffect(() => {
@@ -188,7 +196,7 @@ export default function Home() {
       const response = await fetch(`${apiUrl}/api/agents/load-templates`, { method: "POST" });
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.detail ?? "Template agents could not be loaded");
-      await loadSetup();
+      await Promise.all([loadSetup(), loadTemplates()]);
       setNotice(`${payload.created} template baru dimuat; ${payload.total} template APBN siap digunakan.`);
     } catch (error) {
       setNotice(error instanceof Error ? error.message : "Template agents could not be loaded");
@@ -241,6 +249,7 @@ export default function Home() {
 
   const latest = dashboard?.latest_metric ?? null;
   const activeLogs = run?.logs ?? ["Awaiting task dispatch."];
+  const selectedTemplateData = templates.find((item) => item.key === selectedTemplate);
   const activeInfluence = useMemo(() => [...(dashboard?.influence_observations ?? [])].sort((a, b) => (b.normalized_weight ?? 0) - (a.normalized_weight ?? 0)), [dashboard]);
 
   return <main className="shell dashboard-shell">
@@ -269,7 +278,7 @@ export default function Home() {
             <label className="form-field"><strong>Nama Agen</strong><input value={agent.name} onChange={(event) => setAgent({ ...agent, name: event.target.value })} required /><small>Nama unik yang tampil pada deliberasi dan matriks DDR.</small></label>
             <label className="form-field full-width"><strong>Peran Fungsional</strong><input value={agent.role} onChange={(event) => setAgent({ ...agent, role: event.target.value })} required /><small>Contoh: Penerimaan Negara, Belanja Pemerintah, atau Stabilisasi Makro-Fiskal.</small></label>
           </div>
-          {selectedTemplate && templates.find((item) => item.key === selectedTemplate) && <TemplateContractPreview template={templates.find((item) => item.key === selectedTemplate)!} />}
+          {selectedTemplateData && <TemplateContractPreview template={selectedTemplateData} />}
         </fieldset>
 
         <fieldset className="form-card">
