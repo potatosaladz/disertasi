@@ -1,6 +1,6 @@
 "use client";
 
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 
 type Agent = {
   id: number;
@@ -79,7 +79,8 @@ type Dashboard = {
 };
 type RunLog = { stage: string; level: string; message: string };
 type RunState = { task_id: string; status: string; logs: RunLog[]; result?: { metric_snapshot_id: number } | null; error?: string };
-type DomainRules = { scenario_id: number; revision: string; generated: boolean; stale: boolean; agent_count: number; rules: { hard_constraints?: string[]; owned_checks?: string[]; principles?: string[]; primary_sources?: string[]; automatic_deficit_ceiling?: number } };
+type AgentDomainRules = { agent_id: number; name: string; role: string; template_key: string | null; mandate: string | null; primary_sources: string[]; constraints: string[]; owned_checks: string[] };
+type DomainRules = { scenario_id: number; revision: string; generated: boolean; stale: boolean; agent_count: number; rules: { hard_constraints?: string[]; owned_checks?: string[]; principles?: string[]; primary_sources?: string[]; automatic_deficit_ceiling?: number }; agent_rules: AgentDomainRules[] };
 type AgentForm = Omit<Agent, "id" | "has_llm_api_key" | "template_key" | "system_prompt"> & { llm_api_key: string };
 type ScenarioForm = Omit<Scenario, "id" | "max_deficit_constraint">;
 
@@ -110,7 +111,15 @@ function MetricCard({ label, value, unit, tone }: { label: string; value: string
 }
 
 function TemplateContractPreview({ template }: { template: AgentTemplate }) {
-  return <div className="template-contract"><p>{template.description}</p><div><span>PRIMARY SOURCES</span><strong>{template.primary_sources.join(" · ")}</strong></div><div><span>OWNED CHECKS</span><strong>{template.owned_checks.join(" · ")}</strong></div></div>;
+  return <div className="template-contract"><div><span>MANDATE</span><strong>{template.description}</strong></div><div><span>PRIMARY SOURCES</span><strong>{template.primary_sources.join(" · ")}</strong></div><div><span>CONSTRAINTS</span><strong>{template.constraints.join(" · ")}</strong></div><div><span>OWNED CHECKS</span><strong>{template.owned_checks.join(" · ")}</strong></div></div>;
+}
+
+function RuleList({ title, items, empty }: { title: string; items: string[]; empty: string }) {
+  return <section className="rule-list"><span>{title}</span>{items.length ? <ul>{items.map((item) => <li key={item}>{item}</li>)}</ul> : <p>{empty}</p>}</section>;
+}
+
+function AgentMandateCard({ rules, index }: { rules: AgentDomainRules; index: number }) {
+  return <details className="agent-mandate-card" open={index === 0}><summary><div><span>{String(index + 1).padStart(2, "0")} / {rules.template_key?.toUpperCase() ?? "CUSTOM"}</span><strong>{rules.name}</strong><small>{rules.role}</small></div><b>{rules.primary_sources.length} sources · {rules.constraints.length} constraints</b></summary><div className="agent-mandate-body"><section className="mandate-copy"><span>MANDATE</span><p>{rules.mandate ?? "Mandat terstruktur belum tersedia untuk agen ini."}</p></section><div className="agent-rule-columns"><RuleList title="PRIMARY SOURCES" items={rules.primary_sources} empty="Tidak ada sumber primer terstruktur." /><RuleList title="CONSTRAINTS" items={rules.constraints} empty="Tidak ada constraint terstruktur." /><RuleList title="OWNED CHECKS" items={rules.owned_checks} empty="Tidak ada owned checks terstruktur." /></div></div></details>;
 }
 
 export default function Home() {
@@ -131,6 +140,17 @@ export default function Home() {
   const [scenarioExpanded, setScenarioExpanded] = useState(false);
   const [templateModalOpen, setTemplateModalOpen] = useState(false);
   const [templateConfigs, setTemplateConfigs] = useState<Record<string, { llm_base_url: string; llm_api_key: string; llm_model: string; temperature: number; max_tokens: number }>>({});
+  const [connectionTests, setConnectionTests] = useState<Record<number, { ok: boolean; message: string }>>({});
+  const [mandateLogs, setMandateLogs] = useState<RunLog[]>([]);
+  const [trackerHistory, setTrackerHistory] = useState<RunLog[]>([]);
+  const trackerLogCounts = useRef<Record<string, number>>({});
+
+  function appendTrackerLogs(taskId: string, logs: RunLog[]) {
+    const previousCount = trackerLogCounts.current[taskId] ?? 0;
+    const additions = logs.slice(previousCount);
+    trackerLogCounts.current[taskId] = Math.max(previousCount, logs.length);
+    if (additions.length) setTrackerHistory((current) => [...current, ...additions]);
+  }
 
   async function loadTemplates() {
     const response = await fetch("/api/agent-templates", { cache: "no-store" });
@@ -172,6 +192,7 @@ export default function Home() {
       if (!response.ok) return;
       const nextRun: RunState = await response.json();
       setRun(nextRun);
+      appendTrackerLogs(nextRun.task_id, nextRun.logs);
       if (nextRun.status === "SUCCEEDED" && selectedScenario !== null) {
         await loadDashboard(selectedScenario);
         setNotice("Cycle complete. Dashboard metrics refreshed from PostgreSQL.");
@@ -250,14 +271,21 @@ export default function Home() {
     setDomainRules(null); await loadSetup(); setNotice(`Agent ${item.name} dihapus.`);
   }
 
+  async function testConnection(item: Agent) {
+    setConnectionTests((current) => ({ ...current, [item.id]: { ok: false, message: "Testing connection…" } }));
+    const response = await fetch(`${apiUrl}/api/agents/${item.id}/test-connection`, { method: "POST" });
+    const payload = await response.json();
+    setConnectionTests((current) => ({ ...current, [item.id]: { ok: payload.ok, message: payload.ok ? `OK · ${payload.latency_ms.toFixed(0)}ms · ${payload.model}` : payload.error } }));
+  }
+
   async function generateMandate() {
     if (selectedScenario === null || agents.length === 0) return;
     setRulesBusy(true);
     try {
       const response = await fetch(`${apiUrl}/api/scenarios/${selectedScenario}/domain-rules`, { method: "POST" });
       const payload = await response.json(); if (!response.ok) throw new Error(payload.detail ?? "Mandat gagal dibuat");
-      setDomainRules(payload); setNotice(`Mandat gabungan dibuat dari ${payload.agent_count} agen.`);
-    } catch (error) { setNotice(error instanceof Error ? error.message : "Mandat gagal dibuat"); } finally { setRulesBusy(false); }
+      setDomainRules(payload); setMandateLogs((current) => [...current, { stage: "MANDATE", level: "SUCCESS", message: `Revision ${payload.revision} generated from ${payload.agent_count} agents.` }, { stage: "CONSTRAINTS", level: "INFO", message: `${payload.rules.hard_constraints?.length ?? 0} constraints and ${payload.rules.owned_checks?.length ?? 0} owned checks consolidated.` }]); setNotice(`Mandat terstruktur dibuat untuk ${payload.agent_count} agen.`);
+    } catch (error) { const message = error instanceof Error ? error.message : "Mandat gagal dibuat"; setMandateLogs((current) => [...current, { stage: "MANDATE", level: "ERROR", message }]); setNotice(message); } finally { setRulesBusy(false); }
   }
 
   async function submitScenario(event: FormEvent<HTMLFormElement>) {
@@ -276,6 +304,7 @@ export default function Home() {
     const payload = await response.json();
     if (!response.ok) { setNotice(payload.detail ?? "Could not queue cycle"); return; }
     setRun({ task_id: payload.task_id, status: payload.status, logs: payload.logs });
+    appendTrackerLogs(payload.task_id, payload.logs);
     setNotice(`Task ${payload.task_id.slice(0, 8)} queued on Celery.`);
   }
 
@@ -288,7 +317,7 @@ export default function Home() {
   }
 
   const latest = dashboard?.latest_metric ?? null;
-  const activeLogs = run?.logs ?? [{ stage: "IDLE", level: "INFO", message: "Awaiting task dispatch." }];
+  const activeLogs = trackerHistory.length ? trackerHistory : [{ stage: "IDLE", level: "INFO", message: "Awaiting task dispatch." }];
   const selectedTemplateData = templates.find((item) => item.key === selectedTemplate);
   const canGenerateRules = selectedScenario !== null && agents.length > 0;
   const rulesAreStale = canGenerateRules && (!domainRules || domainRules.agent_count !== agents.length);
@@ -303,7 +332,7 @@ export default function Home() {
 
     <nav className="menu-rail"><span className="menu-label">CONTROL MENUS</span><a href="#setup">01 / Setup</a><a href="#setup">02 / Scenario</a><a className="active" href="#tracker">03 / Live Tracker</a><a href="#ddr">04 / DDR Network</a><a href="#analytics">05 / Analytics</a></nav>
 
-    <section id="tracker" className="tracker-panel panel"><div className="section-header"><div><span className="section-number">03</span><h2>Live Tracker</h2></div><span className={`run-state ${run?.status?.toLowerCase() ?? "idle"}`}>{run?.status ?? "IDLE"}</span></div><div className="tracker-content"><div className="progress-console">{activeLogs.map((log, index) => <div className={`console-line ${log.level.toLowerCase()}`} key={`${log.stage}-${index}`}><span>{String(index + 1).padStart(2, "0")}</span><i className={index === activeLogs.length - 1 && run?.status !== "SUCCEEDED" ? "pulse" : "done"} /><div><b>[{log.level}] {log.stage}</b><small>{log.message}</small></div></div>)}</div><div className="task-readout"><span>TASK IDENTIFIER</span><strong>{run?.task_id ?? "—"}</strong><small>{run?.error ?? (run?.status === "SUCCEEDED" ? "Result persisted" : "Polling every 1.2 seconds")}</small></div></div></section>
+    <section id="tracker" className="tracker-panel panel"><div className="section-header"><div><span className="section-number">03</span><h2>Live Tracker</h2></div><span className={`run-state ${run?.status?.toLowerCase() ?? "idle"}`}>{run?.status ?? "IDLE"}</span></div><div className="tracker-content"><div className="progress-console max-h-[450px] overflow-y-auto">{activeLogs.map((log, index) => <div className={`console-line ${log.level.toLowerCase()}`} key={`${log.stage}-${index}`}><span>{String(index + 1).padStart(2, "0")}</span><i className={index === activeLogs.length - 1 && !["SUCCEEDED", "FAILED"].includes(run?.status ?? "") ? "pulse" : "done"} /><div><b>[{log.level}] {log.stage}</b><small>{log.message}</small></div></div>)}</div><div className="task-readout"><span>TASK IDENTIFIER</span><strong>{run?.task_id ?? "—"}</strong><small>{run?.error ?? (run?.status === "SUCCEEDED" ? "Result persisted" : "Polling every 1.2 seconds")}</small></div></div></section>
 
     <section id="ddr" className="panel"><div className="section-header"><div><span className="section-number">04</span><h2>DDR Network</h2></div><span className="panel-code">D<sub>ij</sub> / 8 COMPONENTS</span></div><div className="matrix-wrap">{dashboard?.disagreements.length ? <table className="ddr-table"><thead><tr><th>AGENT PAIR</th>{components.map((component) => <th key={component}>{component}</th>)}<th>RESOLUTION MECHANISM</th></tr></thead><tbody>{dashboard.disagreements.map((item) => <tr key={item.id}><td><strong>{item.agent_i}</strong><small>× {item.agent_j}</small></td>{components.map((component) => <td key={component}><span className={`bool ${item[component] ? "conflict" : "clear"}`}>{item[component] ? "1" : "0"}</span></td>)}<td className="resolution">{item.resolution_mechanism}</td></tr>)}</tbody></table> : <div className="empty-state"><strong>No DDR vectors yet.</strong><span>Run a cycle with at least two schema-valid agents to populate the matrix.</span></div>}</div></section>
 
@@ -336,7 +365,7 @@ export default function Home() {
 
         <fieldset className="form-card mandate-card">
           <legend><span>03</span> Mandat &amp; Aturan Domain Otomatis</legend>
-          <div className="automatic-rules"><strong>{selectedTemplate ? "Kontrak domain template aktif" : "Pilih template untuk mengaktifkan mandat domain"}</strong><p>Mandat, sumber primer, hard checks, constraint, dimensi dampak, risiko, ketidakpastian, dan prinsip keputusan dirakit otomatis oleh backend. Pengguna tidak perlu menulis system prompt manual.</p><button type="button" className="template-load-button" onClick={generateMandate} disabled={!canGenerateRules || rulesBusy}>{rulesBusy ? "Generating…" : "Generate Otomatis Mandat"}</button>{rulesAreStale && <small className="stale-rules">Konfigurasi agen berubah; generate ulang wajib dilakukan sebelum diskusi.</small>}{domainRules && !domainRules.stale && <small>Revision {domainRules.revision} · {domainRules.rules.owned_checks?.length ?? 0} hard checks · {domainRules.rules.hard_constraints?.length ?? 0} constraints</small>}</div>
+          <div className="automatic-rules"><div className="automatic-rules-intro"><div><strong>{selectedTemplate ? "Kontrak domain template aktif" : "Mandat lintas agen siap dirakit"}</strong><p>Backend menyusun mandat, sumber primer, constraints, dan owned checks per agen tanpa mencampur kepemilikan aturan.</p></div><button type="button" className="template-load-button" onClick={generateMandate} disabled={!canGenerateRules || rulesBusy}>{rulesBusy ? "Generating…" : "Generate Otomatis Mandat"}</button></div>{rulesAreStale && <small className="stale-rules">Konfigurasi agen berubah; generate ulang wajib dilakukan sebelum diskusi.</small>}{domainRules && !domainRules.stale && <><div className="rules-revision"><span>REVISION {domainRules.revision}</span><b>{domainRules.agent_count} AGENTS</b><small>{domainRules.rules.owned_checks?.length ?? 0} hard checks · {domainRules.rules.hard_constraints?.length ?? 0} constraints global</small></div><div className="agent-mandate-grid">{domainRules.agent_rules.map((rules, index) => <AgentMandateCard rules={rules} index={index} key={rules.agent_id} />)}</div></>}{mandateLogs.length > 0 && <div className="mandate-console">{mandateLogs.map((log, index) => <div className={log.level.toLowerCase()} key={`${log.stage}-${index}`}><b>[{log.level}] {log.stage}</b><span>{log.message}</span></div>)}</div>}</div>
         </fieldset>
 
         <fieldset className="form-card">
@@ -352,7 +381,7 @@ export default function Home() {
         <button className="primary-button agent-submit" disabled={busy} type="submit">{editingAgentId ? "Simpan perubahan agen" : "Simpan konfigurasi agen"}<span>↗</span></button>
       </form>
 
-      <div className="agent-register"><div className="subhead"><span>AGEN TERSIMPAN</span><b>{agents.length} AGENTS</b></div>{agents.length ? agents.map((item) => <div className="agent-register-row" key={item.id}><div><strong>{item.name}</strong><small>{item.role}</small></div><span>{item.template_key ? "TEMPLATE" : "CUSTOM"}</span><b>{item.llm_model ?? "ENV DEFAULT"}</b><div className="agent-actions"><button type="button" onClick={() => editAgent(item)}>Edit</button><button type="button" className="danger" onClick={() => deleteAgent(item)}>Delete</button></div></div>) : <p className="empty">Belum ada agen. Muat template APBN atau buat agen baru.</p>}</div>
+      <div className="agent-register"><div className="subhead"><span>AGEN TERSIMPAN</span><b>{agents.length} AGENTS</b></div>{agents.length ? agents.map((item) => <div className="agent-register-row" key={item.id}><div><strong>{item.name}</strong><small>{item.role}</small></div><span>{item.template_key ? "TEMPLATE" : "CUSTOM"}</span><b>{item.llm_model ?? "ENV DEFAULT"}</b><div className="agent-actions"><button type="button" onClick={() => testConnection(item)}>Test Connection</button><button type="button" onClick={() => editAgent(item)}>Edit</button><button type="button" className="danger" onClick={() => deleteAgent(item)}>Delete</button>{connectionTests[item.id] && <small className={connectionTests[item.id].ok ? "test-ok" : "test-error"}>{connectionTests[item.id].message}</small>}</div></div>) : <p className="empty">Belum ada agen. Muat template APBN atau buat agen baru.</p>}</div>
 
       <form className="scenario-config-form" onSubmit={submitScenario}><div><span className="section-number">SCENARIO</span><h3>Uji kebijakan fiskal</h3><small>Constraint hukum dan batas defisit diterapkan otomatis oleh agen.</small></div><label className="form-field"><strong>Goal / Deskripsi Kebijakan</strong><textarea value={scenario.description} onChange={(event) => setScenario({ ...scenario, description: event.target.value })} rows={4} required /><small>Jelaskan tujuan kebijakan, program yang diuji, horizon waktu, dan hasil yang diharapkan.</small></label><label className="form-field"><strong>Program Cost / Parameter Finansial</strong><input type="number" min="0" step="0.01" value={scenario.program_cost ?? ""} onChange={(event) => setScenario({ ...scenario, program_cost: event.target.value === "" ? null : Number(event.target.value) })} /><small>Opsional. Gunakan satuan fiskal yang konsisten dengan alternatif; kosongkan bila belum diketahui.</small></label><button className="secondary-button" disabled={busy}>Simpan skenario</button></form>
     </section>

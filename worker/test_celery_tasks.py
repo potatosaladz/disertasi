@@ -15,6 +15,7 @@ from backend.models import (
 )
 from backend.agent_templates import AGENTS
 from worker.celery_tasks import _default_llm_call, _extract_llm_response, execute_full_shcr_cycle
+from worker.srr_models import Evidence, SRRResponse
 
 
 @pytest.fixture
@@ -128,6 +129,33 @@ def test_extract_llm_response_accepts_raw_string_and_dict() -> None:
     )
     assert content == '{"recommendation": {}}'
     assert tokens == 17
+
+
+def test_sparse_srr_response_uses_defaults_and_allows_extra_fields() -> None:
+    first = SRRResponse.model_validate(
+        {
+            "provider_metadata": {"model": "fiscal-specialist"},
+            "evidence": [
+                {
+                    "content": "Verified baseline",
+                    "source_tag": "budget-2026",
+                    "relevance": "high",
+                }
+            ],
+        }
+    )
+    second = SRRResponse.model_validate({})
+
+    first.evidence.append(Evidence(content="Additional evidence"))
+
+    assert second.evidence == []
+    assert first.alternatives == []
+    assert first.recommendation is None
+    assert first.confidence is None
+    assert first.material_information_retention_macro_f1 is None
+    assert first.model_extra == {"provider_metadata": {"model": "fiscal-specialist"}}
+    assert first.evidence[0].content == "Verified baseline"
+    assert second.divergence_object()["REC"] is None
 
 
 def test_default_llm_call_uses_canonical_template_mandate(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -265,6 +293,42 @@ def test_run_full_shcr_cycle_populates_postgres(scenario_id: int) -> None:
             )
         )
         assert sum(item.normalized_weight or 0.0 for item in observations) == pytest.approx(1.0)
+
+
+def test_sparse_llm_json_is_valid_and_reports_insufficient_evidence(
+    scenario_id: int,
+) -> None:
+    responses = iter(
+        [
+            ('{"provider_metadata":{"model":"a"}}', 5),
+            ('{"material_information_retention_macro_f1":0.8}', 7),
+        ]
+    )
+
+    result = execute_full_shcr_cycle(
+        scenario_id,
+        lambda _agent, _scenario: next(responses),
+    )
+
+    assert result["convergence_status"] == "INSUFFICIENT_EVIDENCE"
+    assert result["token_usage"] == 12
+    with SessionLocal() as session:
+        logs = list(
+            session.scalars(
+                select(ReasoningLog).where(ReasoningLog.scenario_id == scenario_id)
+            )
+        )
+        snapshot = session.scalar(
+            select(MetricSnapshot).where(
+                MetricSnapshot.id == result["metric_snapshot_id"]
+            )
+        )
+        assert len(logs) == 2
+        assert all(log.is_schema_valid for log in logs)
+        assert isinstance(logs[0].parsed_srr_objects, dict)
+        assert logs[0].parsed_srr_objects["provider_metadata"]["model"] == "a"
+        assert snapshot is not None
+        assert snapshot.material_information_retention_macro_f1 == pytest.approx(0.8)
 
 
 def test_invalid_llm_json_marks_schema_invalid(scenario_id: int) -> None:

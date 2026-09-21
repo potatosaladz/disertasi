@@ -1,5 +1,6 @@
 celery[redis]==5.5.3
 fastapi==0.116.1
+openai==2.54.0
 psycopg[binary]==3.2.10
 SQLAlchemy==2.0.43
 uvicorn[standard]==0.35.0

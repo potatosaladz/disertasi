@@ -1,9 +1,12 @@
 import hashlib
 import json
-from contextlib import asynccontextmanager
+import os
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from time import perf_counter
 
 from fastapi import FastAPI, HTTPException, Response, status
+from openai import OpenAI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select, text
@@ -97,6 +100,27 @@ class AgentResponse(BaseModel):
     has_llm_api_key: bool
 
 
+class LLMConnectionTestResponse(BaseModel):
+    agent_id: int
+    ok: bool
+    model: str
+    base_url: str
+    latency_ms: float
+    response_preview: str | None = None
+    error: str | None = None
+
+
+class AgentDomainRules(BaseModel):
+    agent_id: int
+    name: str
+    role: str
+    template_key: str | None
+    mandate: str | None
+    primary_sources: list[str]
+    constraints: list[str]
+    owned_checks: list[str]
+
+
 class DomainRulesResponse(BaseModel):
     scenario_id: int
     revision: str
@@ -104,6 +128,7 @@ class DomainRulesResponse(BaseModel):
     stale: bool
     agent_count: int
     rules: dict[str, object]
+    agent_rules: list[AgentDomainRules]
 
 
 class ScenarioCreate(BaseModel):
@@ -256,6 +281,59 @@ def list_agents() -> list[AgentResponse]:
         return [agent_response(agent) for agent in session.scalars(select(Agent).order_by(Agent.id))]
 
 
+@app.get("/api/agents/{agent_id}", response_model=AgentResponse)
+def get_agent(agent_id: int) -> AgentResponse:
+    with SessionLocal() as session:
+        agent = session.get(Agent, agent_id)
+        if agent is None:
+            raise HTTPException(status_code=404, detail="Agent not found")
+        return agent_response(agent)
+
+
+@app.post("/api/agents/{agent_id}/test-connection", response_model=LLMConnectionTestResponse)
+def test_agent_connection(agent_id: int) -> LLMConnectionTestResponse:
+    started_at = perf_counter()
+    with SessionLocal() as session:
+        agent = session.get(Agent, agent_id)
+        if agent is None:
+            raise HTTPException(status_code=404, detail="Agent not found")
+        base_url = (
+            agent.llm_base_url
+            or os.getenv("OPENAI_BASE_URL")
+            or "http://host.docker.internal:11434/v1"
+        )
+        api_key = agent.llm_api_key or os.getenv("OPENAI_API_KEY") or "local-llm"
+        model = agent.llm_model or os.getenv("OPENAI_MODEL") or "local-model"
+        try:
+            response = OpenAI(api_key=api_key, base_url=base_url).chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": "Reply with exactly: OK"},
+                    {"role": "user", "content": "Connection test"},
+                ],
+                temperature=0,
+                max_tokens=8,
+            )
+            content = response if isinstance(response, str) else response.choices[0].message.content
+            return LLMConnectionTestResponse(
+                agent_id=agent.id,
+                ok=True,
+                model=model,
+                base_url=base_url,
+                latency_ms=(perf_counter() - started_at) * 1000,
+                response_preview=str(content)[:120],
+            )
+        except Exception as error:
+            return LLMConnectionTestResponse(
+                agent_id=agent.id,
+                ok=False,
+                model=model,
+                base_url=base_url,
+                latency_ms=(perf_counter() - started_at) * 1000,
+                error=f"{type(error).__name__}: {error}",
+            )
+
+
 def _agent_revision(agents: list[Agent]) -> str:
     payload = [
         {
@@ -287,6 +365,25 @@ def _combined_domain_rules(agents: list[Agent], scenario: Scenario) -> dict[str,
     }
 
 
+def _agent_domain_rules(agents: list[Agent]) -> list[AgentDomainRules]:
+    rules: list[AgentDomainRules] = []
+    for agent in agents:
+        spec = get_agent_spec(agent.template_key)
+        rules.append(
+            AgentDomainRules(
+                agent_id=agent.id,
+                name=agent.name,
+                role=agent.role,
+                template_key=agent.template_key,
+                mandate=spec.mandate if spec is not None else agent.system_prompt,
+                primary_sources=list(spec.primary_sources) if spec is not None else [],
+                constraints=list(spec.constraints) if spec is not None else [],
+                owned_checks=list(spec.owned_checks) if spec is not None else [],
+            )
+        )
+    return rules
+
+
 @app.post("/api/scenarios/{scenario_id}/domain-rules", response_model=DomainRulesResponse)
 def generate_domain_rules(scenario_id: int) -> DomainRulesResponse:
     with SessionLocal() as session:
@@ -303,6 +400,7 @@ def generate_domain_rules(scenario_id: int) -> DomainRulesResponse:
             stale=False,
             agent_count=len(agents),
             rules=_combined_domain_rules(agents, scenario),
+            agent_rules=_agent_domain_rules(agents),
         )
 
 
@@ -344,6 +442,7 @@ def get_domain_rules(scenario_id: int) -> DomainRulesResponse:
             stale=True,
             agent_count=len(agents),
             rules={},
+            agent_rules=[],
         )
 
 

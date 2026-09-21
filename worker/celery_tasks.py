@@ -1,4 +1,3 @@
-import json
 import logging
 import os
 from collections.abc import Callable
@@ -16,6 +15,7 @@ from backend.core_algorithms import (
     calculate_dynamic_influence,
     calculate_violation_rate,
     detect_divergence_vector,
+    extract_json_object,
     neuro_symbolic_filter,
 )
 from backend.database import SessionLocal
@@ -101,17 +101,18 @@ def _default_llm_call(agent: Agent, scenario: Scenario) -> tuple[str, int]:
     return _extract_llm_response(response)
 
 
-def _parse_response(raw_content: str) -> tuple[dict[str, Any], SRRResponse | None]:
+def _parse_response(raw_content: str) -> tuple[dict[str, Any], SRRResponse | None, str | None]:
     try:
-        payload = json.loads(raw_content)
-    except json.JSONDecodeError:
-        return {"unparsed_content": raw_content}, None
-    if not isinstance(payload, dict):
-        return {"parsed_content": payload}, None
+        payload = extract_json_object(raw_content)
+    except ValueError as error:
+        return {"unparsed_content": raw_content, "parse_error": str(error)}, None, str(error)
     try:
-        return payload, SRRResponse.model_validate(payload)
-    except ValidationError:
-        return payload, None
+        return payload, SRRResponse.model_validate(payload), None
+    except ValidationError as error:
+        return payload, None, "; ".join(
+            f"{'.'.join(str(part) for part in detail['loc'])}: {detail['msg']}"
+            for detail in error.errors()
+        )
 
 
 def _provenance_counts(response: SRRResponse) -> tuple[int, int]:
@@ -122,15 +123,17 @@ def _provenance_counts(response: SRRResponse) -> tuple[int, int]:
 
 def _determine_convergence(
     parsed_responses: list[SRRResponse],
+    alternatives: list[Any],
     feasible_alternatives: list[Any],
 ) -> ConvergenceStatus:
-    if not parsed_responses:
+    if not parsed_responses or not alternatives:
         return ConvergenceStatus.INSUFFICIENT_EVIDENCE
     if not feasible_alternatives:
         return ConvergenceStatus.INFEASIBLE
 
     recommendations = {
-        response.recommendation.content for response in parsed_responses
+        response.recommendation.content if response.recommendation is not None else None
+        for response in parsed_responses
     }
     alternatives_by_name: dict[str, list[Any]] = {}
     for alternative in feasible_alternatives:
@@ -201,9 +204,9 @@ def execute_full_shcr_cycle(
                 )
                 continue
             total_tokens += token_usage
-            raw_json, parsed = _parse_response(raw_content)
+            raw_json, parsed, validation_error = _parse_response(raw_content)
             if parsed is None:
-                logs.append(_log("SRR", "WARNING", f"{agent.name}: response failed JSON/schema validation."))
+                logs.append(_log("SRR", "WARNING", f"{agent.name}: response failed JSON/schema validation: {validation_error}."))
                 emit(logs)
                 session.add(
                     ReasoningLog(
@@ -310,16 +313,17 @@ def execute_full_shcr_cycle(
         provenance_completeness = (
             round((tagged_items / total_items) * 100.0, 2) if total_items else 0.0
         )
+        retention_values = [
+            response.material_information_retention_macro_f1
+            for response in parsed_responses
+            if response.material_information_retention_macro_f1 is not None
+        ]
         retention_macro_f1 = (
-            sum(
-                response.material_information_retention_macro_f1
-                for response in parsed_responses
-            )
-            / len(parsed_responses)
-            if parsed_responses
-            else 0.0
+            sum(retention_values) / len(retention_values) if retention_values else 0.0
         )
-        convergence_status = _determine_convergence(parsed_responses, feasible)
+        convergence_status = _determine_convergence(
+            parsed_responses, alternatives, feasible
+        )
         latency_ms = (perf_counter() - started_at) * 1000.0
 
         logs.append(_log("CAR", "SUCCESS", f"{len(feasible)}/{len(alternatives)} alternatives feasible; violation rate={violation_rate}%."))

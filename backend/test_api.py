@@ -61,6 +61,7 @@ def test_agent_templates_are_available_and_idempotent(client: TestClient) -> Non
         assert len(template_agents) == 5
         assert all(agent.system_prompt for agent in template_agents)
         revenue = next(agent for agent in template_agents if agent.template_key == "revenue")
+        assert revenue.system_prompt is not None
         assert "TAX_LEGAL_BASIS" in revenue.system_prompt
         assert "Never invent a tax base" in revenue.system_prompt
         for agent in template_agents:
@@ -84,6 +85,7 @@ def test_template_selection_automates_system_prompt(client: TestClient) -> None:
         saved = session.get(Agent, response.json()["id"])
         assert saved is not None
         assert saved.template_key == "revenue"
+        assert saved.system_prompt is not None
         assert "Never invent a tax base" in saved.system_prompt
         session.delete(saved)
         session.commit()
@@ -160,6 +162,36 @@ def test_template_loader_applies_per_agent_llm_configuration(client: TestClient)
         session.commit()
 
 
+def test_agent_connection_endpoint_handles_success_and_failure(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    response = client.post(
+        "/api/agents",
+        json={"name": f"connection-{uuid.uuid4()}", "role": "Test", "llm_model": "test-model"},
+    )
+    agent_id = response.json()["id"]
+
+    class FakeCompletions:
+        def create(self, **_kwargs: object) -> object:
+            message = type("Message", (), {"content": "OK"})()
+            choice = type("Choice", (), {"message": message})()
+            return type("Response", (), {"choices": [choice]})()
+
+    class FakeClient:
+        def __init__(self, **_kwargs: object) -> None:
+            self.chat = type("Chat", (), {"completions": FakeCompletions()})()
+
+    monkeypatch.setattr("backend.main.OpenAI", FakeClient)
+    tested = client.post(f"/api/agents/{agent_id}/test-connection")
+    assert tested.status_code == 200
+    assert tested.json()["ok"] is True
+    assert tested.json()["response_preview"] == "OK"
+
+    with SessionLocal() as session:
+        session.delete(session.get(Agent, agent_id))
+        session.commit()
+
+
 def test_agent_can_be_deleted_before_research_records(client: TestClient) -> None:
     response = client.post(
         "/api/agents",
@@ -193,10 +225,59 @@ def test_domain_rules_aggregate_template_agents(client: TestClient) -> None:
     assert payload["stale"] is False
     assert "VERIFIED_OFFSETS_ONLY" in payload["rules"]["owned_checks"]
     assert payload["rules"]["automatic_deficit_ceiling"] == 3.0
+    assert payload["agent_rules"] == [
+        {
+            "agent_id": template_agent.json()["id"],
+            "name": template_agent.json()["name"],
+            "role": "Penerimaan Negara",
+            "template_key": "revenue",
+            "mandate": next(
+                template.mandate
+                for template in STANDARD_APBN_AGENT_TEMPLATES
+                if template.key == "revenue"
+            ),
+            "primary_sources": list(STANDARD_APBN_AGENT_TEMPLATES[0].primary_sources),
+            "constraints": list(STANDARD_APBN_AGENT_TEMPLATES[0].constraints),
+            "owned_checks": list(STANDARD_APBN_AGENT_TEMPLATES[0].owned_checks),
+        }
+    ]
 
     with SessionLocal() as session:
         session.delete(session.get(Scenario, scenario.json()["id"]))
         session.delete(session.get(Agent, template_agent.json()["id"]))
+        session.commit()
+
+
+def test_domain_rules_include_custom_agent_mandate(client: TestClient) -> None:
+    custom_agent = client.post(
+        "/api/agents",
+        json={
+            "name": f"rules-custom-{uuid.uuid4()}",
+            "role": "Custom Reviewer",
+            "system_prompt": "Review distributional effects and cite supplied evidence.",
+        },
+    )
+    scenario = client.post(
+        "/api/scenarios",
+        json={"description": "Generate custom mandate", "program_cost": 4.0},
+    )
+
+    generated = client.post(f"/api/scenarios/{scenario.json()['id']}/domain-rules")
+
+    assert generated.status_code == 200
+    custom_rules = next(
+        item
+        for item in generated.json()["agent_rules"]
+        if item["agent_id"] == custom_agent.json()["id"]
+    )
+    assert custom_rules["mandate"] == "Review distributional effects and cite supplied evidence."
+    assert custom_rules["primary_sources"] == []
+    assert custom_rules["constraints"] == []
+    assert custom_rules["owned_checks"] == []
+
+    with SessionLocal() as session:
+        session.delete(session.get(Scenario, scenario.json()["id"]))
+        session.delete(session.get(Agent, custom_agent.json()["id"]))
         session.commit()
 
 

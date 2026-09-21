@@ -1,4 +1,6 @@
+import json
 import math
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, TypeVar
@@ -16,12 +18,14 @@ DDR_COMPONENT_FIELDS = {
 T = TypeVar("T")
 
 SRR_OUTPUT_INSTRUCTIONS = (
-    "Return only an SRR JSON object containing evidence, assumptions, predictions, risks, "
-    "uncertainties, objectives, constraints, alternatives, recommendation, confidence, and "
-    "material_information_retention_macro_f1. Every typed item must contain content and an "
-    "optional source_tag. Every alternative must contain name, deficit, utility, and optional "
-    "source_tag. Analyze impacts, risks, uncertainties, objections, conditions, and adjustments "
-    "within the agent's fiscal mandate. Do not reveal hidden chain-of-thought; provide only typed, "
+    "Return only an SRR JSON object. Include evidence, assumptions, predictions, risks, "
+    "uncertainties, objectives, constraints, and alternatives when available; omitted collections "
+    "default to empty lists. Recommendation, confidence, and "
+    "material_information_retention_macro_f1 are optional when evidence is insufficient. Every "
+    "typed item must contain content and an optional source_tag. Every supplied alternative must "
+    "contain name, deficit, utility, and optional source_tag. Additional structured fields are "
+    "allowed. Analyze impacts, risks, uncertainties, objections, conditions, and adjustments within "
+    "the agent's fiscal mandate. Do not reveal hidden chain-of-thought; provide only typed, "
     "inspectable artifacts."
 )
 
@@ -32,6 +36,29 @@ def build_agent_system_prompt(role: str, mandate: str | None) -> str:
         sections.append(f"Agent-specific mandate and decision principles:\n{mandate.strip()}")
     sections.append(SRR_OUTPUT_INSTRUCTIONS)
     return "\n\n".join(sections)
+
+
+def extract_json_object(raw_content: str) -> dict[str, Any]:
+    cleaned = raw_content.strip().lstrip("\ufeff")
+    fenced = re.search(r"```(?:json)?\s*(.*?)\s*```", cleaned, flags=re.IGNORECASE | re.DOTALL)
+    if fenced:
+        cleaned = fenced.group(1).strip()
+    try:
+        payload = json.loads(cleaned)
+    except json.JSONDecodeError:
+        start = cleaned.find("{")
+        end = cleaned.rfind("}")
+        if start < 0 or end <= start:
+            raise ValueError("LLM response does not contain a JSON object")
+        try:
+            payload = json.loads(cleaned[start : end + 1])
+        except json.JSONDecodeError as error:
+            raise ValueError(
+                f"Invalid JSON at line {error.lineno}, column {error.colno}: {error.msg}"
+            ) from error
+    if not isinstance(payload, dict):
+        raise ValueError(f"Expected a JSON object, received {type(payload).__name__}")
+    return payload
 
 
 @dataclass(frozen=True)

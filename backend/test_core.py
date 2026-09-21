@@ -9,6 +9,7 @@ from backend.core_algorithms import (
     build_agent_system_prompt,
     calculate_violation_rate,
     detect_divergence_vector,
+    extract_json_object,
     neuro_symbolic_filter,
 )
 
@@ -29,6 +30,13 @@ def make_agent(*, uncertainty: float = 0.0, gate: int = 1) -> dict[str, float | 
     }
 
 
+def test_extract_json_object_cleans_markdown_and_surrounding_text() -> None:
+    assert extract_json_object('```json\n{"status": "ok"}\n```') == {"status": "ok"}
+    assert extract_json_object('Result follows: {"status": "ok"} done') == {"status": "ok"}
+    with pytest.raises(ValueError, match="does not contain"):
+        extract_json_object("not-json")
+
+
 def test_build_agent_system_prompt_injects_mandate() -> None:
     prompt = build_agent_system_prompt(
         "State Revenue Agent",
@@ -38,6 +46,9 @@ def test_build_agent_system_prompt_injects_mandate() -> None:
     assert "State Revenue Agent" in prompt
     assert "revenue resilience" in prompt
     assert "impacts, risks, uncertainties, objections, conditions, and adjustments" in prompt
+    assert "Recommendation, confidence" in prompt
+    assert "optional when evidence is insufficient" in prompt
+    assert "Additional structured fields are allowed" in prompt
     assert "Do not reveal hidden chain-of-thought" in prompt
 
 
