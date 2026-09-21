@@ -8,6 +8,7 @@ from backend.core_algorithms import (
     build_agent_user_prompt,
     build_consensus_prompt,
     build_mandate_synthesis_prompt,
+    build_mandate_synthesis_system_prompt,
     calculate_dynamic_influence,
     extract_llm_completion,
     llm_request_headers,
@@ -85,6 +86,11 @@ def test_mandate_synthesis_prompt_contains_seed_and_scenario() -> None:
     assert "LOCAL SEED CONTRACT" not in prompt
     assert "PROGRAM COST" not in prompt
     assert "DEFICIT CEILING" not in prompt
+    system_prompt = build_mandate_synthesis_system_prompt("Revenue Agent", "Revenue")
+    assert "structured multi-agent fiscal consensus framework" in system_prompt
+    assert "APBN domain focus" in system_prompt
+    assert "regulation and statute" in system_prompt
+    assert "fiscally verifiable evidence" in system_prompt
 
 
 def test_build_agent_system_prompt_injects_mandate() -> None:

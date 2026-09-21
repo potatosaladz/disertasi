@@ -219,6 +219,17 @@ def build_agent_user_prompt(
     )
 
 
+def build_mandate_synthesis_system_prompt(agent_name: str, role: str) -> str:
+    return (
+        f"You are {agent_name}, an autonomous expert acting as {role} in a structured "
+        "multi-agent fiscal consensus framework. Produce a decision-ready mandate that covers: "
+        "the agent's operational responsibility; relevant APBN domain focus; priority questions "
+        "grounded in applicable regulation and statute; and fiscally verifiable evidence required "
+        "for claims, objections, constraints, and recommendations. Preserve uncertainty and valid "
+        "dissent. Return valid JSON only and do not reveal chain-of-thought."
+    )
+
+
 def build_mandate_synthesis_prompt(
     agent_name: str,
     role: str,
@@ -227,8 +238,9 @@ def build_mandate_synthesis_prompt(
     return (
         f"Act autonomously as the expert {role} named {agent_name}. "
         "Generate a practical, scenario-specific operating mandate for this fiscal expert. "
-        "Use your domain expertise to define the mandate, focus areas, priority questions, and "
-        "evidence needed for a defensible APBN decision. Keep legal and fiscal claims cautious; "
+        "Use your domain expertise and the fiscal consensus ontology to define the operational "
+        "mandate, APBN focus areas, regulation/statute-based priority questions, and fiscally "
+        "verifiable evidence needed for a defensible decision. Keep legal and fiscal claims cautious; "
         "do not reveal chain-of-thought. Return only one JSON object with exactly these logical "
         "fields: scenario_mandate, scenario_focus, priority_questions, required_evidence.\n\n"
         f"ACTIVE POLICY SCENARIO: {scenario_description}"

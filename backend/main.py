@@ -23,6 +23,7 @@ from .agent_templates import (
 )
 from .core_algorithms import (
     build_mandate_synthesis_prompt,
+    build_mandate_synthesis_system_prompt,
     extract_json_object,
     extract_llm_completion,
     llm_request_headers,
@@ -465,12 +466,39 @@ def _mandate_payload(payload: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
+def _canonical_response_key(key: str) -> str:
+    return "".join(character.lower() for character in key if character.isalnum())
+
+
 def _response_value(payload: dict[str, Any], *keys: str) -> object:
+    canonical_payload = {
+        _canonical_response_key(key): value
+        for key, value in payload.items()
+    }
     for key in keys:
-        value = payload.get(key)
-        if value is not None:
-            return value
+        canonical_key = _canonical_response_key(key)
+        if canonical_key in canonical_payload and canonical_payload[canonical_key] is not None:
+            return canonical_payload[canonical_key]
     return None
+
+
+def _normalise_mandate_text(value: object, fallback: str, field_name: str, agent_id: int) -> str:
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    if isinstance(value, dict):
+        nested = _response_value(value, "content", "text", "value", "mandate")
+        if isinstance(nested, str) and nested.strip():
+            return nested.strip()
+    if isinstance(value, (list, tuple, set)):
+        items = _normalise_mandate_list(value, [], field_name, agent_id)
+        if items:
+            return " ".join(items)
+    logger.warning(
+        "Agent %s returned an empty or invalid %s; using safe fallback",
+        agent_id,
+        field_name,
+    )
+    return fallback
 
 
 def _normalise_mandate_list(
@@ -553,10 +581,7 @@ def _synthesize_agent_domain_rules(agent: Agent, scenario: Scenario) -> AgentDom
             "messages": [
                 {
                     "role": "system",
-                    "content": (
-                        f"You are {agent.name}, an autonomous expert acting as {agent.role}. "
-                        "Generate a concise, decision-ready operating mandate in valid JSON."
-                    ),
+                    "content": build_mandate_synthesis_system_prompt(agent.name, agent.role),
                 },
                 {
                     "role": "user",
@@ -595,19 +620,18 @@ def _synthesize_agent_domain_rules(agent: Agent, scenario: Scenario) -> AgentDom
         print(content, flush=True)
         payload = _mandate_payload(extract_json_object(content))
         fallback_values = _synthesis_fallbacks(agent, scenario)
-        scenario_mandate = _response_value(
-            payload,
+        scenario_mandate = _normalise_mandate_text(
+            _response_value(
+                payload,
+                "scenario_mandate",
+                "scenarioMandate",
+                "mandate",
+                "operating_mandate",
+            ),
+            fallback_values.scenario_mandate,
             "scenario_mandate",
-            "scenarioMandate",
-            "mandate",
-            "operating_mandate",
+            agent.id,
         )
-        if not isinstance(scenario_mandate, str) or not scenario_mandate.strip():
-            scenario_mandate = fallback_values.scenario_mandate
-            logger.warning(
-                "Agent %s returned an empty scenario_mandate; using scenario-aware fallback",
-                agent.id,
-            )
         scenario_focus = _normalise_mandate_list(
             _response_value(payload, "scenario_focus", "scenarioFocus", "focus", "focus_areas"),
             fallback_values.scenario_focus,
@@ -641,7 +665,7 @@ def _synthesize_agent_domain_rules(agent: Agent, scenario: Scenario) -> AgentDom
         return base.model_copy(
             update={
                 "synthesis_status": "generated",
-                "scenario_mandate": scenario_mandate.strip(),
+                "scenario_mandate": scenario_mandate,
                 "scenario_focus": scenario_focus,
                 "priority_questions": priority_questions,
                 "required_evidence": required_evidence,

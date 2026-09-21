@@ -378,13 +378,13 @@ def test_domain_rules_accepts_flexible_response_keys(
             content = json.dumps(
                 {
                     "data": {
-                        "scenarioMandate": "Autonomous expert mandate.",
-                        "focus_areas": "Fiscal sustainability; Revenue resilience",
-                        "key_questions": [
+                        "Scenario Mandate": {"text": "Autonomous expert mandate."},
+                        "Focus Areas": "Fiscal sustainability; Revenue resilience",
+                        "Key Questions": [
                             {"question": "Is financing available?"},
                             {"text": "Is the policy lawful?"},
                         ],
-                        "evidence_requirements": "Current APBN baseline\nVerified implementation plan",
+                        "Evidence Requirements": "Current APBN baseline\nVerified implementation plan",
                     }
                 }
             )
