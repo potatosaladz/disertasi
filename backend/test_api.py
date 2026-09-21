@@ -35,9 +35,16 @@ def test_agent_templates_are_available_and_idempotent(client: TestClient) -> Non
     assert response.status_code == 200
     templates = response.json()
     assert len(templates) == 5
+    assert [item["key"] for item in templates] == [
+        "revenue", "expenditure", "financing", "treasury", "macro"
+    ]
     assert {item["key"] for item in templates} == {
         template.key for template in STANDARD_APBN_AGENT_TEMPLATES
     }
+    assert templates[0]["name"] == "State Revenue Agent / Penerimaan Negara"
+    assert "UUD45_P23_23A_31" in templates[0]["primary_sources"]
+    assert "VERIFIED_OFFSETS_ONLY" in templates[0]["owned_checks"]
+    assert "DECISION PRINCIPLES" in templates[0]["system_prompt"]
     assert all(item["system_prompt"] for item in templates)
 
     first = client.post("/api/agents/load-templates")
@@ -52,6 +59,9 @@ def test_agent_templates_are_available_and_idempotent(client: TestClient) -> Non
         template_agents = list(session.scalars(select(Agent).where(Agent.name.in_(template_names))))
         assert len(template_agents) == 5
         assert all(agent.system_prompt for agent in template_agents)
+        revenue = next(agent for agent in template_agents if agent.template_key == "revenue")
+        assert "TAX_LEGAL_BASIS" in revenue.system_prompt
+        assert "Never invent a tax base" in revenue.system_prompt
         for agent in template_agents:
             session.execute(delete(Agent).where(Agent.id == agent.id))
         session.commit()

@@ -138,7 +138,7 @@ async def health() -> dict[str, str]:
 
 
 @app.get("/api/agent-templates")
-def list_agent_templates() -> list[dict[str, str | float | int]]:
+def list_agent_templates() -> list[dict[str, object]]:
     return template_catalog()
 
 

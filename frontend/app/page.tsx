@@ -25,6 +25,14 @@ type AgentTemplate = {
   role: string;
   description: string;
   system_prompt: string;
+  primary_sources: string[];
+  owned_checks: string[];
+  parameters: string[];
+  constraints: string[];
+  impact_dimensions: string[];
+  risk_dimensions: string[];
+  uncertainty_dimensions: string[];
+  decision_principles: string[];
   temperature: number;
   max_tokens: number;
   theta_x: number;
@@ -98,6 +106,10 @@ function NumericField({ label, value, onChange, hint }: { label: string; value: 
 
 function MetricCard({ label, value, unit, tone }: { label: string; value: string; unit?: string; tone?: string }) {
   return <div className={`metric-card ${tone ?? ""}`}><span>{label}</span><strong>{value}<small>{unit}</small></strong></div>;
+}
+
+function TemplateContractPreview({ template }: { template: AgentTemplate }) {
+  return <div className="template-contract"><p>{template.description}</p><div><span>PRIMARY SOURCES</span><strong>{template.primary_sources.join(" · ")}</strong></div><div><span>OWNED CHECKS</span><strong>{template.owned_checks.join(" · ")}</strong></div></div>;
 }
 
 export default function Home() {
@@ -259,7 +271,7 @@ export default function Home() {
             <label className="form-field"><strong>Nama Agen</strong><input value={agent.name} onChange={(event) => setAgent({ ...agent, name: event.target.value })} required /><small>Nama unik yang tampil pada deliberasi dan matriks DDR.</small></label>
             <label className="form-field full-width"><strong>Peran Fungsional</strong><input value={agent.role} onChange={(event) => setAgent({ ...agent, role: event.target.value })} required /><small>Contoh: Penerimaan Negara, Belanja Pemerintah, atau Stabilisasi Makro-Fiskal.</small></label>
           </div>
-          {selectedTemplate && <div className="template-note">{templates.find((item) => item.key === selectedTemplate)?.description}</div>}
+          {selectedTemplate && templates.find((item) => item.key === selectedTemplate) && <TemplateContractPreview template={templates.find((item) => item.key === selectedTemplate)!} />}
         </fieldset>
 
         <fieldset className="form-card">
