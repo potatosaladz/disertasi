@@ -18,15 +18,14 @@ DDR_COMPONENT_FIELDS = {
 T = TypeVar("T")
 
 SRR_OUTPUT_INSTRUCTIONS = (
-    "Return only an SRR JSON object. Include evidence, assumptions, predictions, risks, "
-    "uncertainties, objectives, constraints, and alternatives when available; omitted collections "
-    "default to empty lists. Recommendation, confidence, and "
-    "material_information_retention_macro_f1 are optional when evidence is insufficient. Every "
-    "typed item must contain content and an optional source_tag. Every supplied alternative must "
-    "contain name, deficit, utility, and optional source_tag. Additional structured fields are "
-    "allowed. Analyze impacts, risks, uncertainties, objections, conditions, and adjustments within "
-    "the agent's fiscal mandate. Do not reveal hidden chain-of-thought; provide only typed, "
-    "inspectable artifacts."
+    "Return only one valid SRR JSON object. A decision-complete response must include non-empty "
+    "evidence, predictions, risks, uncertainties, and alternatives arrays, plus recommendation and "
+    "confidence. Include assumptions, objectives, constraints, and "
+    "material_information_retention_macro_f1 when supported. Every typed item must contain content "
+    "and an optional source_tag. Every alternative must contain name, deficit, utility, and optional "
+    "source_tag. Additional structured fields are allowed. Analyze impacts, risks, uncertainties, "
+    "objections, conditions, and adjustments within the agent's fiscal mandate. Do not reveal hidden "
+    "chain-of-thought; provide only concise, evidence-linked, inspectable artifacts."
 )
 
 
@@ -62,6 +61,13 @@ def extract_json_object(raw_content: str) -> dict[str, Any]:
 
 
 @dataclass(frozen=True)
+class LLMRuntimeConfig:
+    base_url: str
+    api_key: str
+    model: str
+
+
+@dataclass(frozen=True)
 class Alternative:
     deficit: float
 
@@ -69,6 +75,77 @@ class Alternative:
 @dataclass(frozen=True)
 class HardConstraints:
     max_deficit: float
+
+
+def resolve_llm_runtime_config(agent: object) -> LLMRuntimeConfig:
+    fields = {
+        "base_url": _value(agent, "llm_base_url"),
+        "api_key": _value(agent, "llm_api_key"),
+        "model": _value(agent, "llm_model"),
+    }
+    placeholder_values = {"local-model", "local-llm"}
+    missing = [
+        name
+        for name, value in fields.items()
+        if not isinstance(value, str)
+        or not value.strip()
+        or value.strip().lower() in placeholder_values
+    ]
+    if missing:
+        agent_name = str(_value(agent, "name"))
+        raise ValueError(
+            f"Agent {agent_name!r} requires database LLM configuration: {', '.join(missing)}"
+        )
+    base_url = str(fields["base_url"]).strip()
+    if not base_url.startswith(("http://", "https://")):
+        raise ValueError("LLM base_url must use http:// or https://")
+    return LLMRuntimeConfig(
+        base_url=base_url,
+        api_key=str(fields["api_key"]).strip(),
+        model=str(fields["model"]).strip(),
+    )
+
+
+def build_agent_user_prompt(
+    role: str,
+    policy_goal: str,
+    program_cost: float | None,
+    max_deficit: float,
+) -> str:
+    return (
+        f"Agent role: {role}\n"
+        f"Policy goal: {policy_goal}\n"
+        f"Program cost: {program_cost if program_cost is not None else 'UNKNOWN'}\n"
+        f"Automatic legal deficit ceiling: {max_deficit}%\n\n"
+        "Produce a decision-complete SRR response. State evidence-backed impact claims in predictions, "
+        "identify material risks and uncertainties, provide at least one quantified alternative, and "
+        "finish with a recommendation and calibrated confidence."
+    )
+
+
+def build_consensus_prompt(
+    agent_name: str,
+    role: str,
+    peer_outputs: Sequence[Mapping[str, object]],
+) -> str:
+    return (
+        f"You are {agent_name}, acting as {role}. Review the structured outputs from every agent below. "
+        "Verify competing claims against cited evidence, identify unresolved assumptions, risks, "
+        "uncertainties, constraints, and recommendation conflicts, then return a revised decision-complete "
+        "SRR JSON object. Preserve valid dissent instead of fabricating agreement. Do not reveal hidden "
+        "chain-of-thought; return only inspectable structured artifacts.\n\n"
+        f"PEER OUTPUTS:\n{json.dumps(list(peer_outputs), ensure_ascii=False, sort_keys=True)}"
+    )
+
+
+def validate_decision_artifacts(response: object) -> list[str]:
+    required_collections = ("evidence", "predictions", "risks", "uncertainties", "alternatives")
+    missing = [field for field in required_collections if not _value(response, field)]
+    if _value(response, "recommendation") is None:
+        missing.append("recommendation")
+    if _value(response, "confidence") is None:
+        missing.append("confidence")
+    return missing
 
 
 def _value(item: object, field: str) -> Any:

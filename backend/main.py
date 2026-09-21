@@ -1,6 +1,5 @@
 import hashlib
 import json
-import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from time import perf_counter
@@ -16,6 +15,7 @@ from .agent_templates import (
     load_standard_agent_templates,
     template_catalog,
 )
+from .core_algorithms import resolve_llm_runtime_config
 from .dashboard import router as dashboard_router
 from .database import SessionLocal
 from .init_db import initialize_database
@@ -297,16 +297,19 @@ def test_agent_connection(agent_id: int) -> LLMConnectionTestResponse:
         agent = session.get(Agent, agent_id)
         if agent is None:
             raise HTTPException(status_code=404, detail="Agent not found")
-        base_url = (
-            agent.llm_base_url
-            or os.getenv("OPENAI_BASE_URL")
-            or "http://host.docker.internal:11434/v1"
-        )
-        api_key = agent.llm_api_key or os.getenv("OPENAI_API_KEY") or "local-llm"
-        model = agent.llm_model or os.getenv("OPENAI_MODEL") or "local-model"
+        model = agent.llm_model or "UNCONFIGURED"
+        base_url = agent.llm_base_url or "UNCONFIGURED"
         try:
-            response = OpenAI(api_key=api_key, base_url=base_url).chat.completions.create(
-                model=model,
+            config = resolve_llm_runtime_config(agent)
+            model = config.model
+            base_url = config.base_url
+            response = OpenAI(
+                api_key=config.api_key,
+                base_url=config.base_url,
+                timeout=60.0,
+                max_retries=2,
+            ).chat.completions.create(
+                model=config.model,
                 messages=[
                     {"role": "system", "content": "Reply with exactly: OK"},
                     {"role": "user", "content": "Connection test"},

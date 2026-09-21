@@ -9,7 +9,7 @@ button,input,select { font:inherit; }
 button { cursor:pointer; transition:background-color .2s ease,color .2s ease,border-color .2s ease,transform .2s ease,box-shadow .2s ease; }
 button:not(:disabled):active { transform:translateY(1px); }
 input,select,textarea,details { transition:border-color .2s ease,background-color .2s ease,box-shadow .2s ease; }
-.max-h-\[450px\] { max-height:450px; }
+.max-h-\[500px\] { max-height:500px; }
 .overflow-y-auto { overflow-y:auto; }
 .shell { width:min(1320px,calc(100% - 64px)); margin:auto; position:relative; }
 .topbar { height:82px; display:flex; align-items:center; justify-content:space-between; border-bottom:1px solid var(--line); font:500 11px 'DM Mono',monospace; letter-spacing:.12em; }

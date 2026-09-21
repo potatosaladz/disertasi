@@ -15,6 +15,7 @@ from backend.models import (
 )
 from backend.agent_templates import AGENTS
 from worker.celery_tasks import _default_llm_call, _extract_llm_response, execute_full_shcr_cycle
+from backend.core_algorithms import resolve_llm_runtime_config
 from worker.srr_models import Evidence, SRRResponse
 
 
@@ -119,8 +120,9 @@ def response_payload(
     )
 
 
-def test_extract_llm_response_accepts_raw_string_and_dict() -> None:
-    assert _extract_llm_response('{"evidence": []}') == ('{"evidence": []}', 0)
+def test_extract_llm_response_requires_provider_usage() -> None:
+    with pytest.raises(ValueError, match="usage metadata"):
+        _extract_llm_response('{"evidence": []}')
     content, tokens = _extract_llm_response(
         {
             "choices": [{"message": {"content": '{"recommendation": {}}'}}],
@@ -178,6 +180,9 @@ def test_default_llm_call_uses_canonical_template_mandate(monkeypatch: pytest.Mo
         name="Revenue template",
         role="Penerimaan Negara",
         template_key="revenue",
+        llm_base_url="https://revenue.example/v1",
+        llm_api_key="revenue-key",
+        llm_model="revenue-model",
         system_prompt="Manual text must not override the canonical template.",
     )
     scenario = Scenario(
@@ -233,6 +238,8 @@ def test_default_llm_call_uses_agent_configuration(monkeypatch: pytest.MonkeyPat
     assert captured["client"] == {
         "api_key": "agent-secret",
         "base_url": "https://expenditure.example/v1",
+        "timeout": 60.0,
+        "max_retries": 2,
     }
     request = captured["request"]
     assert isinstance(request, dict)
@@ -243,6 +250,54 @@ def test_default_llm_call_uses_agent_configuration(monkeypatch: pytest.MonkeyPat
     assert isinstance(messages, list)
     assert "Government Expenditure Agent" in messages[0]["content"]
     assert "fiscal adjustment options" in messages[0]["content"]
+
+
+def test_runtime_configuration_rejects_placeholder_defaults() -> None:
+    with pytest.raises(ValueError, match="database LLM configuration"):
+        resolve_llm_runtime_config(
+            Agent(
+                name="unconfigured",
+                role="Reviewer",
+                llm_base_url="http://localhost/v1",
+                llm_api_key="local-llm",
+                llm_model="local-model",
+            )
+        )
+
+
+def test_consensus_round_reviews_peer_outputs(scenario_id: int) -> None:
+    first_round = iter(
+        [
+            (response_payload(prediction="Growth 2%", utility=0.8, recommendation="Adopt A"), 120),
+            (response_payload(prediction="Growth 1%", utility=0.6, recommendation="Adopt B"), 130),
+        ]
+    )
+    reviewed = iter(
+        [
+            (response_payload(prediction="Growth 1.5%", utility=0.75, recommendation="Adopt C"), 140),
+            (response_payload(prediction="Growth 1.5%", utility=0.75, recommendation="Adopt C"), 150),
+        ]
+    )
+    peer_batches: list[list[dict[str, object]]] = []
+
+    def consensus_call(
+        _agent: Agent,
+        _scenario: Scenario,
+        peers: list[dict[str, object]],
+    ) -> tuple[str, int]:
+        peer_batches.append(peers)
+        return next(reviewed)
+
+    result = execute_full_shcr_cycle(
+        scenario_id,
+        lambda _agent, _scenario: next(first_round),
+        consensus_call,
+    )
+
+    assert len(peer_batches) == 2
+    assert {item["agent"] for item in peer_batches[0]} == {"phase3_fiscal", "phase3_risk"}
+    assert result["token_usage"] == 540
+    assert any(log["stage"] == "CONSENSUS" for log in result["logs"])
 
 
 def test_run_full_shcr_cycle_populates_postgres(scenario_id: int) -> None:
@@ -295,9 +350,7 @@ def test_run_full_shcr_cycle_populates_postgres(scenario_id: int) -> None:
         assert sum(item.normalized_weight or 0.0 for item in observations) == pytest.approx(1.0)
 
 
-def test_sparse_llm_json_is_valid_and_reports_insufficient_evidence(
-    scenario_id: int,
-) -> None:
+def test_sparse_llm_json_fails_deliberation_quorum(scenario_id: int) -> None:
     responses = iter(
         [
             ('{"provider_metadata":{"model":"a"}}', 5),
@@ -305,47 +358,16 @@ def test_sparse_llm_json_is_valid_and_reports_insufficient_evidence(
         ]
     )
 
-    result = execute_full_shcr_cycle(
-        scenario_id,
-        lambda _agent, _scenario: next(responses),
-    )
-
-    assert result["convergence_status"] == "INSUFFICIENT_EVIDENCE"
-    assert result["token_usage"] == 12
-    with SessionLocal() as session:
-        logs = list(
-            session.scalars(
-                select(ReasoningLog).where(ReasoningLog.scenario_id == scenario_id)
-            )
+    with pytest.raises(RuntimeError, match="quorum failed"):
+        execute_full_shcr_cycle(
+            scenario_id,
+            lambda _agent, _scenario: next(responses),
         )
-        snapshot = session.scalar(
-            select(MetricSnapshot).where(
-                MetricSnapshot.id == result["metric_snapshot_id"]
-            )
+
+
+def test_invalid_llm_json_fails_deliberation_quorum(scenario_id: int) -> None:
+    with pytest.raises(RuntimeError, match="quorum failed"):
+        execute_full_shcr_cycle(
+            scenario_id,
+            lambda _agent, _scenario: ("not-json", 5),
         )
-        assert len(logs) == 2
-        assert all(log.is_schema_valid for log in logs)
-        assert isinstance(logs[0].parsed_srr_objects, dict)
-        assert logs[0].parsed_srr_objects["provider_metadata"]["model"] == "a"
-        assert snapshot is not None
-        assert snapshot.material_information_retention_macro_f1 == pytest.approx(0.8)
-
-
-def test_invalid_llm_json_marks_schema_invalid(scenario_id: int) -> None:
-    result = execute_full_shcr_cycle(
-        scenario_id,
-        lambda _agent, _scenario: ("not-json", 5),
-    )
-
-    assert result["convergence_status"] == "INSUFFICIENT_EVIDENCE"
-    assert result["token_usage"] == 10
-    assert result["provenance_completeness_percent"] == 0.0
-
-    with SessionLocal() as session:
-        logs = list(
-            session.scalars(
-                select(ReasoningLog).where(ReasoningLog.scenario_id == scenario_id)
-            )
-        )
-        assert len(logs) == 2
-        assert all(not log.is_schema_valid for log in logs)

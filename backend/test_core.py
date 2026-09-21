@@ -5,6 +5,8 @@ import pytest
 from backend.core_algorithms import (
     Alternative,
     HardConstraints,
+    build_agent_user_prompt,
+    build_consensus_prompt,
     calculate_dynamic_influence,
     build_agent_system_prompt,
     calculate_violation_rate,
@@ -46,10 +48,29 @@ def test_build_agent_system_prompt_injects_mandate() -> None:
     assert "State Revenue Agent" in prompt
     assert "revenue resilience" in prompt
     assert "impacts, risks, uncertainties, objections, conditions, and adjustments" in prompt
-    assert "Recommendation, confidence" in prompt
-    assert "optional when evidence is insufficient" in prompt
+    assert "recommendation and confidence" in prompt
+    assert "decision-complete response" in prompt
     assert "Additional structured fields are allowed" in prompt
     assert "Do not reveal hidden chain-of-thought" in prompt
+
+
+def test_reasoning_prompts_require_decision_artifacts_and_peer_review() -> None:
+    user_prompt = build_agent_user_prompt(
+        "Fiscal Reviewer",
+        "Evaluate policy",
+        10.0,
+        3.0,
+    )
+    consensus_prompt = build_consensus_prompt(
+        "Revenue Agent",
+        "Revenue",
+        [{"agent": "Risk Agent", "srr": {"risks": []}}],
+    )
+
+    assert "decision-complete SRR" in user_prompt
+    assert "evidence-backed impact claims" in user_prompt
+    assert "Review the structured outputs from every agent" in consensus_prompt
+    assert "Preserve valid dissent" in consensus_prompt
 
 
 def test_rar_dai_zero_gate() -> None:

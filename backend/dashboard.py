@@ -8,7 +8,7 @@ from sqlalchemy.orm import aliased
 
 from .agent_templates import resolve_agent_system_prompt
 from .celery_client import celery_client
-from .core_algorithms import build_agent_system_prompt
+from .core_algorithms import build_agent_system_prompt, resolve_llm_runtime_config
 from .database import SessionLocal
 from .models import (
     Agent,
@@ -150,6 +150,26 @@ def start_run(scenario_id: int) -> dict[str, Any]:
     with SessionLocal() as session:
         if session.get(Scenario, scenario_id) is None:
             raise HTTPException(status_code=404, detail="Scenario not found")
+        agents = list(session.scalars(select(Agent).order_by(Agent.id)))
+        if len(agents) < 2:
+            raise HTTPException(
+                status_code=409,
+                detail="At least two configured agents are required for deliberation",
+            )
+        invalid_agents: list[str] = []
+        for agent in agents:
+            try:
+                resolve_llm_runtime_config(agent)
+            except ValueError:
+                invalid_agents.append(agent.name)
+        if invalid_agents:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Database LLM configuration is required for every agent: "
+                    + ", ".join(invalid_agents)
+                ),
+            )
     task = celery_client.send_task("shcr.run_full_shcr_cycle", args=[scenario_id])
     return {
         "task_id": task.id,
@@ -182,13 +202,8 @@ def run_status(task_id: str) -> dict[str, Any]:
         payload["logs"] = result.info.get("logs", [])
     if result.successful():
         payload["result"] = result.result
-        payload["logs"] = [
-            {"stage": "SRR", "level": "SUCCESS", "message": "All available agent responses processed."},
-            {"stage": "DDR", "level": "SUCCESS", "message": "Disagreement vectors calculated and resolution routes recorded."},
-            {"stage": "CAR", "level": "SUCCESS", "message": "Hard constraints applied before reconciliation."},
-            {"stage": "METRICS", "level": "SUCCESS", "message": "Dissertation metrics persisted to PostgreSQL."},
-            {"stage": "COMPLETE", "level": "SUCCESS", "message": "SHCR cycle completed."},
-        ]
+        if isinstance(result.result, dict):
+            payload["logs"] = result.result.get("logs", payload["logs"])
     elif result.failed():
         payload["error"] = str(result.result)
     return payload

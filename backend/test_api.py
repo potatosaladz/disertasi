@@ -167,7 +167,13 @@ def test_agent_connection_endpoint_handles_success_and_failure(
 ) -> None:
     response = client.post(
         "/api/agents",
-        json={"name": f"connection-{uuid.uuid4()}", "role": "Test", "llm_model": "test-model"},
+        json={
+            "name": f"connection-{uuid.uuid4()}",
+            "role": "Test",
+            "llm_base_url": "https://connection.example/v1",
+            "llm_api_key": "connection-secret",
+            "llm_model": "test-model",
+        },
     )
     agent_id = response.json()["id"]
 
@@ -225,22 +231,25 @@ def test_domain_rules_aggregate_template_agents(client: TestClient) -> None:
     assert payload["stale"] is False
     assert "VERIFIED_OFFSETS_ONLY" in payload["rules"]["owned_checks"]
     assert payload["rules"]["automatic_deficit_ceiling"] == 3.0
-    assert payload["agent_rules"] == [
-        {
-            "agent_id": template_agent.json()["id"],
-            "name": template_agent.json()["name"],
-            "role": "Penerimaan Negara",
-            "template_key": "revenue",
-            "mandate": next(
-                template.mandate
-                for template in STANDARD_APBN_AGENT_TEMPLATES
-                if template.key == "revenue"
-            ),
-            "primary_sources": list(STANDARD_APBN_AGENT_TEMPLATES[0].primary_sources),
-            "constraints": list(STANDARD_APBN_AGENT_TEMPLATES[0].constraints),
-            "owned_checks": list(STANDARD_APBN_AGENT_TEMPLATES[0].owned_checks),
-        }
-    ]
+    revenue_rules = next(
+        item
+        for item in payload["agent_rules"]
+        if item["agent_id"] == template_agent.json()["id"]
+    )
+    assert revenue_rules == {
+        "agent_id": template_agent.json()["id"],
+        "name": template_agent.json()["name"],
+        "role": "Penerimaan Negara",
+        "template_key": "revenue",
+        "mandate": next(
+            template.mandate
+            for template in STANDARD_APBN_AGENT_TEMPLATES
+            if template.key == "revenue"
+        ),
+        "primary_sources": list(STANDARD_APBN_AGENT_TEMPLATES[0].primary_sources),
+        "constraints": list(STANDARD_APBN_AGENT_TEMPLATES[0].constraints),
+        "owned_checks": list(STANDARD_APBN_AGENT_TEMPLATES[0].owned_checks),
+    }
 
     with SessionLocal() as session:
         session.delete(session.get(Scenario, scenario.json()["id"]))
@@ -331,9 +340,27 @@ def test_scenario_rejects_negative_program_cost(client: TestClient) -> None:
 def test_run_submission_and_status(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
     with SessionLocal() as session:
         scenario = Scenario(description=f"Run test {uuid.uuid4()}", max_deficit_constraint=3.0)
+        agents = [
+            Agent(
+                name=f"run-agent-{uuid.uuid4()}",
+                role="Fiscal",
+                llm_base_url="https://fiscal.example/v1",
+                llm_api_key="fiscal-secret",
+                llm_model="fiscal-model",
+            ),
+            Agent(
+                name=f"run-agent-{uuid.uuid4()}",
+                role="Risk",
+                llm_base_url="https://risk.example/v1",
+                llm_api_key="risk-secret",
+                llm_model="risk-model",
+            ),
+        ]
         session.add(scenario)
+        session.add_all(agents)
         session.commit()
         scenario_id = scenario.id
+        agent_ids = [agent.id for agent in agents]
 
     class FakeTask:
         id = "task-phase5"
@@ -345,6 +372,7 @@ def test_run_submission_and_status(client: TestClient, monkeypatch: pytest.Monke
 
     with SessionLocal() as session:
         session.delete(session.get(Scenario, scenario_id))
+        session.execute(delete(Agent).where(Agent.id.in_(agent_ids)))
         session.commit()
 
 
@@ -392,7 +420,21 @@ def test_dashboard_matrix_and_manifest(client: TestClient) -> None:
 def test_run_status_success(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
     class FakeResult:
         state = "SUCCESS"
-        result = {"metric_snapshot_id": 9}
+        result = {
+            "metric_snapshot_id": 9,
+            "logs": [
+                {
+                    "stage": "CONSENSUS",
+                    "level": "SUCCESS",
+                    "message": "Peer review completed.",
+                },
+                {
+                    "stage": "COMPLETE",
+                    "level": "SUCCESS",
+                    "message": "SHCR cycle completed.",
+                },
+            ],
+        }
         info = None
 
         def successful(self) -> bool:
@@ -406,7 +448,7 @@ def test_run_status_success(client: TestClient, monkeypatch: pytest.MonkeyPatch)
     assert response.status_code == 200
     assert response.json()["status"] == "SUCCEEDED"
     assert response.json()["result"]["metric_snapshot_id"] == 9
-    assert any(log["stage"] == "CAR" for log in response.json()["logs"])
+    assert response.json()["logs"][0]["stage"] == "CONSENSUS"
 
 
 def test_run_status_failure(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:

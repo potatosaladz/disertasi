@@ -144,6 +144,7 @@ export default function Home() {
   const [mandateLogs, setMandateLogs] = useState<RunLog[]>([]);
   const [trackerHistory, setTrackerHistory] = useState<RunLog[]>([]);
   const trackerLogCounts = useRef<Record<string, number>>({});
+  const trackerConsoleRef = useRef<HTMLDivElement>(null);
 
   function appendTrackerLogs(taskId: string, logs: RunLog[]) {
     const previousCount = trackerLogCounts.current[taskId] ?? 0;
@@ -184,12 +185,19 @@ export default function Home() {
     loadSetup().catch(() => setNotice("API connection pending. Check the backend URL."));
   }, []);
   useEffect(() => { if (selectedScenario !== null) loadDashboard(selectedScenario).catch(() => setNotice("No dashboard data for this scenario yet.")); }, [selectedScenario]);
+  useEffect(() => {
+    const consoleElement = trackerConsoleRef.current;
+    if (consoleElement) consoleElement.scrollTop = consoleElement.scrollHeight;
+  }, [trackerHistory.length]);
 
   useEffect(() => {
     if (!run || ["SUCCEEDED", "FAILED"].includes(run.status)) return;
     const timer = window.setInterval(async () => {
       const response = await fetch(`${apiUrl}/api/runs/${run.task_id}`, { cache: "no-store" });
-      if (!response.ok) return;
+      if (!response.ok) {
+        setNotice(`Tracker API error (${response.status}).`);
+        return;
+      }
       const nextRun: RunState = await response.json();
       setRun(nextRun);
       appendTrackerLogs(nextRun.task_id, nextRun.logs);
@@ -332,7 +340,7 @@ export default function Home() {
 
     <nav className="menu-rail"><span className="menu-label">CONTROL MENUS</span><a href="#setup">01 / Setup</a><a href="#setup">02 / Scenario</a><a className="active" href="#tracker">03 / Live Tracker</a><a href="#ddr">04 / DDR Network</a><a href="#analytics">05 / Analytics</a></nav>
 
-    <section id="tracker" className="tracker-panel panel"><div className="section-header"><div><span className="section-number">03</span><h2>Live Tracker</h2></div><span className={`run-state ${run?.status?.toLowerCase() ?? "idle"}`}>{run?.status ?? "IDLE"}</span></div><div className="tracker-content"><div className="progress-console max-h-[450px] overflow-y-auto">{activeLogs.map((log, index) => <div className={`console-line ${log.level.toLowerCase()}`} key={`${log.stage}-${index}`}><span>{String(index + 1).padStart(2, "0")}</span><i className={index === activeLogs.length - 1 && !["SUCCEEDED", "FAILED"].includes(run?.status ?? "") ? "pulse" : "done"} /><div><b>[{log.level}] {log.stage}</b><small>{log.message}</small></div></div>)}</div><div className="task-readout"><span>TASK IDENTIFIER</span><strong>{run?.task_id ?? "—"}</strong><small>{run?.error ?? (run?.status === "SUCCEEDED" ? "Result persisted" : "Polling every 1.2 seconds")}</small></div></div></section>
+    <section id="tracker" className="tracker-panel panel"><div className="section-header"><div><span className="section-number">03</span><h2>Live Tracker</h2></div><span className={`run-state ${run?.status?.toLowerCase() ?? "idle"}`}>{run?.status ?? "IDLE"}</span></div><div className="tracker-content"><div ref={trackerConsoleRef} className="progress-console max-h-[500px] overflow-y-auto">{activeLogs.map((log, index) => <div className={`console-line ${log.level.toLowerCase()}`} key={`${log.stage}-${index}`}><span>{String(index + 1).padStart(2, "0")}</span><i className={index === activeLogs.length - 1 && !["SUCCEEDED", "FAILED"].includes(run?.status ?? "") ? "pulse" : "done"} /><div><b>[{log.level}] {log.stage}</b><small>{log.message}</small></div></div>)}</div><div className="task-readout"><span>TASK IDENTIFIER</span><strong>{run?.task_id ?? "—"}</strong><small>{run?.error ?? (run?.status === "SUCCEEDED" ? "Result persisted" : "Polling every 1.2 seconds")}</small></div></div></section>
 
     <section id="ddr" className="panel"><div className="section-header"><div><span className="section-number">04</span><h2>DDR Network</h2></div><span className="panel-code">D<sub>ij</sub> / 8 COMPONENTS</span></div><div className="matrix-wrap">{dashboard?.disagreements.length ? <table className="ddr-table"><thead><tr><th>AGENT PAIR</th>{components.map((component) => <th key={component}>{component}</th>)}<th>RESOLUTION MECHANISM</th></tr></thead><tbody>{dashboard.disagreements.map((item) => <tr key={item.id}><td><strong>{item.agent_i}</strong><small>× {item.agent_j}</small></td>{components.map((component) => <td key={component}><span className={`bool ${item[component] ? "conflict" : "clear"}`}>{item[component] ? "1" : "0"}</span></td>)}<td className="resolution">{item.resolution_mechanism}</td></tr>)}</tbody></table> : <div className="empty-state"><strong>No DDR vectors yet.</strong><span>Run a cycle with at least two schema-valid agents to populate the matrix.</span></div>}</div></section>
 

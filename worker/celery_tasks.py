@@ -1,10 +1,10 @@
 import logging
-import os
 from collections.abc import Callable
 from time import perf_counter
-from typing import Any, cast
+from typing import Any
 
 from openai import OpenAI
+from openai.types.chat import ChatCompletionMessageParam
 from pydantic import ValidationError
 from sqlalchemy import select
 
@@ -12,11 +12,15 @@ from backend.agent_templates import resolve_agent_system_prompt
 from backend.core_algorithms import (
     HardConstraints,
     build_agent_system_prompt,
+    build_agent_user_prompt,
+    build_consensus_prompt,
     calculate_dynamic_influence,
     calculate_violation_rate,
     detect_divergence_vector,
     extract_json_object,
     neuro_symbolic_filter,
+    resolve_llm_runtime_config,
+    validate_decision_artifacts,
 )
 from backend.database import SessionLocal
 from backend.models import (
@@ -32,6 +36,7 @@ from worker.srr_models import SRRResponse
 
 logger = logging.getLogger(__name__)
 LLMCaller = Callable[[Agent, Scenario], tuple[str, int]]
+ConsensusCaller = Callable[[Agent, Scenario, list[dict[str, Any]]], tuple[str, int]]
 ProgressReporter = Callable[[list[dict[str, str]]], None]
 
 
@@ -41,7 +46,7 @@ def _log(stage: str, level: str, message: str) -> dict[str, str]:
 
 def _extract_llm_response(response: object) -> tuple[str, int]:
     if isinstance(response, str):
-        return response, 0
+        raise ValueError("LLM SDK response omitted provider usage metadata")
     if isinstance(response, dict):
         content = response.get("content")
         if content is None:
@@ -55,8 +60,10 @@ def _extract_llm_response(response: object) -> tuple[str, int]:
         if not isinstance(content, str):
             raise ValueError("LLM response dictionary has no text content")
         usage = response.get("usage")
-        tokens = usage.get("total_tokens", 0) if isinstance(usage, dict) else 0
-        return content, int(tokens)
+        tokens = usage.get("total_tokens") if isinstance(usage, dict) else None
+        if not isinstance(tokens, int) or tokens <= 0:
+            raise ValueError("LLM response omitted positive total token usage")
+        return content, tokens
     choices = getattr(response, "choices", None)
     if not choices:
         raise ValueError(f"Unsupported LLM response type: {type(response).__name__}")
@@ -64,21 +71,36 @@ def _extract_llm_response(response: object) -> tuple[str, int]:
     if not isinstance(content, str):
         raise ValueError("LLM returned no text content")
     usage = getattr(response, "usage", None)
-    return content, int(getattr(usage, "total_tokens", 0) if usage else 0)
+    tokens = getattr(usage, "total_tokens", None) if usage else None
+    if not isinstance(tokens, int) or tokens <= 0:
+        raise ValueError("LLM response omitted positive total token usage")
+    return content, tokens
+
+
+def _create_llm_completion(
+    agent: Agent,
+    messages: list[ChatCompletionMessageParam],
+) -> tuple[str, int]:
+    config = resolve_llm_runtime_config(agent)
+    response = OpenAI(
+        api_key=config.api_key,
+        base_url=config.base_url,
+        timeout=60.0,
+        max_retries=2,
+    ).chat.completions.create(
+        model=config.model,
+        temperature=agent.temperature,
+        max_tokens=agent.max_tokens,
+        messages=messages,
+        response_format={"type": "json_object"},
+    )
+    return _extract_llm_response(response)
 
 
 def _default_llm_call(agent: Agent, scenario: Scenario) -> tuple[str, int]:
-    base_url = agent.llm_base_url or os.getenv(
-        "OPENAI_BASE_URL", "http://host.docker.internal:11434/v1"
-    )
-    api_key = agent.llm_api_key or os.getenv("OPENAI_API_KEY", "local-llm")
-    model = cast(str, agent.llm_model or os.getenv("OPENAI_MODEL") or "local-model")
-    client = OpenAI(api_key=api_key, base_url=base_url)
-    response = client.chat.completions.create(
-        model=model,
-        temperature=agent.temperature,
-        max_tokens=agent.max_tokens,
-        messages=[
+    return _create_llm_completion(
+        agent,
+        [
             {
                 "role": "system",
                 "content": build_agent_system_prompt(
@@ -88,17 +110,49 @@ def _default_llm_call(agent: Agent, scenario: Scenario) -> tuple[str, int]:
             },
             {
                 "role": "user",
-                "content": (
-                    f"Agent role: {agent.role}\n"
-                    f"Policy goal: {scenario.description}\n"
-                    f"Program cost: {scenario.program_cost if scenario.program_cost is not None else 'UNKNOWN'}\n"
-                    f"Automatic legal deficit ceiling: {scenario.max_deficit_constraint}%"
+                "content": build_agent_user_prompt(
+                    agent.role,
+                    scenario.description,
+                    scenario.program_cost,
+                    scenario.max_deficit_constraint,
                 ),
             },
         ],
-        response_format={"type": "json_object"},
     )
-    return _extract_llm_response(response)
+
+
+def _default_consensus_call(
+    agent: Agent,
+    scenario: Scenario,
+    peer_outputs: list[dict[str, Any]],
+) -> tuple[str, int]:
+    return _create_llm_completion(
+        agent,
+        [
+            {
+                "role": "system",
+                "content": build_agent_system_prompt(
+                    agent.role,
+                    resolve_agent_system_prompt(agent),
+                ),
+            },
+            {
+                "role": "user",
+                "content": build_consensus_prompt(
+                    agent.name,
+                    agent.role,
+                    peer_outputs,
+                )
+                + "\n\n"
+                + build_agent_user_prompt(
+                    agent.role,
+                    scenario.description,
+                    scenario.program_cost,
+                    scenario.max_deficit_constraint,
+                ),
+            },
+        ],
+    )
 
 
 def _parse_response(raw_content: str) -> tuple[dict[str, Any], SRRResponse | None, str | None]:
@@ -119,6 +173,16 @@ def _provenance_counts(response: SRRResponse) -> tuple[int, int]:
     items = response.provenance_items()
     tagged = sum(bool(item.source_tag and item.source_tag.strip()) for item in items)
     return tagged, len(items)
+
+
+def _validated_response(raw_content: str) -> tuple[dict[str, Any], SRRResponse | None, str | None]:
+    raw_json, parsed, validation_error = _parse_response(raw_content)
+    if parsed is None:
+        return raw_json, None, validation_error
+    missing = validate_decision_artifacts(parsed)
+    if missing:
+        return raw_json, None, f"missing decision artifacts: {', '.join(missing)}"
+    return raw_json, parsed, None
 
 
 def _determine_convergence(
@@ -155,10 +219,12 @@ def _determine_convergence(
 def execute_full_shcr_cycle(
     scenario_id: int,
     llm_call: LLMCaller | None = None,
+    consensus_call: ConsensusCaller | None = None,
     progress: ProgressReporter | None = None,
 ) -> dict[str, Any]:
     started_at = perf_counter()
     caller = llm_call or _default_llm_call
+    reviewer = consensus_call or (_default_consensus_call if llm_call is None else None)
     emit = progress or (lambda _logs: None)
     logs = [_log("INITIALIZE", "INFO", f"Starting SHCR cycle for scenario {scenario_id}.")]
     emit(logs)
@@ -171,7 +237,10 @@ def execute_full_shcr_cycle(
         if not agents:
             raise ValueError("At least one agent is required")
 
+        if len(agents) < 2:
+            raise ValueError("At least two configured agents are required for deliberation")
         parsed_by_agent: list[tuple[Agent, SRRResponse]] = []
+        reasoning_by_agent: dict[int, ReasoningLog] = {}
         observations = list(
             session.scalars(
                 select(AgentInfluenceObservation)
@@ -204,9 +273,9 @@ def execute_full_shcr_cycle(
                 )
                 continue
             total_tokens += token_usage
-            raw_json, parsed, validation_error = _parse_response(raw_content)
+            raw_json, parsed, validation_error = _validated_response(raw_content)
             if parsed is None:
-                logs.append(_log("SRR", "WARNING", f"{agent.name}: response failed JSON/schema validation: {validation_error}."))
+                logs.append(_log("SRR", "ERROR", f"{agent.name}: unusable LLM response: {validation_error}."))
                 emit(logs)
                 session.add(
                     ReasoningLog(
@@ -226,16 +295,67 @@ def execute_full_shcr_cycle(
             tagged_items += tagged
             total_items += count
             parsed_by_agent.append((agent, parsed))
-            session.add(
-                ReasoningLog(
-                    agent_id=agent.id,
-                    scenario_id=scenario.id,
-                    raw_json=raw_json,
-                    parsed_srr_objects=parsed.model_dump(mode="json"),
-                    is_schema_valid=True,
-                    provenance_count=tagged,
-                )
+            reasoning_log = ReasoningLog(
+                agent_id=agent.id,
+                scenario_id=scenario.id,
+                raw_json=raw_json,
+                parsed_srr_objects=parsed.model_dump(mode="json"),
+                is_schema_valid=True,
+                provenance_count=tagged,
             )
+            reasoning_by_agent[agent.id] = reasoning_log
+            session.add(reasoning_log)
+
+        if len(parsed_by_agent) < 2:
+            failure_message = (
+                "Deliberation quorum failed: at least two agents must produce "
+                "decision-complete LLM artifacts."
+            )
+            logs.append(_log("COMPLETE", "ERROR", failure_message))
+            emit(logs)
+            raise RuntimeError(failure_message)
+
+        if reviewer is None:
+            logs.append(_log("CONSENSUS", "INFO", "Consensus review callback not configured; retaining supplied test outputs."))
+            emit(logs)
+        else:
+            logs.append(_log("CONSENSUS", "INFO", "Sending peer outputs to each agent for structured consensus review."))
+            emit(logs)
+            peer_outputs = [
+                {
+                    "agent": agent.name,
+                    "role": agent.role,
+                    "srr": response.model_dump(mode="json"),
+                }
+                for agent, response in parsed_by_agent
+            ]
+            consensus_results: list[tuple[Agent, SRRResponse]] = []
+            for agent, _ in parsed_by_agent:
+                try:
+                    raw_content, token_usage = reviewer(agent, scenario, peer_outputs)
+                    total_tokens += token_usage
+                    raw_json, reviewed, validation_error = _validated_response(raw_content)
+                    if reviewed is None:
+                        logs.append(_log("CONSENSUS", "ERROR", f"{agent.name}: review rejected: {validation_error}."))
+                        emit(logs)
+                        continue
+                    consensus_results.append((agent, reviewed))
+                    logs.append(_log("CONSENSUS", "SUCCESS", f"{agent.name}: peer review completed with {token_usage} tokens."))
+                    emit(logs)
+                    reasoning_log = reasoning_by_agent[agent.id]
+                    reasoning_log.raw_json = raw_json
+                    reasoning_log.parsed_srr_objects = reviewed.model_dump(mode="json")
+                    reasoning_log.provenance_count = _provenance_counts(reviewed)[0]
+                except Exception as error:
+                    logger.exception("Consensus review failed for agent %s", agent.id)
+                    logs.append(_log("CONSENSUS", "ERROR", f"{agent.name}: {type(error).__name__}: {error}"))
+                    emit(logs)
+            if len(consensus_results) < 2:
+                failure_message = "Structured consensus failed to produce a two-agent quorum."
+                logs.append(_log("COMPLETE", "ERROR", failure_message))
+                emit(logs)
+                raise RuntimeError(failure_message)
+            parsed_by_agent = consensus_results
 
         logs.append(_log("DDR", "INFO", "Calculating disagreement vectors."))
         emit(logs)
@@ -354,6 +474,7 @@ def execute_full_shcr_cycle(
             "convergence_status": convergence_status.value,
             "latency_ms": latency_ms,
             "token_usage": total_tokens,
+            "logs": logs,
         }
 
 
