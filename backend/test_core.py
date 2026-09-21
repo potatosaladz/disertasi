@@ -49,6 +49,10 @@ def test_llm_headers_and_completion_extraction() -> None:
     assert headers["User-Agent"].startswith("Mozilla/5.0")
     assert extract_llm_completion("direct response") == ("direct response", 0)
     assert extract_llm_completion({"content": "mapping response"}) == ("mapping response", 0)
+    assert extract_llm_completion({"choices": [{"message": {"content": "choice response"}}]}) == (
+        "choice response",
+        0,
+    )
     direct = type("DirectResponse", (), {"content": "provider direct content", "usage": None})()
     assert extract_llm_completion(direct) == ("provider direct content", 0)
     with pytest.raises(ValueError, match="no text content"):

@@ -1,6 +1,7 @@
 import hashlib
 import json
 import logging
+import socket
 import warnings
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -10,7 +11,7 @@ from typing import Any, Literal
 from fastapi import FastAPI, HTTPException, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from openai import OpenAI
+from openai import APIConnectionError, APITimeoutError, OpenAI
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select, text
 
@@ -373,6 +374,13 @@ def test_agent_connection(agent_id: int) -> LLMConnectionTestResponse:
                 response_preview=str(content)[:120],
             )
         except Exception as error:
+            if isinstance(
+                error,
+                (APIConnectionError, APITimeoutError, ConnectionError, TimeoutError, OSError, socket.error),
+            ):
+                logger.exception("Local LLM connection failed for agent %s", agent.id)
+            else:
+                logger.exception("LLM connection test failed for agent %s", agent.id)
             return LLMConnectionTestResponse(
                 agent_id=agent.id,
                 ok=False,
@@ -534,7 +542,13 @@ def _synthesize_agent_domain_rules(agent: Agent, scenario: Scenario) -> AgentDom
             }
         )
     except Exception as error:
-        logger.exception("Mandate synthesis failed for agent %s", agent.id)
+        if isinstance(
+            error,
+            (APIConnectionError, APITimeoutError, ConnectionError, TimeoutError, OSError, socket.error),
+        ):
+            logger.exception("Local LLM connection failed during mandate synthesis for agent %s", agent.id)
+        else:
+            logger.exception("Mandate synthesis failed for agent %s", agent.id)
         code: Literal["CONFIGURATION_ERROR", "PROVIDER_ERROR", "EMPTY_CONTENT", "INVALID_JSON", "SCHEMA_ERROR"] = (
             "CONFIGURATION_ERROR"
             if isinstance(error, ValueError) and "configuration" in str(error)

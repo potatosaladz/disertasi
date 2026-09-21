@@ -1,9 +1,10 @@
 import logging
+import socket
 from collections.abc import Callable
 from time import perf_counter
 from typing import Any
 
-from openai import OpenAI
+from openai import APIConnectionError, APITimeoutError, OpenAI
 from openai.types.chat import ChatCompletionMessageParam
 from pydantic import ValidationError
 from sqlalchemy import select
@@ -248,7 +249,13 @@ def execute_full_shcr_cycle(
             try:
                 raw_content, token_usage = caller(agent, scenario)
             except Exception as error:
-                logger.exception("LLM call failed for agent %s", agent.id)
+                if isinstance(
+                    error,
+                    (APIConnectionError, APITimeoutError, ConnectionError, TimeoutError, OSError, socket.error),
+                ):
+                    logger.exception("Local LLM connection failed for agent %s", agent.id)
+                else:
+                    logger.exception("LLM call failed for agent %s", agent.id)
                 logs.append(_log("SRR", "ERROR", f"{agent.name}: {type(error).__name__}: {error}"))
                 emit(logs)
                 session.add(
@@ -337,7 +344,13 @@ def execute_full_shcr_cycle(
                     reasoning_log.parsed_srr_objects = reviewed.model_dump(mode="json")
                     reasoning_log.provenance_count = _provenance_counts(reviewed)[0]
                 except Exception as error:
-                    logger.exception("Consensus review failed for agent %s", agent.id)
+                    if isinstance(
+                        error,
+                        (APIConnectionError, APITimeoutError, ConnectionError, TimeoutError, OSError, socket.error),
+                    ):
+                        logger.exception("Local LLM connection failed during consensus review for agent %s", agent.id)
+                    else:
+                        logger.exception("Consensus review failed for agent %s", agent.id)
                     logs.append(_log("CONSENSUS", "ERROR", f"{agent.name}: {type(error).__name__}: {error}"))
                     emit(logs)
             if len(consensus_results) < 2:

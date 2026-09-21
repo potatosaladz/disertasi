@@ -78,7 +78,13 @@ def llm_request_headers() -> dict[str, str]:
 
 def safe_llm_target(base_url: str) -> str:
     parsed = urlsplit(base_url)
-    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
+    hostname = parsed.hostname or ""
+    host = f"[{hostname}]" if ":" in hostname else hostname
+    try:
+        netloc = f"{host}:{parsed.port}" if parsed.port is not None else host
+    except ValueError:
+        netloc = host
+    return urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
 
 
 def log_llm_outbound(
