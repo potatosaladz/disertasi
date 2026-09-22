@@ -17,6 +17,26 @@ _AGENT_COLUMNS: dict[str, str] = {
     "max_tokens": "INTEGER NOT NULL DEFAULT 4000",
 }
 
+_SESSION_COLUMNS: dict[str, str] = {
+    "reasoning_logs": 'VARCHAR(36) REFERENCES consensus_sessions(id) ON DELETE CASCADE',
+    "disagreement_logs": 'VARCHAR(36) REFERENCES consensus_sessions(id) ON DELETE CASCADE',
+    "metric_snapshots": 'VARCHAR(36) REFERENCES consensus_sessions(id) ON DELETE CASCADE',
+    "agent_influence_observations": 'VARCHAR(36) REFERENCES consensus_sessions(id) ON DELETE CASCADE',
+}
+
+
+def _upgrade_session_columns() -> None:
+    inspector = inspect(engine)
+    existing_tables = set(inspector.get_table_names())
+    with engine.begin() as connection:
+        for table, definition in _SESSION_COLUMNS.items():
+            if table not in existing_tables:
+                continue
+            columns = {column["name"] for column in inspector.get_columns(table)}
+            if "run_id" not in columns:
+                connection.execute(text(f'ALTER TABLE {table} ADD COLUMN run_id {definition}'))
+            connection.execute(text(f"CREATE INDEX IF NOT EXISTS ix_{table}_run_id ON {table} (run_id)"))
+
 
 def _upgrade_agents_table() -> None:
     inspector = inspect(engine)
@@ -86,6 +106,7 @@ def initialize_database() -> None:
     Agent.metadata.create_all(bind=engine)
     _upgrade_agents_table()
     _upgrade_scenarios_table()
+    _upgrade_session_columns()
 
 
 if __name__ == "__main__":

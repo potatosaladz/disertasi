@@ -69,7 +69,10 @@ type Disagreement = {
 };
 type Influence = { agent: string; proposition: string; normalized_weight: number | null; raw_score: number | null; gate: number };
 type Dashboard = {
+  session_id: string | null;
+  session_status: string | null;
   scenario: Scenario;
+  domain_rules: DomainRules;
   latest_metric: Metric | null;
   metric_history: Metric[];
   schema_validity_percent: number;
@@ -78,7 +81,7 @@ type Dashboard = {
   influence_observations: Influence[];
 };
 type RunLog = { stage: string; level: string; message: string };
-type RunState = { task_id: string; status: string; logs: RunLog[]; result?: { metric_snapshot_id: number } | null; error?: string };
+type RunState = { task_id: string; session_id: string; scenario_id: number; status: string; logs: RunLog[]; result?: { metric_snapshot_id: number; session_id: string; scenario_id: number } | null; error?: string };
 type AgentDomainRules = { agent_id: number; name: string; role: string; template_key: string | null; mandate: string | null; primary_sources: string[]; constraints: string[]; owned_checks: string[]; synthesis_status: "generated" | "fallback"; scenario_mandate: string | null; scenario_focus: string[]; priority_questions: string[]; required_evidence: string[]; llm_model: string | null; token_usage: number | null; error: { code: string; message: string } | null };
 type DomainRules = { scenario_id: number; revision: string; generated: boolean; stale: boolean; agent_count: number; rules: { hard_constraints?: string[]; owned_checks?: string[]; principles?: string[]; primary_sources?: string[]; automatic_deficit_ceiling?: number }; agent_rules: AgentDomainRules[]; status: "success" | "partial" | "failed" | "stale" | "missing"; generated_count: number; failure_count: number; detail: string | null };
 type AgentForm = Omit<Agent, "id" | "has_llm_api_key" | "template_key" | "system_prompt"> & { llm_api_key: string };
@@ -118,8 +121,8 @@ function RuleList({ title, items, empty }: { title: string; items: string[]; emp
   return <section className="rule-list"><span>{title}</span>{items.length ? <ul>{items.map((item) => <li key={item}>{item}</li>)}</ul> : <p>{empty}</p>}</section>;
 }
 
-function AgentMandateCard({ rules, index }: { rules: AgentDomainRules; index: number }) {
-  return <details className="agent-mandate-card" open={index === 0}><summary><div><span>{String(index + 1).padStart(2, "0")} / {rules.template_key?.toUpperCase() ?? "CUSTOM"} / {rules.synthesis_status.toUpperCase()}</span><strong>{rules.name}</strong><small>{rules.role}</small></div><b>{rules.primary_sources.length} sources · {rules.constraints.length} constraints</b></summary><div className="agent-mandate-body">{rules.scenario_mandate && <section className="mandate-copy"><span>LLM SCENARIO MANDATE</span><p>{rules.scenario_mandate}</p></section>}<section className="mandate-copy"><span>AUTHORITATIVE LOCAL SEED</span><p>{rules.mandate ?? "Mandat terstruktur belum tersedia untuk agen ini."}</p></section>{rules.error && <section className="mandate-copy"><span>{rules.error.code}</span><p>{rules.error.message}</p></section>}<div className="agent-rule-columns"><RuleList title="SCENARIO FOCUS" items={rules.scenario_focus} empty="LLM synthesis fallback aktif." /><RuleList title="PRIORITY QUESTIONS" items={rules.priority_questions} empty="Belum ada pertanyaan hasil sintesis." /><RuleList title="REQUIRED EVIDENCE" items={rules.required_evidence} empty="Belum ada bukti tambahan hasil sintesis." /><RuleList title="PRIMARY SOURCES" items={rules.primary_sources} empty="Tidak ada sumber primer terstruktur." /><RuleList title="CONSTRAINTS" items={rules.constraints} empty="Tidak ada constraint terstruktur." /><RuleList title="OWNED CHECKS" items={rules.owned_checks} empty="Tidak ada owned checks terstruktur." /></div></div></details>;
+function AgentMandateCard({ rules, index, onGenerate, busy }: { rules: AgentDomainRules; index: number; onGenerate: (agentId: number) => void; busy: boolean }) {
+  return <details className="agent-mandate-card" open={index === 0}><summary><div><span>{String(index + 1).padStart(2, "0")} / {rules.template_key?.toUpperCase() ?? "CUSTOM"} / {rules.synthesis_status.toUpperCase()}</span><strong>{rules.name}</strong><small>{rules.role}</small></div><b>{rules.primary_sources.length} sources · {rules.constraints.length} constraints</b></summary><div className="agent-mandate-body"><div className="mandate-card-actions"><button type="button" className="template-load-button" onClick={() => onGenerate(rules.agent_id)} disabled={busy}>{busy ? "Generating…" : "Generate Mandat"}</button></div>{rules.scenario_mandate && <section className="mandate-copy"><span>LLM SCENARIO MANDATE</span><p>{rules.scenario_mandate}</p></section>}<section className="mandate-copy"><span>AUTHORITATIVE LOCAL SEED</span><p>{rules.mandate ?? "Mandat terstruktur belum tersedia untuk agen ini."}</p></section>{rules.error && <section className="mandate-copy"><span>{rules.error.code}</span><p>{rules.error.message}</p></section>}<div className="agent-rule-columns"><RuleList title="SCENARIO FOCUS" items={rules.scenario_focus} empty="LLM synthesis fallback aktif." /><RuleList title="PRIORITY QUESTIONS" items={rules.priority_questions} empty="Belum ada pertanyaan hasil sintesis." /><RuleList title="REQUIRED EVIDENCE" items={rules.required_evidence} empty="Belum ada bukti tambahan hasil sintesis." /><RuleList title="PRIMARY SOURCES" items={rules.primary_sources} empty="Tidak ada sumber primer terstruktur." /><RuleList title="CONSTRAINTS" items={rules.constraints} empty="Tidak ada constraint terstruktur." /><RuleList title="OWNED CHECKS" items={rules.owned_checks} empty="Tidak ada owned checks terstruktur." /></div></div></details>;
 }
 
 export default function Home() {
@@ -135,6 +138,7 @@ export default function Home() {
   const [notice, setNotice] = useState("Research console ready. Select a scenario to activate the tracker.");
   const [domainRules, setDomainRules] = useState<DomainRules | null>(null);
   const [rulesBusy, setRulesBusy] = useState(false);
+  const [busyAgentId, setBusyAgentId] = useState<number | null>(null);
   const [busy, setBusy] = useState(false);
   const [editingAgentId, setEditingAgentId] = useState<number | null>(null);
   const [scenarioExpanded, setScenarioExpanded] = useState(false);
@@ -182,7 +186,9 @@ export default function Home() {
   async function loadDashboard(id: number) {
     const response = await fetch(`${apiUrl}/api/scenarios/${id}/dashboard`, { cache: "no-store" });
     if (!response.ok) throw new Error("Dashboard unavailable");
-    setDashboard(await response.json());
+    const payload: Dashboard = await response.json();
+    setDashboard(payload);
+    setDomainRules(payload.domain_rules);
   }
 
   useEffect(() => {
@@ -206,8 +212,8 @@ export default function Home() {
       const nextRun: RunState = await response.json();
       setRun(nextRun);
       appendTrackerLogs(nextRun.task_id, nextRun.logs);
-      if (nextRun.status === "SUCCEEDED" && selectedScenario !== null) {
-        await loadDashboard(selectedScenario);
+      if (nextRun.status === "SUCCEEDED" && selectedScenario === nextRun.scenario_id) {
+        await loadDashboard(nextRun.scenario_id);
         setNotice("Cycle complete. Dashboard metrics refreshed from PostgreSQL.");
       }
     }, 1200);
@@ -293,9 +299,10 @@ export default function Home() {
 
   async function generateMandate() {
     if (selectedScenario === null || agents.length === 0) return;
+    const scenarioId = selectedScenario;
     setRulesBusy(true);
     try {
-      const response = await fetch(`${apiUrl}/api/scenarios/${selectedScenario}/domain-rules`, { method: "POST" });
+      const response = await fetch(`${apiUrl}/api/scenarios/${scenarioId}/domain-rules`, { method: "POST" });
       if (!response.ok) {
         const rawError = await response.text();
         let message = rawError || `Mandat gagal dibuat (${response.status})`;
@@ -314,6 +321,7 @@ export default function Home() {
       }
       if (!payload.generated) throw new Error(payload.detail ?? "Backend tidak menandai mandat sebagai generated");
       setDomainRules({ ...payload, generated: true, stale: false });
+      await loadDashboard(scenarioId);
       setMandateLogs((current) => [...current, { stage: "MANDATE", level: payload.status === "partial" ? "WARNING" : "SUCCESS", message: payload.detail ?? `Generated ${payload.generated_count ?? 0} mandates.` }]);
       setNotice(payload.detail ?? "Mandat dinamis berhasil dibuat.");
     } catch (error) {
@@ -325,12 +333,42 @@ export default function Home() {
     }
   }
 
+  async function generateAgentMandate(agentId: number) {
+    if (selectedScenario === null) return;
+    const scenarioId = selectedScenario;
+    setBusyAgentId(agentId);
+    try {
+      const response = await fetch(
+        `${apiUrl}/api/scenarios/${scenarioId}/agents/${agentId}/domain-rules`,
+        { method: "POST" },
+      );
+      const rawPayload = await response.text();
+      let payload: AgentDomainRules | { detail?: string };
+      try {
+        payload = JSON.parse(rawPayload) as AgentDomainRules | { detail?: string };
+      } catch {
+        throw new Error(rawPayload || `Mandat agen gagal dibuat (${response.status})`);
+      }
+      if (!response.ok) throw new Error("detail" in payload ? payload.detail : "Mandat agen gagal dibuat");
+      await loadDashboard(scenarioId);
+      const generated = payload as AgentDomainRules;
+      setMandateLogs((current) => [...current, { stage: "MANDATE", level: generated.synthesis_status === "generated" ? "SUCCESS" : "WARNING", message: `Mandat ${generated.name} diperbarui.` }]);
+      setNotice(`Mandat ${generated.name} diperbarui dan dashboard telah di-refresh.`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Mandat agen gagal dibuat";
+      setMandateLogs((current) => [...current, { stage: "MANDATE", level: "ERROR", message }]);
+      setNotice(message);
+    } finally {
+      setBusyAgentId(null);
+    }
+  }
+
   async function submitScenario(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); setBusy(true);
     try {
       const response = await fetch(`${apiUrl}/api/scenarios`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(scenario) });
       const payload = await response.json(); if (!response.ok) throw new Error(payload.detail ?? "Scenario could not be saved");
-      setScenario(initialScenario); await loadSetup(); setSelectedScenario(payload.id); setNotice(`Skenario ${payload.id} tersimpan; aturan hukum dan batas defisit diterapkan otomatis.`);
+      setScenario(initialScenario); await loadSetup(); setDomainRules(null); setDashboard(null); setRun(null); setTrackerHistory([]); setSelectedScenario(payload.id); setNotice(`Skenario ${payload.id} tersimpan; aturan hukum dan batas defisit diterapkan otomatis.`);
     } catch (error) { setNotice(error instanceof Error ? error.message : "Scenario could not be saved"); } finally { setBusy(false); }
   }
 
@@ -340,7 +378,7 @@ export default function Home() {
     const response = await fetch(`${apiUrl}/api/scenarios/${selectedScenario}/runs`, { method: "POST" });
     const payload = await response.json();
     if (!response.ok) { setNotice(payload.detail ?? "Could not queue cycle"); return; }
-    setRun({ task_id: payload.task_id, status: payload.status, logs: payload.logs });
+    setRun({ task_id: payload.task_id, session_id: payload.session_id, scenario_id: payload.scenario_id, status: payload.status, logs: payload.logs });
     appendQueueLog(payload.task_id, payload.logs);
     setNotice(`Task ${payload.task_id.slice(0, 8)} queued on Celery.`);
   }
@@ -357,7 +395,7 @@ export default function Home() {
   const activeLogs = trackerHistory.length ? trackerHistory : [{ stage: "IDLE", level: "INFO", message: "Awaiting task dispatch." }];
   const selectedTemplateData = templates.find((item) => item.key === selectedTemplate);
   const canGenerateRules = selectedScenario !== null && agents.length > 0;
-  const rulesAreStale = canGenerateRules && (!domainRules || !domainRules.generated || domainRules.stale || domainRules.agent_count !== agents.length);
+  const rulesAreStale = canGenerateRules && (!domainRules || domainRules.scenario_id !== selectedScenario || !domainRules.generated || domainRules.stale || domainRules.agent_count !== agents.length);
   const activeInfluence = useMemo(() => [...(dashboard?.influence_observations ?? [])].sort((a, b) => (b.normalized_weight ?? 0) - (a.normalized_weight ?? 0)), [dashboard]);
 
   return <main className="shell dashboard-shell">
@@ -365,7 +403,7 @@ export default function Home() {
     <section className="dashboard-hero"><div><div className="eyebrow">PHASE 05 / OBSERVATION LAYER</div><h1>Make disagreement<br /><em>inspectable.</em></h1><p>A live evidence surface for tracking execution, divergence, hard constraints, and the convergence states produced by each fiscal experiment.</p></div><div className="hero-orbit"><span>DDR</span><b>→</b><span>CAR</span><b>→</b><span>SHCR</span></div></section>
     <div className="notice"><span className="notice-label">SYSTEM NOTE</span><span>{notice}</span></div>
 
-    <section className="control-strip"><div className="scenario-overview"><span>ACTIVE SCENARIO / SCOPE</span><strong>{selectedScenario ? `Scenario #${selectedScenario}` : "Belum dipilih"}</strong><p className={scenarioExpanded ? "expanded" : "collapsed"}>{scenarios.find((item) => item.id === selectedScenario)?.description ?? "Pilih skenario untuk memulai."}</p><button type="button" onClick={() => setScenarioExpanded((value) => !value)}>{scenarioExpanded ? "Sembunyikan Detail" : "Tampilkan Detail / Expand"}</button><select aria-label="Select active scenario" value={selectedScenario ?? ""} onChange={(event) => { setSelectedScenario(Number(event.target.value)); setDomainRules(null); }}><option value="" disabled>Select scenario</option>{scenarios.map((item) => <option key={item.id} value={item.id}>#{item.id} — {item.description.slice(0, 72)}</option>)}</select></div><button className="primary-button run-button" onClick={startRun} disabled={run?.status === "RUNNING" || run?.status === "QUEUED" || rulesAreStale}>{run?.status === "RUNNING" ? "Diskusi berjalan…" : "Mulai Diskusi"}<span>↗</span></button></section>
+    <section className="control-strip"><div className="scenario-overview"><span>ACTIVE SCENARIO / SCOPE</span><strong>{selectedScenario ? `Scenario #${selectedScenario}` : "Belum dipilih"}</strong><p className={scenarioExpanded ? "expanded" : "collapsed"}>{scenarios.find((item) => item.id === selectedScenario)?.description ?? "Pilih skenario untuk memulai."}</p><button type="button" onClick={() => setScenarioExpanded((value) => !value)}>{scenarioExpanded ? "Sembunyikan Detail" : "Tampilkan Detail / Expand"}</button><select aria-label="Select active scenario" value={selectedScenario ?? ""} onChange={(event) => { setSelectedScenario(Number(event.target.value)); setDomainRules(null); setDashboard(null); setRun(null); setTrackerHistory([]); setMandateLogs([]); }}><option value="" disabled>Select scenario</option>{scenarios.map((item) => <option key={item.id} value={item.id}>#{item.id} — {item.description.slice(0, 72)}</option>)}</select></div><button className="primary-button run-button" onClick={startRun} disabled={run?.status === "RUNNING" || run?.status === "QUEUED" || rulesAreStale}>{run?.status === "RUNNING" ? "Diskusi berjalan…" : "Mulai Diskusi"}<span>↗</span></button></section>
 
     <nav className="menu-rail"><span className="menu-label">CONTROL MENUS</span><a href="#setup">01 / Setup</a><a href="#setup">02 / Scenario</a><a className="active" href="#tracker">03 / Live Tracker</a><a href="#ddr">04 / DDR Network</a><a href="#analytics">05 / Analytics</a></nav>
 
@@ -402,7 +440,7 @@ export default function Home() {
 
         <fieldset className="form-card mandate-card">
           <legend><span>03</span> Mandat &amp; Aturan Domain Otomatis</legend>
-          <div className="automatic-rules"><div className="automatic-rules-intro"><div><strong>{selectedTemplate ? "Kontrak domain template aktif" : "Mandat lintas agen siap dirakit"}</strong><p>Backend menyusun mandat, sumber primer, constraints, dan owned checks per agen tanpa mencampur kepemilikan aturan.</p></div><button type="button" className="template-load-button" onClick={generateMandate} disabled={!canGenerateRules || rulesBusy}>{rulesBusy ? "Generating…" : "Generate Otomatis Mandat"}</button></div>{rulesAreStale && <small className="stale-rules">Konfigurasi agen berubah; generate ulang wajib dilakukan sebelum diskusi.</small>}{domainRules && !domainRules.stale && <><div className="rules-revision"><span>REVISION {domainRules.revision}</span><b>{domainRules.agent_count} AGENTS</b><small>{domainRules.rules.owned_checks?.length ?? 0} hard checks · {domainRules.rules.hard_constraints?.length ?? 0} constraints global</small></div><div className="agent-mandate-grid">{domainRules.agent_rules.map((rules, index) => <AgentMandateCard rules={rules} index={index} key={rules.agent_id} />)}</div></>}{mandateLogs.length > 0 && <div className="mandate-console">{mandateLogs.map((log, index) => <div className={log.level.toLowerCase()} key={`${log.stage}-${index}`}><b>[{log.level}] {log.stage}</b><span>{log.message}</span></div>)}</div>}</div>
+          <div className="automatic-rules"><div className="automatic-rules-intro"><div><strong>{selectedTemplate ? "Kontrak domain template aktif" : "Mandat lintas agen siap dirakit"}</strong><p>Backend menyusun mandat, sumber primer, constraints, dan owned checks per agen tanpa mencampur kepemilikan aturan.</p></div><button type="button" className="template-load-button" onClick={generateMandate} disabled={!canGenerateRules || rulesBusy}>{rulesBusy ? "Generating…" : "Generate Otomatis Mandat"}</button></div>{rulesAreStale && <small className="stale-rules">Konfigurasi agen berubah; generate ulang wajib dilakukan sebelum diskusi.</small>}{domainRules && !domainRules.stale && <><div className="rules-revision"><span>REVISION {domainRules.revision}</span><b>{domainRules.agent_count} AGENTS</b><small>{domainRules.rules.owned_checks?.length ?? 0} hard checks · {domainRules.rules.hard_constraints?.length ?? 0} constraints global</small></div><div className="agent-mandate-grid">{domainRules.agent_rules.map((rules, index) => <AgentMandateCard rules={rules} index={index} onGenerate={generateAgentMandate} busy={busyAgentId === rules.agent_id} key={rules.agent_id} />)}</div></>}{mandateLogs.length > 0 && <div className="mandate-console">{mandateLogs.map((log, index) => <div className={log.level.toLowerCase()} key={`${log.stage}-${index}`}><b>[{log.level}] {log.stage}</b><span>{log.message}</span></div>)}</div>}</div>
         </fieldset>
 
         <fieldset className="form-card">
@@ -418,7 +456,7 @@ export default function Home() {
         <button className="primary-button agent-submit" disabled={busy} type="submit">{editingAgentId ? "Simpan perubahan agen" : "Simpan konfigurasi agen"}<span>↗</span></button>
       </form>
 
-      <div className="agent-register"><div className="subhead"><span>AGEN TERSIMPAN</span><b>{agents.length} AGENTS</b></div>{agents.length ? agents.map((item) => <div className="agent-register-row" key={item.id}><div><strong>{item.name}</strong><small>{item.role}</small></div><span>{item.template_key ? "TEMPLATE" : "CUSTOM"}</span><b>{item.llm_model ?? "ENV DEFAULT"}</b><div className="agent-actions"><button type="button" onClick={() => testConnection(item)}>Test Connection</button><button type="button" onClick={() => editAgent(item)}>Edit</button><button type="button" className="danger" onClick={() => deleteAgent(item)}>Delete</button>{connectionTests[item.id] && <small className={connectionTests[item.id].ok ? "test-ok" : "test-error"}>{connectionTests[item.id].message}</small>}</div></div>) : <p className="empty">Belum ada agen. Muat template APBN atau buat agen baru.</p>}</div>
+      <div className="agent-register"><div className="subhead"><span>AGEN TERSIMPAN</span><b>{agents.length} AGENTS</b></div>{agents.length ? agents.map((item) => <div className="agent-register-row" key={item.id}><div><strong>{item.name}</strong><small>{item.role}</small></div><span>{item.template_key ? "TEMPLATE" : "CUSTOM"}</span><b>{item.llm_model ?? "ENV DEFAULT"}</b><div className="agent-actions"><button type="button" onClick={() => generateAgentMandate(item.id)} disabled={busyAgentId === item.id}>{busyAgentId === item.id ? "Generating…" : "Generate Mandat"}</button><button type="button" onClick={() => testConnection(item)}>Test Connection</button><button type="button" onClick={() => editAgent(item)}>Edit</button><button type="button" className="danger" onClick={() => deleteAgent(item)}>Delete</button>{connectionTests[item.id] && <small className={connectionTests[item.id].ok ? "test-ok" : "test-error"}>{connectionTests[item.id].message}</small>}</div></div>) : <p className="empty">Belum ada agen. Muat template APBN atau buat agen baru.</p>}</div>
 
       <form className="scenario-config-form" onSubmit={submitScenario}><div><span className="section-number">SCENARIO</span><h3>Uji kebijakan fiskal</h3><small>Constraint hukum dan batas defisit diterapkan otomatis oleh agen.</small></div><label className="form-field"><strong>Goal / Deskripsi Kebijakan</strong><textarea value={scenario.description} onChange={(event) => setScenario({ ...scenario, description: event.target.value })} rows={4} required /><small>Jelaskan tujuan kebijakan, program yang diuji, horizon waktu, dan hasil yang diharapkan.</small></label><label className="form-field"><strong>Program Cost / Parameter Finansial</strong><input type="number" min="0" step="0.01" value={scenario.program_cost ?? ""} onChange={(event) => setScenario({ ...scenario, program_cost: event.target.value === "" ? null : Number(event.target.value) })} /><small>Opsional. Gunakan satuan fiskal yang konsisten dengan alternatif; kosongkan bila belum diketahui.</small></label><button className="secondary-button" disabled={busy}>Simpan skenario</button></form>
     </section>

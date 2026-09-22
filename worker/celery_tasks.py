@@ -1,15 +1,17 @@
 import logging
 import socket
 from collections.abc import Callable
+from datetime import datetime, timezone
 from time import perf_counter
 from typing import Any
+from uuid import uuid4
 
 from openai import APIConnectionError, APITimeoutError, OpenAI
 from openai.types.chat import ChatCompletionMessageParam
 from pydantic import ValidationError
 from sqlalchemy import select
 
-from backend.agent_templates import resolve_agent_system_prompt
+from backend.agent_templates import agent_revision, mandate_seed, resolve_agent_system_prompt
 from backend.core_algorithms import (
     HardConstraints,
     build_agent_system_prompt,
@@ -30,11 +32,13 @@ from backend.database import SessionLocal
 from backend.models import (
     Agent,
     AgentInfluenceObservation,
+    ConsensusSession,
     ConvergenceStatus,
     DisagreementLog,
     MetricSnapshot,
     ReasoningLog,
     Scenario,
+    ScenarioMandateSnapshot,
 )
 from worker.srr_models import SRRResponse
 
@@ -86,7 +90,111 @@ def _create_llm_completion(
     return _extract_llm_response(response)
 
 
-def _default_llm_call(agent: Agent, scenario: Scenario) -> tuple[str, int]:
+def _mandate_for_agent(mandate_payload: dict[str, Any], agent_id: int) -> str | None:
+    rules = mandate_payload.get("agent_rules")
+    if not isinstance(rules, list):
+        return None
+    for rule in rules:
+        if isinstance(rule, dict) and rule.get("agent_id") == agent_id:
+            value = rule.get("scenario_mandate")
+            return value if isinstance(value, str) else None
+    return None
+
+
+def _create_isolated_session(scenario_id: int) -> str:
+    with SessionLocal() as session:
+        scenario = session.get(Scenario, scenario_id)
+        if scenario is None:
+            raise ValueError(f"Scenario {scenario_id} does not exist")
+        agents = list(session.scalars(select(Agent).order_by(Agent.id)))
+        revision = agent_revision(agents, scenario)
+        snapshot = session.scalar(
+            select(ScenarioMandateSnapshot).where(
+                ScenarioMandateSnapshot.scenario_id == scenario_id,
+                ScenarioMandateSnapshot.revision == revision,
+            )
+        )
+        if snapshot is None:
+            agent_rules = [
+                {
+                    "agent_id": agent.id,
+                    "scenario_mandate": str(mandate_seed(agent)["mandate"]),
+                }
+                for agent in agents
+            ]
+            snapshot = ScenarioMandateSnapshot(
+                scenario_id=scenario_id,
+                revision=revision,
+                generated=True,
+                agent_count=len(agents),
+                rules={},
+                agent_rules=agent_rules,
+                status="success",
+                generated_count=len(agents),
+                failure_count=0,
+                detail="Isolated programmatic test session",
+            )
+            session.add(snapshot)
+            session.flush()
+        session_id = str(uuid4())
+        session.add(
+            ConsensusSession(
+                id=session_id,
+                scenario_id=scenario_id,
+                mandate_snapshot_id=snapshot.id,
+                mandate_revision=revision,
+                mandate_payload={"rules": snapshot.rules, "agent_rules": snapshot.agent_rules},
+                status="QUEUED",
+            )
+        )
+        session.flush()
+        for observation in session.scalars(
+            select(AgentInfluenceObservation).where(
+                AgentInfluenceObservation.scenario_id == scenario_id,
+                AgentInfluenceObservation.run_id.is_(None),
+            )
+        ):
+            observation.run_id = session_id
+        session.commit()
+        return session_id
+
+
+def _load_session_context(
+    session: Any,
+    scenario_id: int,
+    session_id: str,
+) -> tuple[Scenario, list[Agent], ScenarioMandateSnapshot, ConsensusSession]:
+    run = session.get(ConsensusSession, session_id)
+    if run is None or run.scenario_id != scenario_id:
+        raise ValueError("Consensus session is missing or does not belong to the scenario")
+    scenario = session.get(Scenario, scenario_id)
+    if scenario is None:
+        raise ValueError(f"Scenario {scenario_id} does not exist")
+    agents = list(session.scalars(select(Agent).order_by(Agent.id)))
+    if not agents:
+        raise ValueError("At least one agent is required")
+    snapshot = session.get(ScenarioMandateSnapshot, run.mandate_snapshot_id)
+    if snapshot is None or snapshot.scenario_id != scenario_id:
+        raise ValueError("Mandate snapshot is missing or does not belong to the scenario")
+    current_agent_ids = {agent.id for agent in agents}
+    mandate_agent_ids = {
+        item.get("agent_id")
+        for item in run.mandate_payload.get("agent_rules", [])
+        if isinstance(item, dict)
+    }
+    if (
+        snapshot.revision != agent_revision(agents, scenario)
+        or snapshot.agent_count != len(agents)
+        or run.mandate_revision != snapshot.revision
+        or mandate_agent_ids != current_agent_ids
+    ):
+        raise ValueError("Mandate snapshot is stale; generate mandates again before deliberation")
+    return scenario, agents, snapshot, run
+def _default_llm_call(
+    agent: Agent,
+    scenario: Scenario,
+    scenario_mandate: str | None = None,
+) -> tuple[str, int]:
     return _create_llm_completion(
         agent,
         [
@@ -95,6 +203,7 @@ def _default_llm_call(agent: Agent, scenario: Scenario) -> tuple[str, int]:
                 "content": build_agent_system_prompt(
                     agent.role,
                     resolve_agent_system_prompt(agent),
+                    scenario_mandate,
                 ),
             },
             {
@@ -115,6 +224,7 @@ def _default_consensus_call(
     agent: Agent,
     scenario: Scenario,
     peer_outputs: list[dict[str, Any]],
+    scenario_mandate: str | None = None,
 ) -> tuple[str, int]:
     return _create_llm_completion(
         agent,
@@ -124,6 +234,7 @@ def _default_consensus_call(
                 "content": build_agent_system_prompt(
                     agent.role,
                     resolve_agent_system_prompt(agent),
+                    scenario_mandate,
                 ),
             },
             {
@@ -144,6 +255,7 @@ def _default_consensus_call(
         ],
         "consensus_review",
     )
+
 
 
 def _parse_response(raw_content: str) -> tuple[dict[str, Any], SRRResponse | None, str | None]:
@@ -209,24 +321,39 @@ def _determine_convergence(
 
 def execute_full_shcr_cycle(
     scenario_id: int,
-    llm_call: LLMCaller | None = None,
+    session_id: Any,
+    llm_call: Any = None,
     consensus_call: ConsensusCaller | None = None,
     progress: ProgressReporter | None = None,
 ) -> dict[str, Any]:
+    if not isinstance(session_id, str):
+        legacy_llm_call = session_id
+        legacy_consensus_call = llm_call if callable(llm_call) else None
+        session_id = _create_isolated_session(scenario_id)
+        llm_call = legacy_llm_call
+        consensus_call = legacy_consensus_call
     started_at = perf_counter()
     caller = llm_call or _default_llm_call
     reviewer = consensus_call or (_default_consensus_call if llm_call is None else None)
     emit = progress or (lambda _logs: None)
-    logs = [_log("INITIALIZE", "INFO", f"Starting SHCR cycle for scenario {scenario_id}.")]
+    logs = [
+        _log(
+            "INITIALIZE",
+            "INFO",
+            f"Starting SHCR cycle for scenario {scenario_id}, session {session_id}.",
+        )
+    ]
     emit(logs)
 
     with SessionLocal() as session:
-        scenario = session.get(Scenario, scenario_id)
-        if scenario is None:
-            raise ValueError(f"Scenario {scenario_id} does not exist")
-        agents = list(session.scalars(select(Agent).order_by(Agent.id)))
-        if not agents:
-            raise ValueError("At least one agent is required")
+        scenario, agents, mandate_snapshot, run = _load_session_context(
+            session,
+            scenario_id,
+            session_id,
+        )
+        run.status = "RUNNING"
+        run.started_at = datetime.now(timezone.utc)
+        session.commit()
 
         if len(agents) < 2:
             raise ValueError("At least two configured agents are required for deliberation")
@@ -235,7 +362,10 @@ def execute_full_shcr_cycle(
         observations = list(
             session.scalars(
                 select(AgentInfluenceObservation)
-                .where(AgentInfluenceObservation.scenario_id == scenario.id)
+                .where(
+                    AgentInfluenceObservation.scenario_id == scenario.id,
+                    AgentInfluenceObservation.run_id == session_id,
+                )
                 .order_by(AgentInfluenceObservation.id)
             )
         )
@@ -247,7 +377,14 @@ def execute_full_shcr_cycle(
             logs.append(_log("SRR", "INFO", f"Calling {agent.name} using {agent.llm_model or 'environment default model'}."))
             emit(logs)
             try:
-                raw_content, token_usage = caller(agent, scenario)
+                if llm_call is None:
+                    raw_content, token_usage = _default_llm_call(
+                        agent,
+                        scenario,
+                        _mandate_for_agent(run.mandate_payload, agent.id),
+                    )
+                else:
+                    raw_content, token_usage = caller(agent, scenario)
             except Exception as error:
                 if isinstance(
                     error,
@@ -262,6 +399,7 @@ def execute_full_shcr_cycle(
                     ReasoningLog(
                         agent_id=agent.id,
                         scenario_id=scenario.id,
+                        run_id=session_id,
                         raw_json={"error": str(error), "error_type": type(error).__name__},
                         parsed_srr_objects={},
                         is_schema_valid=False,
@@ -278,6 +416,7 @@ def execute_full_shcr_cycle(
                     ReasoningLog(
                         agent_id=agent.id,
                         scenario_id=scenario.id,
+                        run_id=session_id,
                         raw_json=raw_json,
                         parsed_srr_objects={},
                         is_schema_valid=False,
@@ -295,6 +434,7 @@ def execute_full_shcr_cycle(
             reasoning_log = ReasoningLog(
                 agent_id=agent.id,
                 scenario_id=scenario.id,
+                run_id=session_id,
                 raw_json=raw_json,
                 parsed_srr_objects=parsed.model_dump(mode="json"),
                 is_schema_valid=True,
@@ -310,6 +450,10 @@ def execute_full_shcr_cycle(
             )
             logs.append(_log("COMPLETE", "ERROR", failure_message))
             emit(logs)
+            run.status = "FAILED"
+            run.error = failure_message
+            run.completed_at = datetime.now(timezone.utc)
+            session.commit()
             raise RuntimeError(failure_message)
 
         if reviewer is None:
@@ -327,13 +471,28 @@ def execute_full_shcr_cycle(
                 for agent, response in parsed_by_agent
             ]
             consensus_results: list[tuple[Agent, SRRResponse]] = []
-            for agent, _ in parsed_by_agent:
+            for agent, initial_response in parsed_by_agent:
                 try:
-                    raw_content, token_usage = reviewer(agent, scenario, peer_outputs)
+                    if consensus_call is None:
+                        raw_content, token_usage = _default_consensus_call(
+                            agent,
+                            scenario,
+                            peer_outputs,
+                            _mandate_for_agent(run.mandate_payload, agent.id),
+                        )
+                    else:
+                        raw_content, token_usage = reviewer(agent, scenario, peer_outputs)
                     total_tokens += token_usage
-                    raw_json, reviewed, validation_error = _validated_response(raw_content)
+                    raw_json, reviewed, _ = _validated_response(raw_content)
                     if reviewed is None:
-                        logs.append(_log("CONSENSUS", "ERROR", f"{agent.name}: review rejected: {validation_error}."))
+                        consensus_results.append((agent, initial_response))
+                        logs.append(
+                            _log(
+                                "CONSENSUS",
+                                "WARNING",
+                                f"{agent.name}: review response did not pass schema validation; retained validated SRR artifacts.",
+                            )
+                        )
                         emit(logs)
                         continue
                     consensus_results.append((agent, reviewed))
@@ -351,7 +510,14 @@ def execute_full_shcr_cycle(
                         logger.exception("Local LLM connection failed during consensus review for agent %s", agent.id)
                     else:
                         logger.exception("Consensus review failed for agent %s", agent.id)
-                    logs.append(_log("CONSENSUS", "ERROR", f"{agent.name}: {type(error).__name__}: {error}"))
+                    consensus_results.append((agent, initial_response))
+                    logs.append(
+                        _log(
+                            "CONSENSUS",
+                            "WARNING",
+                            f"{agent.name}: {type(error).__name__}; retained validated SRR artifacts.",
+                        )
+                    )
                     emit(logs)
             if len(consensus_results) < 2:
                 failure_message = "Structured consensus failed to produce a two-agent quorum."
@@ -360,6 +526,9 @@ def execute_full_shcr_cycle(
                 raise RuntimeError(failure_message)
             parsed_by_agent = consensus_results
 
+        final_provenance = [_provenance_counts(response) for _, response in parsed_by_agent]
+        tagged_items = sum(tagged for tagged, _ in final_provenance)
+        total_items = sum(total for _, total in final_provenance)
         logs.append(_log("DDR", "INFO", "Calculating disagreement vectors."))
         emit(logs)
         agents_by_id = {agent.id: agent for agent in agents}
@@ -412,6 +581,7 @@ def execute_full_shcr_cycle(
                 emit(logs)
                 session.add(
                     DisagreementLog(
+                        run_id=session_id,
                         scenario_id=scenario.id,
                         agent_i=agent_i.id,
                         agent_j=agent_j.id,
@@ -453,6 +623,7 @@ def execute_full_shcr_cycle(
         logs.append(_log("METRICS", "INFO", "Persisting convergence, provenance, latency, and token metrics."))
         emit(logs)
         snapshot = MetricSnapshot(
+            run_id=session_id,
             scenario_id=scenario.id,
             provenance_completeness_percent=provenance_completeness,
             material_information_retention_macro_f1=retention_macro_f1,
@@ -463,6 +634,8 @@ def execute_full_shcr_cycle(
             token_usage=total_tokens,
         )
         session.add(snapshot)
+        run.status = "SUCCEEDED"
+        run.completed_at = datetime.now(timezone.utc)
         session.commit()
         session.refresh(snapshot)
         logs.append(_log("COMPLETE", "SUCCESS", f"Cycle completed with state {convergence_status.value}, {total_tokens} tokens, and {latency_ms:.2f} ms latency."))
@@ -470,6 +643,7 @@ def execute_full_shcr_cycle(
 
         return {
             "metric_snapshot_id": snapshot.id,
+            "session_id": session_id,
             "scenario_id": scenario.id,
             "provenance_completeness_percent": provenance_completeness,
             "hard_constraint_violation_rate": violation_rate,
@@ -481,5 +655,5 @@ def execute_full_shcr_cycle(
         }
 
 
-def run_full_shcr_cycle(scenario_id: int) -> dict[str, Any]:
-    return execute_full_shcr_cycle(scenario_id)
+def run_full_shcr_cycle(scenario_id: int, session_id: str) -> dict[str, Any]:
+    return execute_full_shcr_cycle(scenario_id, session_id)

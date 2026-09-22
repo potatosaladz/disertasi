@@ -34,3 +34,57 @@ BEGIN
         END IF;
     END IF;
 END $$;
+
+DO $$
+BEGIN
+    IF to_regclass('public.scenarios') IS NOT NULL THEN
+        CREATE TABLE IF NOT EXISTS scenario_mandate_snapshots (
+            id SERIAL PRIMARY KEY,
+            scenario_id INTEGER NOT NULL REFERENCES scenarios(id) ON DELETE CASCADE,
+            revision VARCHAR(64) NOT NULL,
+            generated BOOLEAN NOT NULL DEFAULT TRUE,
+            agent_count INTEGER NOT NULL CHECK (agent_count >= 0),
+            rules JSONB NOT NULL,
+            agent_rules JSONB NOT NULL,
+            status VARCHAR(20) NOT NULL,
+            generated_count INTEGER NOT NULL DEFAULT 0 CHECK (generated_count >= 0),
+            failure_count INTEGER NOT NULL DEFAULT 0 CHECK (failure_count >= 0),
+            detail TEXT,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            CONSTRAINT uq_scenario_mandate_revision UNIQUE (scenario_id, revision)
+        );
+        CREATE INDEX IF NOT EXISTS ix_scenario_mandate_snapshots_scenario_id
+            ON scenario_mandate_snapshots (scenario_id);
+    END IF;
+END $$;
+
+DO $$
+BEGIN
+    IF to_regclass('public.scenarios') IS NOT NULL
+       AND to_regclass('public.scenario_mandate_snapshots') IS NOT NULL THEN
+        CREATE TABLE IF NOT EXISTS consensus_sessions (
+            id VARCHAR(36) PRIMARY KEY,
+            scenario_id INTEGER NOT NULL REFERENCES scenarios(id) ON DELETE CASCADE,
+            mandate_snapshot_id INTEGER NOT NULL REFERENCES scenario_mandate_snapshots(id) ON DELETE CASCADE,
+            mandate_revision VARCHAR(64) NOT NULL,
+            mandate_payload JSONB NOT NULL,
+            celery_task_id VARCHAR(255) UNIQUE,
+            status VARCHAR(20) NOT NULL DEFAULT 'QUEUED',
+            error TEXT,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            started_at TIMESTAMPTZ,
+            completed_at TIMESTAMPTZ
+        );
+        CREATE INDEX IF NOT EXISTS ix_consensus_sessions_scenario_id
+            ON consensus_sessions (scenario_id);
+        ALTER TABLE IF EXISTS reasoning_logs ADD COLUMN IF NOT EXISTS run_id VARCHAR(36) REFERENCES consensus_sessions(id) ON DELETE CASCADE;
+        ALTER TABLE IF EXISTS disagreement_logs ADD COLUMN IF NOT EXISTS run_id VARCHAR(36) REFERENCES consensus_sessions(id) ON DELETE CASCADE;
+        ALTER TABLE IF EXISTS metric_snapshots ADD COLUMN IF NOT EXISTS run_id VARCHAR(36) REFERENCES consensus_sessions(id) ON DELETE CASCADE;
+        ALTER TABLE IF EXISTS agent_influence_observations ADD COLUMN IF NOT EXISTS run_id VARCHAR(36) REFERENCES consensus_sessions(id) ON DELETE CASCADE;
+        CREATE INDEX IF NOT EXISTS ix_reasoning_logs_run_id ON reasoning_logs (run_id);
+        CREATE INDEX IF NOT EXISTS ix_disagreement_logs_run_id ON disagreement_logs (run_id);
+        CREATE INDEX IF NOT EXISTS ix_metric_snapshots_run_id ON metric_snapshots (run_id);
+        CREATE INDEX IF NOT EXISTS ix_agent_influence_observations_run_id ON agent_influence_observations (run_id);
+    END IF;
+END $$;

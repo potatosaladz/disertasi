@@ -1,3 +1,5 @@
+import hashlib
+import json
 from dataclasses import asdict, dataclass
 from typing import Any
 
@@ -352,6 +354,42 @@ def mandate_seed(agent: Agent) -> dict[str, Any]:
         "uncertainty_dimensions": [],
         "decision_principles": [],
     }
+
+
+def agent_revision(agents: list[Agent], scenario: object | None = None) -> str:
+    payload = {
+        "scenario": (
+            {
+                "id": getattr(scenario, "id"),
+                "description": getattr(scenario, "description"),
+                "program_cost": getattr(scenario, "program_cost"),
+                "max_deficit_constraint": getattr(scenario, "max_deficit_constraint"),
+            }
+            if scenario is not None
+            else None
+        ),
+        "agents": [
+            {
+                "id": agent.id,
+                "name": agent.name,
+                "template_key": agent.template_key,
+                "role": agent.role,
+                "seed": mandate_seed(agent),
+                "llm_base_url": agent.llm_base_url,
+                "llm_model": agent.llm_model,
+                "has_llm_api_key": bool(agent.llm_api_key),
+                "temperature": agent.temperature,
+                "max_tokens": agent.max_tokens,
+                "theta_x": agent.theta_x,
+                "theta_q": agent.theta_q,
+                "theta_h": agent.theta_h,
+                "theta_s": agent.theta_s,
+                "theta_u": agent.theta_u,
+            }
+            for agent in agents
+        ],
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:16]
 
 
 def get_agent_spec(template_key: str | None) -> AgentSpec | None:

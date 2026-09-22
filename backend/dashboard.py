@@ -1,22 +1,25 @@
 from typing import Any
+from uuid import uuid4
 
 from celery.result import AsyncResult
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException, Query, status
 from fastapi.responses import JSONResponse
 from sqlalchemy import select
 from sqlalchemy.orm import aliased
 
-from .agent_templates import resolve_agent_system_prompt
+from .agent_templates import agent_revision, resolve_agent_system_prompt
 from .celery_client import celery_client
 from .core_algorithms import build_agent_system_prompt, resolve_llm_runtime_config
 from .database import SessionLocal
 from .models import (
     Agent,
     AgentInfluenceObservation,
+    ConsensusSession,
     DisagreementLog,
     MetricSnapshot,
     ReasoningLog,
     Scenario,
+    ScenarioMandateSnapshot,
 )
 
 router = APIRouter(prefix="/api")
@@ -42,6 +45,7 @@ def _metric_payload(snapshot: MetricSnapshot) -> dict[str, Any]:
     return {
         "id": snapshot.id,
         "scenario_id": snapshot.scenario_id,
+        "session_id": snapshot.run_id,
         "hard_constraint_violation_rate": snapshot.hard_constraint_violation_rate,
         "provenance_completeness_percent": snapshot.provenance_completeness_percent,
         "material_information_retention_macro_f1": snapshot.material_information_retention_macro_f1,
@@ -53,23 +57,92 @@ def _metric_payload(snapshot: MetricSnapshot) -> dict[str, Any]:
     }
 
 
-def _dashboard_payload(scenario_id: int) -> dict[str, Any]:
+def _dashboard_payload(scenario_id: int, session_id: str | None = None) -> dict[str, Any]:
     with SessionLocal() as session:
         scenario = session.get(Scenario, scenario_id)
         if scenario is None:
             raise HTTPException(status_code=404, detail="Scenario not found")
+        active_session = (
+            session.get(ConsensusSession, session_id)
+            if session_id is not None
+            else session.scalar(
+                select(ConsensusSession)
+                .where(ConsensusSession.scenario_id == scenario_id)
+                .order_by(ConsensusSession.created_at.desc())
+            )
+        )
+        if session_id is not None and active_session is None:
+            raise HTTPException(status_code=404, detail="Consensus session not found for scenario")
+        if active_session is not None and active_session.scenario_id != scenario_id:
+            raise HTTPException(status_code=404, detail="Consensus session not found for scenario")
+        active_session_id = active_session.id if active_session is not None else None
+        artifact_session_id = active_session_id or "__NO_ACTIVE_SESSION__"
+
+        agents = list(session.scalars(select(Agent).order_by(Agent.id)))
+        mandate_snapshot = session.scalar(
+            select(ScenarioMandateSnapshot)
+            .where(ScenarioMandateSnapshot.scenario_id == scenario_id)
+            .order_by(ScenarioMandateSnapshot.updated_at.desc(), ScenarioMandateSnapshot.id.desc())
+        )
+        current_revision = agent_revision(agents, scenario)
+        mandate_is_stale = (
+            mandate_snapshot is not None
+            and (
+                mandate_snapshot.revision != current_revision
+                or mandate_snapshot.agent_count != len(agents)
+            )
+        )
+        domain_rules = (
+            {
+                "scenario_id": mandate_snapshot.scenario_id,
+                "revision": mandate_snapshot.revision,
+                "generated": mandate_snapshot.generated,
+                "stale": mandate_is_stale,
+                "agent_count": mandate_snapshot.agent_count,
+                "rules": mandate_snapshot.rules,
+                "agent_rules": mandate_snapshot.agent_rules,
+                "status": "stale" if mandate_is_stale else mandate_snapshot.status,
+                "generated_count": mandate_snapshot.generated_count,
+                "failure_count": mandate_snapshot.failure_count,
+                "detail": (
+                    "Saved mandates are stale because the scenario or agent configuration changed."
+                    if mandate_is_stale
+                    else mandate_snapshot.detail
+                ),
+            }
+            if mandate_snapshot is not None
+            else {
+                "scenario_id": scenario_id,
+                "revision": current_revision,
+                "generated": False,
+                "stale": True,
+                "agent_count": len(agents),
+                "rules": {},
+                "agent_rules": [],
+                "status": "missing",
+                "generated_count": 0,
+                "failure_count": 0,
+                "detail": "Generate scenario-specific mandates before starting deliberation.",
+            }
+        )
 
         snapshots = list(
             session.scalars(
                 select(MetricSnapshot)
-                .where(MetricSnapshot.scenario_id == scenario_id)
+                .where(
+                    MetricSnapshot.scenario_id == scenario_id,
+                    MetricSnapshot.run_id == artifact_session_id,
+                )
                 .order_by(MetricSnapshot.created_at.desc(), MetricSnapshot.id.desc())
             )
         )
         reasoning_logs = list(
             session.scalars(
                 select(ReasoningLog)
-                .where(ReasoningLog.scenario_id == scenario_id)
+                .where(
+                    ReasoningLog.scenario_id == scenario_id,
+                    ReasoningLog.run_id == artifact_session_id,
+                )
                 .order_by(ReasoningLog.id)
             )
         )
@@ -79,13 +152,19 @@ def _dashboard_payload(scenario_id: int) -> dict[str, Any]:
             select(DisagreementLog, agent_i.name, agent_j.name)
             .join(agent_i, DisagreementLog.agent_i == agent_i.id)
             .join(agent_j, DisagreementLog.agent_j == agent_j.id)
-            .where(DisagreementLog.scenario_id == scenario_id)
+            .where(
+                DisagreementLog.scenario_id == scenario_id,
+                DisagreementLog.run_id == artifact_session_id,
+            )
             .order_by(DisagreementLog.id)
         ).all()
         influences = session.execute(
             select(AgentInfluenceObservation, Agent.name)
             .join(Agent, AgentInfluenceObservation.agent_id == Agent.id)
-            .where(AgentInfluenceObservation.scenario_id == scenario_id)
+            .where(
+                AgentInfluenceObservation.scenario_id == scenario_id,
+                AgentInfluenceObservation.run_id == artifact_session_id,
+            )
             .order_by(AgentInfluenceObservation.id)
         ).all()
         schema_validity = (
@@ -100,12 +179,15 @@ def _dashboard_payload(scenario_id: int) -> dict[str, Any]:
         )
 
         return {
+            "session_id": active_session_id,
+            "session_status": active_session.status if active_session else None,
             "scenario": {
                 "id": scenario.id,
                 "description": scenario.description,
                 "program_cost": scenario.program_cost,
                 "max_deficit_constraint": scenario.max_deficit_constraint,
             },
+            "domain_rules": domain_rules,
             "latest_metric": _metric_payload(snapshots[0]) if snapshots else None,
             "metric_history": [_metric_payload(snapshot) for snapshot in snapshots],
             "schema_validity_percent": schema_validity,
@@ -147,14 +229,38 @@ def _dashboard_payload(scenario_id: int) -> dict[str, Any]:
 
 @router.post("/scenarios/{scenario_id}/runs", status_code=status.HTTP_202_ACCEPTED)
 def start_run(scenario_id: int) -> dict[str, Any]:
+    session_id = str(uuid4())
     with SessionLocal() as session:
-        if session.get(Scenario, scenario_id) is None:
+        scenario = session.get(Scenario, scenario_id)
+        if scenario is None:
             raise HTTPException(status_code=404, detail="Scenario not found")
         agents = list(session.scalars(select(Agent).order_by(Agent.id)))
         if len(agents) < 2:
             raise HTTPException(
                 status_code=409,
                 detail="At least two configured agents are required for deliberation",
+            )
+        current_revision = agent_revision(agents, scenario)
+        mandate_snapshot = session.scalar(
+            select(ScenarioMandateSnapshot).where(
+                ScenarioMandateSnapshot.scenario_id == scenario_id,
+                ScenarioMandateSnapshot.revision == current_revision,
+            )
+        )
+        snapshot_agent_ids = {
+            item.get("agent_id")
+            for item in mandate_snapshot.agent_rules
+            if isinstance(item, dict)
+        } if mandate_snapshot is not None else set()
+        if (
+            mandate_snapshot is None
+            or not mandate_snapshot.generated
+            or mandate_snapshot.agent_count != len(agents)
+            or snapshot_agent_ids != {agent.id for agent in agents}
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Generate current mandates for every agent before deliberation",
             )
         invalid_agents: list[str] = []
         for agent in agents:
@@ -170,9 +276,31 @@ def start_run(scenario_id: int) -> dict[str, Any]:
                     + ", ".join(invalid_agents)
                 ),
             )
-    task = celery_client.send_task("shcr.run_full_shcr_cycle", args=[scenario_id])
+        run = ConsensusSession(
+            id=session_id,
+            scenario_id=scenario_id,
+            mandate_snapshot_id=mandate_snapshot.id,
+            mandate_revision=mandate_snapshot.revision,
+            mandate_payload={
+                "rules": mandate_snapshot.rules,
+                "agent_rules": mandate_snapshot.agent_rules,
+            },
+            status="QUEUED",
+        )
+        session.add(run)
+        session.commit()
+    task = celery_client.send_task(
+        "shcr.run_full_shcr_cycle",
+        args=[scenario_id, session_id],
+    )
+    with SessionLocal() as session:
+        run_record = session.get(ConsensusSession, session_id)
+        if run_record is not None:
+            run_record.celery_task_id = task.id
+            session.commit()
     return {
         "task_id": task.id,
+        "session_id": session_id,
         "scenario_id": scenario_id,
         "status": "QUEUED",
         "logs": [{"stage": "QUEUE", "level": "INFO", "message": "Cycle queued for worker execution."}],
@@ -182,6 +310,10 @@ def start_run(scenario_id: int) -> dict[str, Any]:
 @router.get("/runs/{task_id}")
 def run_status(task_id: str) -> dict[str, Any]:
     result = AsyncResult(task_id, app=celery_client)
+    with SessionLocal() as session:
+        run = session.scalar(
+            select(ConsensusSession).where(ConsensusSession.celery_task_id == task_id)
+        )
     state_map = {
         "PENDING": "QUEUED",
         "RECEIVED": "QUEUED",
@@ -197,6 +329,8 @@ def run_status(task_id: str) -> dict[str, Any]:
         "status": state_map.get(result.state, result.state),
         "logs": [],
         "result": None,
+        "session_id": run.id if run else None,
+        "scenario_id": run.scenario_id if run else None,
     }
     if isinstance(result.info, dict):
         payload["logs"] = result.info.get("logs", [])
@@ -210,24 +344,39 @@ def run_status(task_id: str) -> dict[str, Any]:
 
 
 @router.get("/scenarios/{scenario_id}/dashboard")
-def scenario_dashboard(scenario_id: int) -> dict[str, Any]:
-    return _dashboard_payload(scenario_id)
+def scenario_dashboard(
+    scenario_id: int,
+    session_id: str | None = Query(default=None),
+) -> dict[str, Any]:
+    return _dashboard_payload(scenario_id, session_id)
 
 
 @router.get("/scenarios/{scenario_id}/manifest")
-def reproducibility_manifest(scenario_id: int) -> JSONResponse:
-    dashboard = _dashboard_payload(scenario_id)
+def reproducibility_manifest(
+    scenario_id: int,
+    session_id: str | None = Query(default=None),
+) -> JSONResponse:
+    dashboard = _dashboard_payload(scenario_id, session_id)
     with SessionLocal() as session:
         agents = list(session.scalars(select(Agent).order_by(Agent.id)))
         reasoning = session.execute(
             select(ReasoningLog, Agent)
             .join(Agent, ReasoningLog.agent_id == Agent.id)
-            .where(ReasoningLog.scenario_id == scenario_id)
+            .where(
+                ReasoningLog.scenario_id == scenario_id,
+                ReasoningLog.run_id == dashboard["session_id"],
+            )
             .order_by(ReasoningLog.id)
         ).all()
+        mandate_by_agent = {
+            item["agent_id"]: item.get("scenario_mandate")
+            for item in dashboard["domain_rules"]["agent_rules"]
+            if isinstance(item, dict) and isinstance(item.get("agent_id"), int)
+        }
         manifest = {
             "manifest_version": "1.0",
             "framework": "SHCR = SRR + (RAR -> DAI) + DDR + CAR",
+            "session_id": dashboard["session_id"],
             "scenario": dashboard["scenario"],
             "agents": [
                 {
@@ -252,10 +401,11 @@ def reproducibility_manifest(scenario_id: int) -> JSONResponse:
             "prompts": [
                 {
                     "agent_id": agent.id,
-                    "system": build_agent_system_prompt(
-                        agent.role,
-                        resolve_agent_system_prompt(agent),
-                    ),
+                     "system": build_agent_system_prompt(
+                         agent.role,
+                         resolve_agent_system_prompt(agent),
+                         mandate_by_agent.get(agent.id),
+                     ),
                     "user": (
                         f"Agent role: {agent.role}\n"
                         f"Policy goal: {dashboard['scenario']['description']}\n"

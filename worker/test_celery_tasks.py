@@ -159,6 +159,38 @@ def test_sparse_srr_response_uses_defaults_and_allows_extra_fields() -> None:
     assert second.divergence_object()["REC"] is None
 
 
+def test_flexible_srr_response_normalises_required_artifacts() -> None:
+    parsed = SRRResponse.model_validate(
+        {
+            "analysis": {
+                "required_evidence": "Budget baseline; Audit report",
+                "prediction": {"text": "Revenue increases", "source": "forecast"},
+                "risk": "Implementation delay",
+                "unknowns": [{"description": "Demand response"}],
+                "options": [
+                    {
+                        "title": "Targeted option",
+                        "deficit_impact": 2.5,
+                        "utility_score": 0.8,
+                    }
+                ],
+                "decision": "Adopt with controls",
+                "confidence_score": "75%",
+            }
+        }
+    )
+
+    assert [item.content for item in parsed.evidence] == ["Budget baseline", "Audit report"]
+    assert parsed.predictions[0].source_tag == "forecast"
+    assert parsed.risks[0].content == "Implementation delay"
+    assert parsed.uncertainties[0].content == "Demand response"
+    assert parsed.alternatives[0].deficit == 2.5
+    assert parsed.alternatives[0].utility == 0.8
+    assert parsed.recommendation is not None
+    assert parsed.recommendation.content == "Adopt with controls"
+    assert parsed.confidence == 0.75
+
+
 def test_default_llm_call_uses_canonical_template_mandate(monkeypatch: pytest.MonkeyPatch) -> None:
     captured: dict[str, object] = {}
 
@@ -190,13 +222,14 @@ def test_default_llm_call_uses_canonical_template_mandate(monkeypatch: pytest.Mo
         max_deficit_constraint=3.0,
     )
 
-    _default_llm_call(agent, scenario)
+    _default_llm_call(agent, scenario, "Evaluate the current revenue reform scenario.")
 
     messages = captured["messages"]
     assert isinstance(messages, list)
     assert AGENTS[0].mandate in messages[0]["content"]
     assert "VERIFIED_OFFSETS_ONLY" in messages[0]["content"]
     assert "Manual text must not override" not in messages[0]["content"]
+    assert "Evaluate the current revenue reform scenario." in messages[0]["content"]
     assert "Program cost: 25.0" in messages[1]["content"]
     assert "Automatic legal deficit ceiling: 3.0%" in messages[1]["content"]
 
@@ -304,6 +337,26 @@ def test_consensus_round_reviews_peer_outputs(scenario_id: int) -> None:
     assert any(log["stage"] == "CONSENSUS" for log in result["logs"])
 
 
+def test_invalid_consensus_review_retains_validated_initial_artifacts(scenario_id: int) -> None:
+    responses = iter(
+        [
+            (response_payload(prediction="Growth 2%", utility=0.8, recommendation="Adopt A"), 120),
+            (response_payload(prediction="Growth 1%", utility=0.6, recommendation="Adopt B"), 130),
+        ]
+    )
+
+    result = execute_full_shcr_cycle(
+        scenario_id,
+        lambda _agent, _scenario: next(responses),
+        lambda _agent, _scenario, _peers: ("{}", 10),
+    )
+
+    consensus_logs = [log for log in result["logs"] if log["stage"] == "CONSENSUS"]
+    assert any(log["level"] == "WARNING" for log in consensus_logs)
+    assert not any(log["level"] == "ERROR" for log in consensus_logs)
+    assert result["metric_snapshot_id"] > 0
+
+
 def test_run_full_shcr_cycle_populates_postgres(scenario_id: int) -> None:
     responses = iter(
         [
@@ -331,14 +384,20 @@ def test_run_full_shcr_cycle_populates_postgres(scenario_id: int) -> None:
 
         logs = list(
             session.scalars(
-                select(ReasoningLog).where(ReasoningLog.scenario_id == scenario_id)
+                select(ReasoningLog).where(
+                    ReasoningLog.scenario_id == scenario_id,
+                    ReasoningLog.run_id == result["session_id"],
+                )
             )
         )
         assert len(logs) == 2
         assert all(log.is_schema_valid for log in logs)
 
         disagreement = session.scalar(
-            select(DisagreementLog).where(DisagreementLog.scenario_id == scenario_id)
+                select(DisagreementLog).where(
+                    DisagreementLog.scenario_id == scenario_id,
+                    DisagreementLog.run_id == result["session_id"],
+                )
         )
         assert disagreement is not None
         assert disagreement.dP is True
@@ -347,7 +406,8 @@ def test_run_full_shcr_cycle_populates_postgres(scenario_id: int) -> None:
         observations = list(
             session.scalars(
                 select(AgentInfluenceObservation).where(
-                    AgentInfluenceObservation.scenario_id == scenario_id
+                    AgentInfluenceObservation.scenario_id == scenario_id,
+                    AgentInfluenceObservation.run_id == result["session_id"],
                 )
             )
         )

@@ -8,10 +8,18 @@ from fastapi.testclient import TestClient
 from sqlalchemy import delete, select
 
 from backend.celery_client import celery_client
-from backend.agent_templates import STANDARD_APBN_AGENT_TEMPLATES
+from backend.agent_templates import STANDARD_APBN_AGENT_TEMPLATES, agent_revision
 from backend.database import SessionLocal
 from backend.main import app
-from backend.models import Agent, DisagreementLog, MetricSnapshot, ReasoningLog, Scenario
+from backend.models import (
+    Agent,
+    ConsensusSession,
+    DisagreementLog,
+    MetricSnapshot,
+    ReasoningLog,
+    Scenario,
+    ScenarioMandateSnapshot,
+)
 
 
 @pytest.fixture
@@ -304,6 +312,37 @@ def test_domain_rules_aggregate_template_agents(
     assert payload["status"] == "success"
     assert payload["generated_count"] == 1
 
+    restored = client.get(f"/api/scenarios/{scenario.json()['id']}/domain-rules")
+    assert restored.status_code == 200
+    assert restored.json() == payload
+    dashboard = client.get(f"/api/scenarios/{scenario.json()['id']}/dashboard")
+    assert dashboard.status_code == 200
+    assert dashboard.json()["domain_rules"] == payload
+
+    with SessionLocal() as session:
+        snapshot = session.scalar(
+            select(ScenarioMandateSnapshot).where(
+                ScenarioMandateSnapshot.scenario_id == scenario.json()["id"]
+            )
+        )
+        assert snapshot is not None
+        assert snapshot.agent_rules[0]["scenario_mandate"] == (
+            "Evaluate scenario-specific revenue legality and timing."
+        )
+
+    updated_agent = client.put(
+        f"/api/agents/{template_agent.json()['id']}",
+        json={"role": "Updated Revenue Role"},
+    )
+    assert updated_agent.status_code == 200
+    stale = client.get(f"/api/scenarios/{scenario.json()['id']}/domain-rules")
+    assert stale.status_code == 200
+    assert stale.json()["status"] == "stale"
+    assert stale.json()["stale"] is True
+    assert stale.json()["agent_rules"][0]["scenario_mandate"] == (
+        "Evaluate scenario-specific revenue legality and timing."
+    )
+
     with SessionLocal() as session:
         session.delete(session.get(Scenario, scenario.json()["id"]))
         session.delete(session.get(Agent, template_agent.json()["id"]))
@@ -375,7 +414,7 @@ def test_domain_rules_accepts_flexible_response_keys(
 ) -> None:
     class FlexibleCompletions:
         def create(self, **_kwargs: object) -> object:
-            content = json.dumps(
+            mandate_content = json.dumps(
                 {
                     "data": {
                         "Scenario Mandate": {"text": "Autonomous expert mandate."},
@@ -387,6 +426,9 @@ def test_domain_rules_accepts_flexible_response_keys(
                         "Evidence Requirements": "Current APBN baseline\nVerified implementation plan",
                     }
                 }
+            )
+            content = ": keepalive\n\n" + json.dumps(
+                {"choices": [{"message": {"content": mandate_content}}]}
             )
             message = type("Message", (), {"content": content})()
             choice = type("Choice", (), {"message": message})()
@@ -420,6 +462,14 @@ def test_domain_rules_accepts_flexible_response_keys(
     assert rule["scenario_focus"] == ["Fiscal sustainability", "Revenue resilience"]
     assert rule["priority_questions"] == ["Is financing available?", "Is the policy lawful?"]
     assert rule["required_evidence"] == ["Current APBN baseline", "Verified implementation plan"]
+
+    single = client.post(
+        f"/api/scenarios/{scenario.json()['id']}/agents/{agent.json()['id']}/domain-rules"
+    )
+    assert single.status_code == 200
+    assert single.json()["scenario_mandate"] == "Autonomous expert mandate."
+    restored = client.get(f"/api/scenarios/{scenario.json()['id']}/domain-rules")
+    assert restored.json()["agent_rules"][0]["scenario_mandate"] == "Autonomous expert mandate."
 
     with SessionLocal() as session:
         session.delete(session.get(Scenario, scenario.json()["id"]))
@@ -693,6 +743,24 @@ def test_run_submission_and_status(client: TestClient, monkeypatch: pytest.Monke
         ]
         session.add(scenario)
         session.add_all(agents)
+        session.flush()
+        revision = agent_revision(agents, scenario)
+        session.add(
+            ScenarioMandateSnapshot(
+                scenario_id=scenario.id,
+                revision=revision,
+                generated=True,
+                agent_count=len(agents),
+                rules={},
+                agent_rules=[
+                    {"agent_id": item.id, "scenario_mandate": f"Mandate for {item.name}"}
+                    for item in agents
+                ],
+                status="success",
+                generated_count=len(agents),
+                failure_count=0,
+            )
+        )
         session.commit()
         scenario_id = scenario.id
         agent_ids = [agent.id for agent in agents]
@@ -718,16 +786,47 @@ def test_dashboard_matrix_and_manifest(client: TestClient) -> None:
         agent_j = Agent(name=f"dashboard-j-{uuid.uuid4()}", role="Risk")
         session.add_all([scenario, agent_i, agent_j])
         session.flush()
-        session.add(MetricSnapshot(scenario_id=scenario.id, provenance_completeness_percent=75.0, material_information_retention_macro_f1=0.8, hard_constraint_violation_rate=20.0, feasible_alternatives_count=4, convergence_status="INFEASIBLE", latency_ms=120.0, token_usage=500))
+        revision = agent_revision([agent_i, agent_j], scenario)
+        mandate = ScenarioMandateSnapshot(
+            scenario_id=scenario.id,
+            revision=revision,
+            generated=True,
+            agent_count=2,
+            rules={},
+            agent_rules=[
+                {"agent_id": agent_i.id, "scenario_mandate": "Fiscal mandate"},
+                {"agent_id": agent_j.id, "scenario_mandate": "Risk mandate"},
+            ],
+            status="success",
+            generated_count=2,
+            failure_count=0,
+        )
+        session.add(mandate)
+        session.flush()
+        run_id = str(uuid.uuid4())
+        session.add(
+            ConsensusSession(
+                id=run_id,
+                scenario_id=scenario.id,
+                mandate_snapshot_id=mandate.id,
+                mandate_revision=revision,
+                mandate_payload={"rules": {}, "agent_rules": mandate.agent_rules},
+                status="SUCCEEDED",
+            )
+        )
+        session.add(MetricSnapshot(run_id=run_id, scenario_id=scenario.id, provenance_completeness_percent=75.0, material_information_retention_macro_f1=0.8, hard_constraint_violation_rate=20.0, feasible_alternatives_count=4, convergence_status="INFEASIBLE", latency_ms=120.0, token_usage=500))
+        session.add(MetricSnapshot(scenario_id=scenario.id, provenance_completeness_percent=10.0, material_information_retention_macro_f1=0.1, hard_constraint_violation_rate=90.0, feasible_alternatives_count=1, convergence_status="NO_CONSENSUS", latency_ms=50.0, token_usage=100))
         session.add_all([
-            ReasoningLog(agent_id=agent_i.id, scenario_id=scenario.id, raw_json={"prompt": "i"}, parsed_srr_objects={"evidence": []}, is_schema_valid=True, provenance_count=2),
-            ReasoningLog(agent_id=agent_j.id, scenario_id=scenario.id, raw_json={"prompt": "j"}, parsed_srr_objects={"evidence": []}, is_schema_valid=False, provenance_count=0),
+            ReasoningLog(run_id=run_id, agent_id=agent_i.id, scenario_id=scenario.id, raw_json={"prompt": "i"}, parsed_srr_objects={"evidence": []}, is_schema_valid=True, provenance_count=2),
+            ReasoningLog(run_id=run_id, agent_id=agent_j.id, scenario_id=scenario.id, raw_json={"prompt": "j"}, parsed_srr_objects={"evidence": []}, is_schema_valid=False, provenance_count=0),
         ])
-        session.add(DisagreementLog(scenario_id=scenario.id, agent_i=agent_i.id, agent_j=agent_j.id, dE=True, dP=True, dREC=False))
+        session.add(DisagreementLog(run_id=run_id, scenario_id=scenario.id, agent_i=agent_i.id, agent_j=agent_j.id, dE=True, dP=True, dREC=False))
         session.commit()
         scenario_id = scenario.id
 
-    dashboard = client.get(f"/api/scenarios/{scenario_id}/dashboard")
+    dashboard = client.get(
+        f"/api/scenarios/{scenario_id}/dashboard?session_id={run_id}"
+    )
     assert dashboard.status_code == 200
     payload: dict[str, Any] = dashboard.json()
     assert payload["latest_metric"]["convergence_status"] == "INFEASIBLE"

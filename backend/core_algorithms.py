@@ -41,34 +41,53 @@ SRR_OUTPUT_INSTRUCTIONS = (
 )
 
 
-def build_agent_system_prompt(role: str, mandate: str | None) -> str:
+def build_agent_system_prompt(
+    role: str,
+    mandate: str | None,
+    scenario_mandate: str | None = None,
+) -> str:
     sections = [f"Functional fiscal role: {role}."]
     if mandate and mandate.strip():
         sections.append(f"Agent-specific mandate and decision principles:\n{mandate.strip()}")
+    if scenario_mandate and scenario_mandate.strip():
+        sections.append(f"Current scenario-specific mandate:\n{scenario_mandate.strip()}")
     sections.append(SRR_OUTPUT_INSTRUCTIONS)
     return "\n\n".join(sections)
 
 
 def extract_json_object(raw_content: str) -> dict[str, Any]:
     cleaned = raw_content.strip().lstrip("\ufeff")
-    fenced = re.search(r"```(?:json)?\s*(.*?)\s*```", cleaned, flags=re.IGNORECASE | re.DOTALL)
+    fenced = re.fullmatch(
+        r"```(?:json)?\s*(.*?)\s*```",
+        cleaned,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
     if fenced:
         cleaned = fenced.group(1).strip()
     try:
         payload = json.loads(cleaned)
     except json.JSONDecodeError:
-        start = cleaned.find("{")
-        end = cleaned.rfind("}")
-        if start < 0 or end <= start:
-            raise ValueError("LLM response does not contain a JSON object")
-        try:
-            payload = json.loads(cleaned[start : end + 1])
-        except json.JSONDecodeError as error:
-            raise ValueError(
-                f"Invalid JSON at line {error.lineno}, column {error.colno}: {error.msg}"
-            ) from error
+        payload = None
+        decoder = json.JSONDecoder()
+        for match in re.finditer(r"\{", cleaned):
+            try:
+                candidate, _ = decoder.raw_decode(cleaned[match.start() :])
+            except json.JSONDecodeError:
+                continue
+            if isinstance(candidate, dict):
+                payload = candidate
+                break
+        if payload is None:
+            raise ValueError("LLM response does not contain a valid JSON object")
     if not isinstance(payload, dict):
         raise ValueError(f"Expected a JSON object, received {type(payload).__name__}")
+    choices = payload.get("choices")
+    if isinstance(choices, Sequence) and not isinstance(choices, (str, bytes)) and choices:
+        choice = choices[0]
+        if isinstance(choice, Mapping):
+            message = choice.get("message")
+            if isinstance(message, Mapping) and isinstance(message.get("content"), str):
+                return extract_json_object(message["content"])
     return payload
 
 
@@ -213,9 +232,11 @@ def build_agent_user_prompt(
         f"Policy goal: {policy_goal}\n"
         f"Program cost: {program_cost if program_cost is not None else 'UNKNOWN'}\n"
         f"Automatic legal deficit ceiling: {max_deficit}%\n\n"
-        "Produce a decision-complete SRR response. State evidence-backed impact claims in predictions, "
-        "identify material risks and uncertainties, provide at least one quantified alternative, and "
-        "finish with a recommendation and calibrated confidence."
+        "Produce a decision-complete SRR JSON response with all mandatory decision artifacts: "
+        "non-empty evidence, predictions, risks, uncertainties, and alternatives arrays, plus "
+        "a recommendation object and numeric confidence between 0 and 1. State evidence-backed impact "
+        "claims in predictions. Use concise structured items with content and optional source_tag; "
+        "alternatives require name, deficit, and utility."
     )
 
 
@@ -256,8 +277,9 @@ def build_consensus_prompt(
         f"You are {agent_name}, acting as {role}. Review the structured outputs from every agent below. "
         "Verify competing claims against cited evidence, identify unresolved assumptions, risks, "
         "uncertainties, constraints, and recommendation conflicts, then return a revised decision-complete "
-        "SRR JSON object. Preserve valid dissent instead of fabricating agreement. Do not reveal hidden "
-        "chain-of-thought; return only inspectable structured artifacts.\n\n"
+        "SRR JSON object with non-empty evidence, predictions, risks, uncertainties, and alternatives, "
+        "plus recommendation and confidence. Preserve valid dissent instead of fabricating agreement. "
+        "Do not reveal hidden chain-of-thought; return only inspectable structured artifacts.\n\n"
         f"PEER OUTPUTS:\n{json.dumps(list(peer_outputs), ensure_ascii=False, sort_keys=True)}"
     )
 

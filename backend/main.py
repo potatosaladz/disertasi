@@ -1,4 +1,3 @@
-import hashlib
 import json
 import logging
 import socket
@@ -6,16 +5,18 @@ import warnings
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from time import perf_counter
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from fastapi import FastAPI, HTTPException, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from openai import APIConnectionError, APITimeoutError, OpenAI
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import select, text
+from sqlalchemy.orm import Session
 
 from .agent_templates import (
+    agent_revision,
     get_agent_spec,
     load_standard_agent_templates,
     mandate_seed,
@@ -39,6 +40,7 @@ from .models import (
     DisagreementLog,
     ReasoningLog,
     Scenario,
+    ScenarioMandateSnapshot,
 )
 
 
@@ -392,42 +394,6 @@ def test_agent_connection(agent_id: int) -> LLMConnectionTestResponse:
             )
 
 
-def _agent_revision(agents: list[Agent], scenario: Scenario | None = None) -> str:
-    payload = {
-        "scenario": (
-            {
-                "id": scenario.id,
-                "description": scenario.description,
-                "program_cost": scenario.program_cost,
-                "max_deficit_constraint": scenario.max_deficit_constraint,
-            }
-            if scenario is not None
-            else None
-        ),
-        "agents": [
-            {
-                "id": agent.id,
-                "name": agent.name,
-                "template_key": agent.template_key,
-                "role": agent.role,
-                "seed": mandate_seed(agent),
-                "llm_base_url": agent.llm_base_url,
-                "llm_model": agent.llm_model,
-                "has_llm_api_key": bool(agent.llm_api_key),
-                "temperature": agent.temperature,
-                "max_tokens": agent.max_tokens,
-                "theta_x": agent.theta_x,
-                "theta_q": agent.theta_q,
-                "theta_h": agent.theta_h,
-                "theta_s": agent.theta_s,
-                "theta_u": agent.theta_u,
-            }
-            for agent in agents
-        ],
-    }
-    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:16]
-
-
 def _combined_domain_rules(agents: list[Agent], scenario: Scenario) -> dict[str, object]:
     specs = [spec for agent in agents if (spec := get_agent_spec(agent.template_key))]
     return {
@@ -439,6 +405,59 @@ def _combined_domain_rules(agents: list[Agent], scenario: Scenario) -> dict[str,
     }
 
 
+class MandateSynthesisResponse(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    scenario_mandate: str | list[Any] | dict[str, Any] | None = None
+    scenario_focus: str | list[Any] | dict[str, Any] | None = None
+    priority_questions: str | list[Any] | dict[str, Any] | None = None
+    required_evidence: str | list[Any] | dict[str, Any] | None = None
+
+    @field_validator("*", mode="before")
+    @classmethod
+    def accept_supported_value_shapes(cls, value: object) -> object:
+        return value if isinstance(value, (str, list, dict)) else None
+
+
+def _validated_mandate_payload(payload: dict[str, Any]) -> MandateSynthesisResponse:
+    unwrapped = _mandate_payload(payload)
+    choices = unwrapped.get("choices")
+    if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+        message = choices[0].get("message")
+        if isinstance(message, dict) and isinstance(message.get("content"), str):
+            unwrapped = _mandate_payload(extract_json_object(message["content"]))
+    return MandateSynthesisResponse.model_validate(
+        {
+            "scenario_mandate": _response_value(
+                unwrapped,
+                "scenario_mandate",
+                "scenarioMandate",
+                "mandate",
+                "operating_mandate",
+            ),
+            "scenario_focus": _response_value(
+                unwrapped,
+                "scenario_focus",
+                "scenarioFocus",
+                "focus",
+                "focus_areas",
+            ),
+            "priority_questions": _response_value(
+                unwrapped,
+                "priority_questions",
+                "priorityQuestions",
+                "questions",
+                "key_questions",
+            ),
+            "required_evidence": _response_value(
+                unwrapped,
+                "required_evidence",
+                "requiredEvidence",
+                "evidence",
+                "evidence_requirements",
+            ),
+        }
+    )
 class MandateSynthesisFallbacks(BaseModel):
     scenario_mandate: str
     scenario_focus: list[str]
@@ -459,9 +478,9 @@ def _fallback_scenario_mandate(agent: Agent, scenario: Scenario) -> str:
 
 
 def _mandate_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    for wrapper_key in ("result", "data", "output", "mandate_result"):
-        wrapped = payload.get(wrapper_key)
-        if isinstance(wrapped, dict):
+    wrapper_keys = {"result", "data", "output", "mandateresult"}
+    for key, wrapped in payload.items():
+        if _canonical_response_key(key) in wrapper_keys and isinstance(wrapped, dict):
             return wrapped
     return payload
 
@@ -565,6 +584,22 @@ def _base_agent_domain_rules(agent: Agent) -> AgentDomainRules:
     )
 
 
+def _fallback_agent_domain_rules(agent: Agent, scenario: Scenario) -> AgentDomainRules:
+    base = _base_agent_domain_rules(agent)
+    fallback_values = _synthesis_fallbacks(agent, scenario)
+    return base.model_copy(
+        update={
+            "scenario_mandate": fallback_values.scenario_mandate,
+            "scenario_focus": fallback_values.scenario_focus,
+            "priority_questions": fallback_values.priority_questions,
+            "required_evidence": fallback_values.required_evidence,
+            "applicable_primary_sources": base.primary_sources,
+            "applicable_constraints": base.constraints,
+            "applicable_owned_checks": base.owned_checks,
+        }
+    )
+
+
 def _synthesize_agent_domain_rules(agent: Agent, scenario: Scenario) -> AgentDomainRules:
     base = _base_agent_domain_rules(agent)
     started_at = perf_counter()
@@ -618,46 +653,28 @@ def _synthesize_agent_domain_rules(agent: Agent, scenario: Scenario) -> AgentDom
         content, tokens = extract_llm_completion(response)
         print("--- RAW LLM RESPONSE ---", flush=True)
         print(content, flush=True)
-        payload = _mandate_payload(extract_json_object(content))
+        parsed = _validated_mandate_payload(extract_json_object(content))
         fallback_values = _synthesis_fallbacks(agent, scenario)
         scenario_mandate = _normalise_mandate_text(
-            _response_value(
-                payload,
-                "scenario_mandate",
-                "scenarioMandate",
-                "mandate",
-                "operating_mandate",
-            ),
+            parsed.scenario_mandate,
             fallback_values.scenario_mandate,
             "scenario_mandate",
             agent.id,
         )
         scenario_focus = _normalise_mandate_list(
-            _response_value(payload, "scenario_focus", "scenarioFocus", "focus", "focus_areas"),
+            parsed.scenario_focus,
             fallback_values.scenario_focus,
             "scenario_focus",
             agent.id,
         )
         priority_questions = _normalise_mandate_list(
-            _response_value(
-                payload,
-                "priority_questions",
-                "priorityQuestions",
-                "questions",
-                "key_questions",
-            ),
+            parsed.priority_questions,
             fallback_values.priority_questions,
             "priority_questions",
             agent.id,
         )
         required_evidence = _normalise_mandate_list(
-            _response_value(
-                payload,
-                "required_evidence",
-                "requiredEvidence",
-                "evidence",
-                "evidence_requirements",
-            ),
+            parsed.required_evidence,
             fallback_values.required_evidence,
             "required_evidence",
             agent.id,
@@ -696,8 +713,16 @@ def _synthesize_agent_domain_rules(agent: Agent, scenario: Scenario) -> AgentDom
             code = "SCHEMA_ERROR"
         elif isinstance(error, ValueError) and "text content" in str(error):
             code = "EMPTY_CONTENT"
+        fallback_values = _synthesis_fallbacks(agent, scenario)
         return base.model_copy(
             update={
+                "scenario_mandate": fallback_values.scenario_mandate,
+                "scenario_focus": fallback_values.scenario_focus,
+                "priority_questions": fallback_values.priority_questions,
+                "required_evidence": fallback_values.required_evidence,
+                "applicable_primary_sources": base.primary_sources,
+                "applicable_constraints": base.constraints,
+                "applicable_owned_checks": base.owned_checks,
                 "latency_ms": (perf_counter() - started_at) * 1000,
                 "error": MandateSynthesisError(
                     code=code,
@@ -706,6 +731,67 @@ def _synthesize_agent_domain_rules(agent: Agent, scenario: Scenario) -> AgentDom
                 ),
             }
         )
+
+
+def _save_domain_rules_snapshot(session: Session, response: DomainRulesResponse) -> None:
+    snapshot = session.scalar(
+        select(ScenarioMandateSnapshot).where(
+            ScenarioMandateSnapshot.scenario_id == response.scenario_id,
+            ScenarioMandateSnapshot.revision == response.revision,
+        )
+    )
+    values = {
+        "generated": response.generated,
+        "agent_count": response.agent_count,
+        "rules": response.rules,
+        "agent_rules": [rule.model_dump(mode="json") for rule in response.agent_rules],
+        "status": response.status,
+        "generated_count": response.generated_count,
+        "failure_count": response.failure_count,
+        "detail": response.detail,
+    }
+    if snapshot is None:
+        snapshot = ScenarioMandateSnapshot(
+            scenario_id=response.scenario_id,
+            revision=response.revision,
+            **values,
+        )
+        session.add(snapshot)
+    else:
+        for field, value in values.items():
+            setattr(snapshot, field, value)
+    session.commit()
+
+
+def _domain_rules_from_snapshot(
+    snapshot: ScenarioMandateSnapshot,
+    current_revision: str,
+    current_agent_count: int,
+) -> DomainRulesResponse:
+    is_stale = snapshot.revision != current_revision or snapshot.agent_count != current_agent_count
+    detail = snapshot.detail
+    if is_stale:
+        detail = "Saved mandates are stale because the scenario or agent configuration changed."
+    return DomainRulesResponse(
+        scenario_id=snapshot.scenario_id,
+        revision=snapshot.revision,
+        generated=snapshot.generated,
+        stale=is_stale,
+        agent_count=snapshot.agent_count,
+        rules=snapshot.rules,
+        agent_rules=[AgentDomainRules.model_validate(rule) for rule in snapshot.agent_rules],
+        status=(
+            "stale"
+            if is_stale
+            else cast(
+                Literal["success", "partial", "failed", "stale", "missing"],
+                snapshot.status,
+            )
+        ),
+        generated_count=snapshot.generated_count,
+        failure_count=snapshot.failure_count,
+        detail=detail,
+    )
 
 
 @app.post(
@@ -745,26 +831,31 @@ def generate_domain_rules(scenario_id: int) -> DomainRulesResponse | JSONRespons
                         "agent_rules": [rule.model_dump(mode="json") for rule in agent_rules],
                     },
                 )
+            revision = agent_revision(agents, scenario)
+            rules = _combined_domain_rules(agents, scenario)
+            detail = (
+                f"Generated {generated_count} scenario mandates; {failure_count} agents use local fallback."
+                if failure_count
+                else f"Generated {generated_count} scenario-specific mandates."
+            )
             response_status: Literal["success", "partial"] = (
                 "partial" if failure_count else "success"
             )
-            return DomainRulesResponse(
+            response = DomainRulesResponse(
                 scenario_id=scenario_id,
-                revision=_agent_revision(agents, scenario),
+                revision=revision,
                 generated=True,
                 stale=False,
                 agent_count=len(agents),
-                rules=_combined_domain_rules(agents, scenario),
+                rules=rules,
                 agent_rules=agent_rules,
                 status=response_status,
                 generated_count=generated_count,
                 failure_count=failure_count,
-                detail=(
-                    f"Generated {generated_count} scenario mandates; {failure_count} agents use local fallback."
-                    if failure_count
-                    else f"Generated {generated_count} scenario-specific mandates."
-                ),
+                detail=detail,
             )
+            _save_domain_rules_snapshot(session, response)
+            return response
     except Exception as error:
         logger.exception("Unexpected domain mandate generation failure for scenario %s", scenario_id)
         return JSONResponse(
@@ -774,6 +865,69 @@ def generate_domain_rules(scenario_id: int) -> DomainRulesResponse | JSONRespons
                 "detail": f"Mandate generation failed: {type(error).__name__}",
             },
         )
+
+
+@app.post(
+    "/api/scenarios/{scenario_id}/agents/{agent_id}/domain-rules",
+    response_model=AgentDomainRules,
+)
+def generate_agent_domain_rules(scenario_id: int, agent_id: int) -> AgentDomainRules:
+    with SessionLocal() as session:
+        scenario = session.get(Scenario, scenario_id)
+        agent = session.get(Agent, agent_id)
+        if scenario is None:
+            raise HTTPException(status_code=404, detail="Scenario not found")
+        if agent is None:
+            raise HTTPException(status_code=404, detail="Agent not found")
+        rule = _synthesize_agent_domain_rules(agent, scenario)
+        agents = list(session.scalars(select(Agent).order_by(Agent.id)))
+        current_revision = agent_revision(agents, scenario)
+        snapshot = session.scalar(
+            select(ScenarioMandateSnapshot)
+            .where(
+                ScenarioMandateSnapshot.scenario_id == scenario_id,
+                ScenarioMandateSnapshot.revision == current_revision,
+            )
+        )
+        if snapshot is None:
+            agent_rules = [
+                rule if item.id == agent_id else _fallback_agent_domain_rules(item, scenario)
+                for item in agents
+            ]
+            generated_count = sum(
+                item.synthesis_status == "generated" for item in agent_rules
+            )
+            response = DomainRulesResponse(
+                scenario_id=scenario_id,
+                revision=current_revision,
+                generated=True,
+                stale=False,
+                agent_count=len(agents),
+                rules=_combined_domain_rules(agents, scenario),
+                agent_rules=agent_rules,
+                status="partial" if generated_count < len(agents) else "success",
+                generated_count=generated_count,
+                failure_count=len(agents) - generated_count,
+                detail=f"Generated mandate for agent {agent.name}.",
+            )
+            _save_domain_rules_snapshot(session, response)
+        else:
+            stored_rules = [
+                item for item in snapshot.agent_rules if item.get("agent_id") != agent_id
+            ]
+            stored_rules.append(rule.model_dump(mode="json"))
+            stored_rules.sort(key=lambda item: int(item["agent_id"]))
+            snapshot.agent_rules = stored_rules
+            snapshot.generated_count = sum(
+                item.get("synthesis_status") == "generated" for item in stored_rules
+            )
+            snapshot.failure_count = len(stored_rules) - snapshot.generated_count
+            snapshot.status = "partial" if snapshot.failure_count else "success"
+            snapshot.detail = (
+                f"Updated mandate for agent {agent.name}; {snapshot.generated_count} mandates available."
+            )
+            session.commit()
+        return rule
 
 
 @app.delete("/api/agents/{agent_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -807,19 +961,27 @@ def get_domain_rules(scenario_id: int) -> DomainRulesResponse:
         if scenario is None:
             raise HTTPException(status_code=404, detail="Scenario not found")
         agents = list(session.scalars(select(Agent).order_by(Agent.id)))
-        return DomainRulesResponse(
-            scenario_id=scenario_id,
-            revision=_agent_revision(agents, scenario),
-            generated=False,
-            stale=True,
-            agent_count=len(agents),
-            rules={},
-            agent_rules=[],
-            status="missing",
-            generated_count=0,
-            failure_count=0,
-            detail="Generate scenario-specific mandates before starting deliberation.",
+        current_revision = agent_revision(agents, scenario)
+        snapshot = session.scalar(
+            select(ScenarioMandateSnapshot)
+            .where(ScenarioMandateSnapshot.scenario_id == scenario_id)
+            .order_by(ScenarioMandateSnapshot.updated_at.desc(), ScenarioMandateSnapshot.id.desc())
         )
+        if snapshot is None:
+            return DomainRulesResponse(
+                scenario_id=scenario_id,
+                revision=current_revision,
+                generated=False,
+                stale=True,
+                agent_count=len(agents),
+                rules={},
+                agent_rules=[],
+                status="missing",
+                generated_count=0,
+                failure_count=0,
+                detail="Generate scenario-specific mandates before starting deliberation.",
+            )
+        return _domain_rules_from_snapshot(snapshot, current_revision, len(agents))
 
 
 @app.post("/api/scenarios", response_model=ScenarioResponse, status_code=status.HTTP_201_CREATED)
