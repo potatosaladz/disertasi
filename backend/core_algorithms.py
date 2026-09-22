@@ -242,12 +242,14 @@ def build_agent_user_prompt(
 
 def build_mandate_synthesis_system_prompt(agent_name: str, role: str) -> str:
     return (
-        f"You are {agent_name}, an autonomous expert acting as {role} in a structured "
-        "multi-agent fiscal consensus framework. Produce a decision-ready mandate that covers: "
-        "the agent's operational responsibility; relevant APBN domain focus; priority questions "
-        "grounded in applicable regulation and statute; and fiscally verifiable evidence required "
-        "for claims, objections, constraints, and recommendations. Preserve uncertainty and valid "
-        "dissent. Return valid JSON only and do not reveal chain-of-thought."
+        f"You are {agent_name}, an autonomous expert acting as {role} in the dissertation framework "
+        '"Collective Reasoning in Heterogeneous Multi-Agent Systems: A Structured Consensus Framework '
+        'for Strategic Fiscal Decision Support." Produce a decision-ready mandate that covers the '
+        "agent's operational responsibility, APBN domain focus, regulation-based priority questions, "
+        "fiscally verifiable evidence, auditable epistemic traceability, structured disagreement and "
+        "consensus handling, and strict regulatory compliance. Preserve uncertainty and valid dissent. "
+        "Never treat an unverified LLM prediction as legal authority, realized revenue, fiscal space, "
+        "or evidence. Return valid JSON only and do not reveal chain-of-thought."
     )
 
 
@@ -255,15 +257,31 @@ def build_mandate_synthesis_prompt(
     agent_name: str,
     role: str,
     scenario_description: str,
+    primary_sources: Sequence[str] = (),
+    constraints: Sequence[str] = (),
+    owned_checks: Sequence[str] = (),
+    max_deficit_constraint: float = 3.0,
 ) -> str:
+    domain_contract = {
+        "primary_sources": list(primary_sources),
+        "constraints": list(constraints),
+        "owned_checks": list(owned_checks),
+        "automatic_deficit_ceiling_percent_gdp": max_deficit_constraint,
+    }
     return (
-        f"Act autonomously as the expert {role} named {agent_name}. "
-        "Generate a practical, scenario-specific operating mandate for this fiscal expert. "
-        "Use your domain expertise and the fiscal consensus ontology to define the operational "
-        "mandate, APBN focus areas, regulation/statute-based priority questions, and fiscally "
-        "verifiable evidence needed for a defensible decision. Keep legal and fiscal claims cautious; "
-        "do not reveal chain-of-thought. Return only one JSON object with exactly these logical "
-        "fields: scenario_mandate, scenario_focus, priority_questions, required_evidence.\n\n"
+        f"Act autonomously as the expert {role} named {agent_name}. Generate a practical, "
+        "scenario-specific operating mandate grounded in the authoritative domain contract below. "
+        "Use Primary Sources as the legal/evidentiary basis, Constraints as non-negotiable fiscal or "
+        "statutory boundaries, and Owned Checks as validations this agent must execute. Define how "
+        "claims and inter-agent handoffs remain source-linked and auditable; how disagreements are "
+        "classified, preserved, escalated, and reconciled through a structured consensus protocol; "
+        "and how the legal deficit ceiling and other hard constraints are enforced without converting "
+        "unverified model predictions into facts or fiscal capacity. Do not reveal chain-of-thought. "
+        "Return only one JSON object with exactly these logical fields: scenario_mandate, "
+        "scenario_focus, priority_questions, required_evidence, epistemic_logic_traceability, "
+        "structured_consensus_protocol, regulatory_compliance_alignment. Each field may be a concise "
+        "string or an array of concise inspectable statements.\n\n"
+        f"AUTHORITATIVE DOMAIN CONTRACT:\n{json.dumps(domain_contract, ensure_ascii=False)}\n\n"
         f"ACTIVE POLICY SCENARIO: {scenario_description}"
     )
 

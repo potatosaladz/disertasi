@@ -3,6 +3,7 @@ import logging
 import socket
 import warnings
 from collections.abc import AsyncIterator
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from time import perf_counter
 from typing import Any, Literal, cast
@@ -149,6 +150,9 @@ class AgentDomainRules(BaseModel):
     scenario_focus: list[str] = Field(default_factory=list)
     priority_questions: list[str] = Field(default_factory=list)
     required_evidence: list[str] = Field(default_factory=list)
+    epistemic_logic_traceability: list[str] = Field(default_factory=list)
+    structured_consensus_protocol: list[str] = Field(default_factory=list)
+    regulatory_compliance_alignment: list[str] = Field(default_factory=list)
     applicable_primary_sources: list[str] = Field(default_factory=list)
     applicable_constraints: list[str] = Field(default_factory=list)
     applicable_owned_checks: list[str] = Field(default_factory=list)
@@ -412,6 +416,9 @@ class MandateSynthesisResponse(BaseModel):
     scenario_focus: str | list[Any] | dict[str, Any] | None = None
     priority_questions: str | list[Any] | dict[str, Any] | None = None
     required_evidence: str | list[Any] | dict[str, Any] | None = None
+    epistemic_logic_traceability: str | list[Any] | dict[str, Any] | None = None
+    structured_consensus_protocol: str | list[Any] | dict[str, Any] | None = None
+    regulatory_compliance_alignment: str | list[Any] | dict[str, Any] | None = None
 
     @field_validator("*", mode="before")
     @classmethod
@@ -456,6 +463,27 @@ def _validated_mandate_payload(payload: dict[str, Any]) -> MandateSynthesisRespo
                 "evidence",
                 "evidence_requirements",
             ),
+            "epistemic_logic_traceability": _response_value(
+                unwrapped,
+                "epistemic_logic_traceability",
+                "epistemicTraceability",
+                "traceability",
+                "auditability",
+            ),
+            "structured_consensus_protocol": _response_value(
+                unwrapped,
+                "structured_consensus_protocol",
+                "structuredConsensusProtocol",
+                "consensus_protocol",
+                "disagreement_handling",
+            ),
+            "regulatory_compliance_alignment": _response_value(
+                unwrapped,
+                "regulatory_compliance_alignment",
+                "regulatoryComplianceAlignment",
+                "compliance_alignment",
+                "regulatory_alignment",
+            ),
         }
     )
 class MandateSynthesisFallbacks(BaseModel):
@@ -463,6 +491,9 @@ class MandateSynthesisFallbacks(BaseModel):
     scenario_focus: list[str]
     priority_questions: list[str]
     required_evidence: list[str]
+    epistemic_logic_traceability: list[str]
+    structured_consensus_protocol: list[str]
+    regulatory_compliance_alignment: list[str]
 
 
 MANDATE_DEFAULT_FOCUS = [
@@ -529,6 +560,35 @@ def _normalise_mandate_list(
     if isinstance(value, str):
         valid_items = [item.strip(" -•\t") for item in value.replace(";", "\n").splitlines()]
         valid_items = [item for item in valid_items if item]
+    elif isinstance(value, dict):
+        nested = _response_value(
+            value,
+            "content",
+            "text",
+            "name",
+            "question",
+            "evidence",
+            "description",
+            "mechanism",
+            "protocol",
+            "alignment",
+            "traceability",
+        )
+        if nested is not None:
+            valid_items = _normalise_mandate_list(nested, [], field_name, agent_id)
+        else:
+            valid_items = []
+            for candidate in value.values():
+                if isinstance(candidate, str):
+                    valid_items.extend(
+                        item.strip(" -•\t")
+                        for item in candidate.replace(";", "\n").splitlines()
+                        if item.strip(" -•\t")
+                    )
+                elif isinstance(candidate, list):
+                    for item in candidate:
+                        if isinstance(item, str) and item.strip():
+                            valid_items.append(item.strip())
     elif isinstance(value, (list, tuple, set)):
         valid_items = []
         for item in value:
@@ -538,7 +598,7 @@ def _normalise_mandate_list(
                 text = next(
                     (
                         candidate.strip()
-                        for key in ("content", "text", "name", "question", "evidence")
+                        for key in ("content", "text", "name", "question", "evidence", "description", "mechanism", "protocol", "alignment", "traceability")
                         if isinstance((candidate := item.get(key)), str) and candidate.strip()
                     ),
                     None,
@@ -567,6 +627,15 @@ def _synthesis_fallbacks(agent: Agent, scenario: Scenario) -> MandateSynthesisFa
         required_evidence=[
             "Current APBN baseline, source-linked fiscal assumptions, and implementation evidence"
         ],
+        epistemic_logic_traceability=[
+            "Attach source tags and verification status to material claims and preserve auditable inter-agent handoffs"
+        ],
+        structured_consensus_protocol=[
+            "Classify disagreements, preserve valid dissent, and escalate unresolved conflicts through DDR and CAR"
+        ],
+        regulatory_compliance_alignment=[
+            f"Enforce the {scenario.max_deficit_constraint}% GDP deficit ceiling and reject unverified fiscal offsets"
+        ],
     )
 
 
@@ -593,6 +662,9 @@ def _fallback_agent_domain_rules(agent: Agent, scenario: Scenario) -> AgentDomai
             "scenario_focus": fallback_values.scenario_focus,
             "priority_questions": fallback_values.priority_questions,
             "required_evidence": fallback_values.required_evidence,
+            "epistemic_logic_traceability": fallback_values.epistemic_logic_traceability,
+            "structured_consensus_protocol": fallback_values.structured_consensus_protocol,
+            "regulatory_compliance_alignment": fallback_values.regulatory_compliance_alignment,
             "applicable_primary_sources": base.primary_sources,
             "applicable_constraints": base.constraints,
             "applicable_owned_checks": base.owned_checks,
@@ -624,6 +696,10 @@ def _synthesize_agent_domain_rules(agent: Agent, scenario: Scenario) -> AgentDom
                         agent.name,
                         agent.role,
                         scenario.description,
+                        primary_sources=base.primary_sources,
+                        constraints=base.constraints,
+                        owned_checks=base.owned_checks,
+                        max_deficit_constraint=scenario.max_deficit_constraint,
                     ),
                 },
             ],
@@ -679,6 +755,24 @@ def _synthesize_agent_domain_rules(agent: Agent, scenario: Scenario) -> AgentDom
             "required_evidence",
             agent.id,
         )
+        epistemic_logic_traceability = _normalise_mandate_list(
+            parsed.epistemic_logic_traceability,
+            fallback_values.epistemic_logic_traceability,
+            "epistemic_logic_traceability",
+            agent.id,
+        )
+        structured_consensus_protocol = _normalise_mandate_list(
+            parsed.structured_consensus_protocol,
+            fallback_values.structured_consensus_protocol,
+            "structured_consensus_protocol",
+            agent.id,
+        )
+        regulatory_compliance_alignment = _normalise_mandate_list(
+            parsed.regulatory_compliance_alignment,
+            fallback_values.regulatory_compliance_alignment,
+            "regulatory_compliance_alignment",
+            agent.id,
+        )
         return base.model_copy(
             update={
                 "synthesis_status": "generated",
@@ -686,6 +780,9 @@ def _synthesize_agent_domain_rules(agent: Agent, scenario: Scenario) -> AgentDom
                 "scenario_focus": scenario_focus,
                 "priority_questions": priority_questions,
                 "required_evidence": required_evidence,
+                "epistemic_logic_traceability": epistemic_logic_traceability,
+                "structured_consensus_protocol": structured_consensus_protocol,
+                "regulatory_compliance_alignment": regulatory_compliance_alignment,
                 "applicable_primary_sources": base.primary_sources,
                 "applicable_constraints": base.constraints,
                 "applicable_owned_checks": base.owned_checks,
@@ -720,6 +817,9 @@ def _synthesize_agent_domain_rules(agent: Agent, scenario: Scenario) -> AgentDom
                 "scenario_focus": fallback_values.scenario_focus,
                 "priority_questions": fallback_values.priority_questions,
                 "required_evidence": fallback_values.required_evidence,
+                "epistemic_logic_traceability": fallback_values.epistemic_logic_traceability,
+                "structured_consensus_protocol": fallback_values.structured_consensus_protocol,
+                "regulatory_compliance_alignment": fallback_values.regulatory_compliance_alignment,
                 "applicable_primary_sources": base.primary_sources,
                 "applicable_constraints": base.constraints,
                 "applicable_owned_checks": base.owned_checks,
@@ -763,6 +863,78 @@ def _save_domain_rules_snapshot(session: Session, response: DomainRulesResponse)
     session.commit()
 
 
+def _safe_agent_domain_rule(raw_rule: object) -> AgentDomainRules:
+    raw = dict(raw_rule) if isinstance(raw_rule, dict) else {}
+    defaults: dict[str, object] = {
+        "agent_id": 0,
+        "name": "Unknown agent",
+        "role": "Unknown role",
+        "template_key": None,
+        "mandate": None,
+        "primary_sources": [],
+        "constraints": [],
+        "owned_checks": [],
+        "synthesis_status": "fallback",
+        "scenario_mandate": None,
+        "scenario_focus": [],
+        "priority_questions": [],
+        "required_evidence": [],
+        "epistemic_logic_traceability": [],
+        "structured_consensus_protocol": [],
+        "regulatory_compliance_alignment": [],
+        "applicable_primary_sources": [],
+        "applicable_constraints": [],
+        "applicable_owned_checks": [],
+        "llm_model": None,
+        "latency_ms": None,
+        "token_usage": 0,
+        "error": None,
+    }
+    for key, value in defaults.items():
+        if raw.get(key) is None and value is not None:
+            raw[key] = value
+        else:
+            raw.setdefault(key, value)
+    raw["agent_id"] = raw["agent_id"] if isinstance(raw["agent_id"], int) else 0
+    raw["name"] = str(raw["name"] or "Unknown agent")
+    raw["role"] = str(raw["role"] or "Unknown role")
+    if raw["synthesis_status"] not in {"generated", "fallback"}:
+        raw["synthesis_status"] = "fallback"
+    if not isinstance(raw["error"], dict):
+        raw["error"] = None
+    elif raw["error"].get("code") not in {
+        "CONFIGURATION_ERROR",
+        "PROVIDER_ERROR",
+        "EMPTY_CONTENT",
+        "INVALID_JSON",
+        "SCHEMA_ERROR",
+    }:
+        raw["error"] = {
+            "code": "SCHEMA_ERROR",
+            "message": str(raw["error"].get("message") or "Stored mandate error"),
+            "retryable": False,
+        }
+    else:
+        raw["error"].setdefault("message", "Stored mandate error")
+        raw["error"].setdefault("retryable", False)
+    for key in (
+        "primary_sources",
+        "constraints",
+        "owned_checks",
+        "scenario_focus",
+        "priority_questions",
+        "required_evidence",
+        "epistemic_logic_traceability",
+        "structured_consensus_protocol",
+        "regulatory_compliance_alignment",
+        "applicable_primary_sources",
+        "applicable_constraints",
+        "applicable_owned_checks",
+    ):
+        if not isinstance(raw[key], list):
+            raw[key] = [str(raw[key])] if raw[key] else []
+    return AgentDomainRules.model_validate(raw)
+
 def _domain_rules_from_snapshot(
     snapshot: ScenarioMandateSnapshot,
     current_revision: str,
@@ -778,8 +950,11 @@ def _domain_rules_from_snapshot(
         generated=snapshot.generated,
         stale=is_stale,
         agent_count=snapshot.agent_count,
-        rules=snapshot.rules,
-        agent_rules=[AgentDomainRules.model_validate(rule) for rule in snapshot.agent_rules],
+        rules=snapshot.rules if isinstance(snapshot.rules, dict) else {},
+        agent_rules=[
+            _safe_agent_domain_rule(rule)
+            for rule in (snapshot.agent_rules if isinstance(snapshot.agent_rules, list) else [])
+        ],
         status=(
             "stale"
             if is_stale
@@ -819,7 +994,13 @@ def generate_domain_rules(scenario_id: int) -> DomainRulesResponse | JSONRespons
                     status_code=409,
                     content={"success": False, "detail": "At least one agent is required"},
                 )
-            agent_rules = [_synthesize_agent_domain_rules(agent, scenario) for agent in agents]
+            with ThreadPoolExecutor(max_workers=min(len(agents), 5)) as executor:
+                agent_rules = list(
+                    executor.map(
+                        lambda agent: _synthesize_agent_domain_rules(agent, scenario),
+                        agents,
+                    )
+                )
             generated_count = sum(rule.synthesis_status == "generated" for rule in agent_rules)
             failure_count = len(agent_rules) - generated_count
             if generated_count == 0:

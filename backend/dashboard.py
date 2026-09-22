@@ -41,6 +41,74 @@ def _resolution_mechanism(log: DisagreementLog) -> str:
     return "No Resolution Required"
 
 
+def _safe_agent_rules(raw_rules: object) -> list[dict[str, Any]]:
+    if not isinstance(raw_rules, list):
+        return []
+    normalised: list[dict[str, Any]] = []
+    for raw_rule in raw_rules:
+        if not isinstance(raw_rule, dict):
+            continue
+        rule = dict(raw_rule)
+        for key, value in {
+            "agent_id": 0,
+            "name": "Unknown agent",
+            "role": "Unknown role",
+            "template_key": None,
+            "mandate": None,
+            "primary_sources": [],
+            "constraints": [],
+            "owned_checks": [],
+            "synthesis_status": "fallback",
+            "scenario_mandate": None,
+            "scenario_focus": [],
+            "priority_questions": [],
+            "required_evidence": [],
+            "epistemic_logic_traceability": [],
+            "structured_consensus_protocol": [],
+            "regulatory_compliance_alignment": [],
+            "applicable_primary_sources": [],
+            "applicable_constraints": [],
+            "applicable_owned_checks": [],
+            "llm_model": None,
+            "latency_ms": None,
+            "token_usage": 0,
+            "error": None,
+        }.items():
+            if rule.get(key) is None and value is not None:
+                rule[key] = value
+            else:
+                rule.setdefault(key, value)
+        rule["agent_id"] = rule["agent_id"] if isinstance(rule["agent_id"], int) else 0
+        rule["name"] = str(rule["name"] or "Unknown agent")
+        rule["role"] = str(rule["role"] or "Unknown role")
+        if rule["synthesis_status"] not in {"generated", "fallback"}:
+            rule["synthesis_status"] = "fallback"
+        if not isinstance(rule["error"], dict):
+            rule["error"] = None
+        else:
+            rule["error"].setdefault("code", "SCHEMA_ERROR")
+            rule["error"].setdefault("message", "Stored mandate error")
+            rule["error"].setdefault("retryable", False)
+        for field in (
+            "primary_sources",
+            "constraints",
+            "owned_checks",
+            "scenario_focus",
+            "priority_questions",
+            "required_evidence",
+            "epistemic_logic_traceability",
+            "structured_consensus_protocol",
+            "regulatory_compliance_alignment",
+            "applicable_primary_sources",
+            "applicable_constraints",
+            "applicable_owned_checks",
+        ):
+            if not isinstance(rule[field], list):
+                rule[field] = [str(rule[field])] if rule[field] else []
+        normalised.append(rule)
+    return normalised
+
+
 def _metric_payload(snapshot: MetricSnapshot) -> dict[str, Any]:
     return {
         "id": snapshot.id,
@@ -85,6 +153,14 @@ def _dashboard_payload(scenario_id: int, session_id: str | None = None) -> dict[
             .order_by(ScenarioMandateSnapshot.updated_at.desc(), ScenarioMandateSnapshot.id.desc())
         )
         current_revision = agent_revision(agents, scenario)
+        stored_agent_rules = _safe_agent_rules(
+            mandate_snapshot.agent_rules if mandate_snapshot is not None else []
+        )
+        stored_rules = (
+            mandate_snapshot.rules
+            if mandate_snapshot is not None and isinstance(mandate_snapshot.rules, dict)
+            else {}
+        )
         mandate_is_stale = (
             mandate_snapshot is not None
             and (
@@ -99,8 +175,8 @@ def _dashboard_payload(scenario_id: int, session_id: str | None = None) -> dict[
                 "generated": mandate_snapshot.generated,
                 "stale": mandate_is_stale,
                 "agent_count": mandate_snapshot.agent_count,
-                "rules": mandate_snapshot.rules,
-                "agent_rules": mandate_snapshot.agent_rules,
+                "rules": stored_rules,
+                "agent_rules": stored_agent_rules,
                 "status": "stale" if mandate_is_stale else mandate_snapshot.status,
                 "generated_count": mandate_snapshot.generated_count,
                 "failure_count": mandate_snapshot.failure_count,

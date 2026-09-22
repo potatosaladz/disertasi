@@ -79,18 +79,27 @@ def test_mandate_synthesis_prompt_contains_seed_and_scenario() -> None:
         "Revenue Agent",
         "Revenue",
         "Assess a targeted support programme.",
+        primary_sources=["UU17_2003_P12"],
+        constraints=["Projected deficit must remain <= 3% GDP."],
+        owned_checks=["DEFICIT_3PCT"],
+        max_deficit_constraint=3.0,
     )
     assert "Act autonomously as the expert Revenue" in prompt
     assert "targeted support programme" in prompt
     assert "scenario_mandate" in prompt
-    assert "LOCAL SEED CONTRACT" not in prompt
-    assert "PROGRAM COST" not in prompt
-    assert "DEFICIT CEILING" not in prompt
+    assert "AUTHORITATIVE DOMAIN CONTRACT" in prompt
+    assert "UU17_2003_P12" in prompt
+    assert "Projected deficit must remain <= 3% GDP." in prompt
+    assert "DEFICIT_3PCT" in prompt
+    assert "epistemic_logic_traceability" in prompt
+    assert "structured_consensus_protocol" in prompt
+    assert "regulatory_compliance_alignment" in prompt
+    assert "automatic_deficit_ceiling_percent_gdp" in prompt
     system_prompt = build_mandate_synthesis_system_prompt("Revenue Agent", "Revenue")
-    assert "structured multi-agent fiscal consensus framework" in system_prompt
-    assert "APBN domain focus" in system_prompt
-    assert "regulation and statute" in system_prompt
-    assert "fiscally verifiable evidence" in system_prompt
+    assert "Collective Reasoning in Heterogeneous Multi-Agent Systems" in system_prompt
+    assert "auditable epistemic traceability" in system_prompt
+    assert "structured disagreement and consensus handling" in system_prompt
+    assert "strict regulatory compliance" in system_prompt
 
 
 def test_build_agent_system_prompt_injects_mandate() -> None:

@@ -224,13 +224,17 @@ def test_domain_rules_aggregate_template_agents(
     captured: dict[str, object] = {}
 
     class FakeCompletions:
-        def create(self, **_kwargs: object) -> object:
+        def create(self, **kwargs: object) -> object:
+            captured["request"] = kwargs
             content = json.dumps(
                 {
                     "scenario_mandate": "Evaluate scenario-specific revenue legality and timing.",
                     "scenario_focus": ["Revenue timing"],
                     "priority_questions": ["Is the offset verified?"],
                     "required_evidence": ["Collection schedule"],
+                    "epistemic_logic_traceability": ["Tag every material claim with its source and verification state."],
+                    "structured_consensus_protocol": ["Escalate unresolved fiscal conflicts through DDR and CAR."],
+                    "regulatory_compliance_alignment": ["Enforce the 3% GDP deficit ceiling and reject unverified offsets."],
                 }
             )
             message = type("Message", (), {"content": content})()
@@ -290,6 +294,15 @@ def test_domain_rules_aggregate_template_agents(
         "scenario_focus": ["Revenue timing"],
         "priority_questions": ["Is the offset verified?"],
         "required_evidence": ["Collection schedule"],
+        "epistemic_logic_traceability": [
+            "Tag every material claim with its source and verification state."
+        ],
+        "structured_consensus_protocol": [
+            "Escalate unresolved fiscal conflicts through DDR and CAR."
+        ],
+        "regulatory_compliance_alignment": [
+            "Enforce the 3% GDP deficit ceiling and reject unverified offsets."
+        ],
         "applicable_primary_sources": list(STANDARD_APBN_AGENT_TEMPLATES[0].primary_sources),
         "applicable_constraints": list(STANDARD_APBN_AGENT_TEMPLATES[0].constraints),
         "applicable_owned_checks": list(STANDARD_APBN_AGENT_TEMPLATES[0].owned_checks),
@@ -309,6 +322,19 @@ def test_domain_rules_aggregate_template_agents(
             "Accept": "application/json",
         },
     }
+    request = captured["request"]
+    assert isinstance(request, dict)
+    messages = request["messages"]
+    assert isinstance(messages, list)
+    user_prompt = messages[1]["content"]
+    assert isinstance(user_prompt, str)
+    assert "UUD45_P23_23A_31" in user_prompt
+    assert "Tax/compulsory-levy policy needs proper statutory legal basis." in user_prompt
+    assert "VERIFIED_OFFSETS_ONLY" in user_prompt
+    assert '"automatic_deficit_ceiling_percent_gdp": 3.0' in user_prompt
+    assert "epistemic_logic_traceability" in user_prompt
+    assert "structured_consensus_protocol" in user_prompt
+    assert "regulatory_compliance_alignment" in user_prompt
     assert payload["status"] == "success"
     assert payload["generated_count"] == 1
 
@@ -424,6 +450,11 @@ def test_domain_rules_accepts_flexible_response_keys(
                             {"text": "Is the policy lawful?"},
                         ],
                         "Evidence Requirements": "Current APBN baseline\nVerified implementation plan",
+                        "Epistemic Traceability": {"traceability": "Source-linked claim ledger"},
+                        "Consensus Protocol": "Classify disagreement; Preserve dissent",
+                        "Compliance Alignment": [
+                            {"alignment": "Enforce the statutory deficit ceiling"}
+                        ],
                     }
                 }
             )
@@ -462,6 +493,14 @@ def test_domain_rules_accepts_flexible_response_keys(
     assert rule["scenario_focus"] == ["Fiscal sustainability", "Revenue resilience"]
     assert rule["priority_questions"] == ["Is financing available?", "Is the policy lawful?"]
     assert rule["required_evidence"] == ["Current APBN baseline", "Verified implementation plan"]
+    assert rule["epistemic_logic_traceability"] == ["Source-linked claim ledger"]
+    assert rule["structured_consensus_protocol"] == [
+        "Classify disagreement",
+        "Preserve dissent",
+    ]
+    assert rule["regulatory_compliance_alignment"] == [
+        "Enforce the statutory deficit ceiling"
+    ]
 
     single = client.post(
         f"/api/scenarios/{scenario.json()['id']}/agents/{agent.json()['id']}/domain-rules"
@@ -901,6 +940,68 @@ def test_run_status_failure(client: TestClient, monkeypatch: pytest.MonkeyPatch)
     response = client.get("/api/runs/failed-task")
     assert response.json()["status"] == "FAILED"
     assert response.json()["error"] == "cycle failed"
+
+
+def test_malformed_stored_mandate_is_normalised_for_api_and_dashboard(
+    client: TestClient,
+) -> None:
+    with SessionLocal() as session:
+        scenario = Scenario(
+            description=f"Stored mandate compatibility {uuid.uuid4()}",
+            max_deficit_constraint=3.0,
+        )
+        agent = Agent(name=f"stored-mandate-{uuid.uuid4()}", role="Fiscal Reviewer")
+        session.add_all([scenario, agent])
+        session.flush()
+        revision = agent_revision([agent], scenario)
+        session.add(
+            ScenarioMandateSnapshot(
+                scenario_id=scenario.id,
+                revision=revision,
+                generated=True,
+                agent_count=1,
+                rules={},
+                agent_rules=[
+                    {
+                        "agent_id": agent.id,
+                        "name": agent.name,
+                        "role": agent.role,
+                        "scenario_focus": "Fiscal sustainability",
+                        "priority_questions": None,
+                        "error": {"code": "LEGACY", "message": "legacy error"},
+                    }
+                ],
+                status="success",
+                generated_count=1,
+                failure_count=0,
+            )
+        )
+        session.commit()
+        scenario_id = scenario.id
+        agent_id = agent.id
+
+    rules = client.get(f"/api/scenarios/{scenario_id}/domain-rules")
+    dashboard = client.get(f"/api/scenarios/{scenario_id}/dashboard")
+
+    assert rules.status_code == 200
+    assert dashboard.status_code == 200
+    stored = rules.json()["agent_rules"][0]
+    assert stored["scenario_focus"] == ["Fiscal sustainability"]
+    assert stored["priority_questions"] == []
+    assert stored["required_evidence"] == []
+    assert stored["primary_sources"] == []
+    assert stored["epistemic_logic_traceability"] == []
+    assert stored["structured_consensus_protocol"] == []
+    assert stored["regulatory_compliance_alignment"] == []
+    assert stored["error"]["code"] == "SCHEMA_ERROR"
+    assert dashboard.json()["domain_rules"]["agent_rules"][0]["scenario_focus"] == [
+        "Fiscal sustainability"
+    ]
+
+    with SessionLocal() as session:
+        session.delete(session.get(Scenario, scenario_id))
+        session.delete(session.get(Agent, agent_id))
+        session.commit()
 
 
 def test_empty_dashboard(client: TestClient) -> None:

@@ -358,6 +358,7 @@ def mandate_seed(agent: Agent) -> dict[str, Any]:
 
 def agent_revision(agents: list[Agent], scenario: object | None = None) -> str:
     payload = {
+        "mandate_contract_version": "dissertation-consensus-v2",
         "scenario": (
             {
                 "id": getattr(scenario, "id"),
