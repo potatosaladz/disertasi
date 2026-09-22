@@ -1,6 +1,7 @@
 "use client";
 
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import RunGraph, { type RunGraphPayload } from "./RunGraph";
 
 type Agent = {
   id: number;
@@ -145,6 +146,7 @@ export default function Home() {
   const [scenarios, setScenarios] = useState<Scenario[]>([]);
   const [selectedScenario, setSelectedScenario] = useState<number | null>(null);
   const [dashboard, setDashboard] = useState<Dashboard | null>(null);
+  const [graph, setGraph] = useState<RunGraphPayload | null>(null);
   const [run, setRun] = useState<RunState | null>(null);
   const [notice, setNotice] = useState("Research console ready. Select a scenario to activate the tracker.");
   const [domainRules, setDomainRules] = useState<DomainRules | null>(null);
@@ -206,10 +208,21 @@ export default function Home() {
     setDomainRules(payload.domain_rules);
   }
 
+  async function loadRunGraph(taskId: string | null, scenarioId: number, sessionId: string) {
+    const endpoint = taskId
+      ? `${apiUrl}/api/runs/${taskId}/graph`
+      : `${apiUrl}/api/scenarios/${scenarioId}/runs/${sessionId}/graph`;
+    const response = await fetch(`${endpoint}?refresh=${Date.now()}`, { cache: "no-store" });
+    if (!response.ok) throw new Error(`Graph API returned ${response.status}`);
+    const payload: RunGraphPayload = await response.json();
+    setGraph(payload);
+  }
+
   async function loadLatestRun(id: number) {
     const response = await fetch(`${apiUrl}/api/scenarios/${id}/runs/latest?refresh=${Date.now()}`, { cache: "no-store" });
     if (response.status === 404) {
       setRun(null);
+      setGraph(null);
       setTrackerHistory([]);
       return;
     }
@@ -218,6 +231,7 @@ export default function Home() {
     setRun(payload);
     setTrackerHistory(payload.logs ?? []);
     if (payload.task_id) trackerLogCounts.current[payload.task_id] = payload.logs?.length ?? 0;
+    await loadRunGraph(payload.task_id, payload.scenario_id, payload.session_id);
     if (payload.status === "SUCCEEDED" && payload.scenario_id === id) await loadDashboard(id, payload.session_id);
   }
   async function loadDomainRules(id: number) {
@@ -266,6 +280,7 @@ export default function Home() {
       const nextRun: RunState = await response.json();
       setRun(nextRun);
       if (nextRun.task_id) appendTrackerLogs(nextRun.task_id, nextRun.logs);
+      await loadRunGraph(nextRun.task_id, nextRun.scenario_id, nextRun.session_id);
       if (nextRun.status === "SUCCEEDED" && selectedScenario === nextRun.scenario_id) {
         await loadDashboard(nextRun.scenario_id, nextRun.session_id);
         setNotice("Cycle complete. Dashboard metrics refreshed from PostgreSQL.");
@@ -432,7 +447,7 @@ export default function Home() {
     try {
       const response = await fetch(`${apiUrl}/api/scenarios`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(scenario) });
       const payload = await response.json(); if (!response.ok) throw new Error(payload.detail ?? "Scenario could not be saved");
-      setScenario(initialScenario); await loadSetup(); setDomainRules(null); setDashboard(null); setRun(null); setTrackerHistory([]); setSelectedScenario(payload.id); setNotice(`Skenario ${payload.id} tersimpan; aturan hukum dan batas defisit diterapkan otomatis.`);
+      setScenario(initialScenario); await loadSetup(); setDomainRules(null); setDashboard(null); setGraph(null); setRun(null); setTrackerHistory([]); setSelectedScenario(payload.id); setNotice(`Skenario ${payload.id} tersimpan; aturan hukum dan batas defisit diterapkan otomatis.`);
     } catch (error) { setNotice(error instanceof Error ? error.message : "Scenario could not be saved"); } finally { setBusy(false); }
   }
 
@@ -442,8 +457,9 @@ export default function Home() {
     const response = await fetch(`${apiUrl}/api/scenarios/${selectedScenario}/runs`, { method: "POST" });
     const payload = await response.json();
     if (!response.ok) { setNotice(payload.detail ?? "Could not queue cycle"); return; }
-    setRun({ task_id: payload.task_id, session_id: payload.session_id, scenario_id: payload.scenario_id, status: payload.status, logs: payload.logs });
+    setRun({ task_id: payload.task_id, session_id: payload.session_id, scenario_id: payload.scenario_id, status: payload.status, logs: payload.logs, simulation_artifacts: [] });
     appendQueueLog(payload.task_id, payload.logs);
+    await loadRunGraph(payload.task_id, payload.scenario_id, payload.session_id);
     setNotice(`Task ${payload.task_id.slice(0, 8)} queued on Celery.`);
   }
 
@@ -468,16 +484,18 @@ export default function Home() {
     <section className="dashboard-hero"><div><div className="eyebrow">PHASE 05 / OBSERVATION LAYER</div><h1>Make disagreement<br /><em>inspectable.</em></h1><p>A live evidence surface for tracking execution, divergence, hard constraints, and the convergence states produced by each fiscal experiment.</p></div><div className="hero-orbit"><span>DDR</span><b>→</b><span>CAR</span><b>→</b><span>SHCR</span></div></section>
     <div className="notice"><span className="notice-label">SYSTEM NOTE</span><span>{notice}</span></div>
 
-    <section className="control-strip"><div className="scenario-overview"><span>ACTIVE SCENARIO / SCOPE</span><strong>{selectedScenario ? `Scenario #${selectedScenario}` : "Belum dipilih"}</strong><p className={scenarioExpanded ? "expanded" : "collapsed"}>{scenarios.find((item) => item.id === selectedScenario)?.description ?? "Pilih skenario untuk memulai."}</p><button type="button" onClick={() => setScenarioExpanded((value) => !value)}>{scenarioExpanded ? "Sembunyikan Detail" : "Tampilkan Detail / Expand"}</button><select aria-label="Select active scenario" value={selectedScenario ?? ""} onChange={(event) => { setSelectedScenario(Number(event.target.value)); setDomainRules(null); setDashboard(null); setRun(null); setTrackerHistory([]); setMandateLogs([]); }}><option value="" disabled>Select scenario</option>{scenarios.map((item) => <option key={item.id} value={item.id}>#{item.id} — {item.description.slice(0, 72)}</option>)}</select></div><button className="primary-button run-button" onClick={startRun} disabled={run?.status === "RUNNING" || run?.status === "QUEUED" || rulesAreStale}>{run?.status === "RUNNING" ? "Diskusi berjalan…" : "Mulai Diskusi"}<span>↗</span></button></section>
+    <section className="control-strip"><div className="scenario-overview"><span>ACTIVE SCENARIO / SCOPE</span><strong>{selectedScenario ? `Scenario #${selectedScenario}` : "Belum dipilih"}</strong><p className={scenarioExpanded ? "expanded" : "collapsed"}>{scenarios.find((item) => item.id === selectedScenario)?.description ?? "Pilih skenario untuk memulai."}</p><button type="button" onClick={() => setScenarioExpanded((value) => !value)}>{scenarioExpanded ? "Sembunyikan Detail" : "Tampilkan Detail / Expand"}</button><select aria-label="Select active scenario" value={selectedScenario ?? ""} onChange={(event) => { setSelectedScenario(Number(event.target.value)); setDomainRules(null); setDashboard(null); setGraph(null); setRun(null); setTrackerHistory([]); setMandateLogs([]); }}><option value="" disabled>Select scenario</option>{scenarios.map((item) => <option key={item.id} value={item.id}>#{item.id} — {item.description.slice(0, 72)}</option>)}</select></div><button className="primary-button run-button" onClick={startRun} disabled={run?.status === "RUNNING" || run?.status === "QUEUED" || rulesAreStale}>{run?.status === "RUNNING" ? "Diskusi berjalan…" : "Mulai Diskusi"}<span>↗</span></button></section>
 
-    <nav className="menu-rail"><span className="menu-label">CONTROL MENUS</span><a href="#setup">01 / Setup</a><a href="#setup">02 / Scenario</a><a className="active" href="#tracker">03 / Live Tracker</a><a href="#ddr">04 / DDR Network</a><a href="#analytics">05 / Analytics</a></nav>
+    <nav className="menu-rail"><span className="menu-label">CONTROL MENUS</span><a href="#setup">01 / Setup</a><a href="#setup">02 / Scenario</a><a className="active" href="#tracker">03 / Live Tracker</a><a href="#network">04 / Graph Network</a><a href="#ddr">05 / DDR</a><a href="#analytics">06 / Analytics</a></nav>
 
     <section id="tracker" className="tracker-panel panel"><div className="section-header"><div><span className="section-number">03</span><h2>Live Tracker</h2></div><span className={`run-state ${run?.status?.toLowerCase() ?? "idle"}`}>{run?.status ?? "IDLE"}</span></div><div className="tracker-content"><div ref={trackerConsoleRef} className="progress-console max-h-[500px] overflow-y-auto">{activeLogs.map((log, index) => <div className={`console-line ${log.level.toLowerCase()}`} key={`${log.stage}-${index}`}><span>{String(index + 1).padStart(2, "0")}</span><i className={index === activeLogs.length - 1 && !["SUCCEEDED", "FAILED"].includes(run?.status ?? "") ? "pulse" : "done"} /><div><b>[{log.level}] {log.stage}</b><small>{log.message}</small></div></div>)}</div><div className="task-readout"><span>TASK IDENTIFIER</span><strong>{run?.task_id ?? "—"}</strong><small>{run?.error ?? (run?.status === "SUCCEEDED" ? "Result persisted" : "Polling every 1.2 seconds")}</small></div></div>{simulationArtifacts.length > 0 && <div className="simulation-stack">{simulationArtifacts.map((artifact) => <SimulationResolutionPanel artifact={artifact} key={artifact.id} />)}</div>}</section>
 
-    <section id="ddr" className="panel"><div className="section-header"><div><span className="section-number">04</span><h2>DDR Network</h2></div><span className="panel-code">D<sub>ij</sub> / 8 COMPONENTS</span></div><div className="matrix-wrap">{dashboard?.disagreements.length ? <table className="ddr-table"><thead><tr><th>AGENT PAIR</th>{components.map((component) => <th key={component}>{component}</th>)}<th>RESOLUTION MECHANISM</th></tr></thead><tbody>{dashboard.disagreements.map((item) => <tr key={item.id}><td><strong>{item.agent_i}</strong><small>× {item.agent_j}</small></td>{components.map((component) => <td key={component}><span className={`bool ${item[component] ? "conflict" : "clear"}`}>{item[component] ? "1" : "0"}</span></td>)}<td className="resolution">{item.resolution_mechanism}</td></tr>)}</tbody></table> : <div className="empty-state"><strong>No DDR vectors yet.</strong><span>Run a cycle with at least two schema-valid agents to populate the matrix.</span></div>}</div></section>
+    <section id="network" className="panel graph-panel"><div className="section-header"><div><span className="section-number">04</span><h2>Interactive Graph Network</h2></div><div className="graph-legend"><span><i className="pending" /> pending</span><span><i className="running" /> active</span><span><i className="succeeded" /> complete</span><span><i className="warning" /> dissent</span><span><i className="failed" /> failed</span></div></div><RunGraph graph={graph} /></section>
+
+    <section id="ddr" className="panel"><div className="section-header"><div><span className="section-number">05</span><h2>DDR Network</h2></div><span className="panel-code">D<sub>ij</sub> / 8 COMPONENTS</span></div><div className="matrix-wrap">{dashboard?.disagreements.length ? <table className="ddr-table"><thead><tr><th>AGENT PAIR</th>{components.map((component) => <th key={component}>{component}</th>)}<th>RESOLUTION MECHANISM</th></tr></thead><tbody>{dashboard.disagreements.map((item) => <tr key={item.id}><td><strong>{item.agent_i}</strong><small>× {item.agent_j}</small></td>{components.map((component) => <td key={component}><span className={`bool ${item[component] ? "conflict" : "clear"}`}>{item[component] ? "1" : "0"}</span></td>)}<td className="resolution">{item.resolution_mechanism}</td></tr>)}</tbody></table> : <div className="empty-state"><strong>No DDR vectors yet.</strong><span>Run a cycle with at least two schema-valid agents to populate the matrix.</span></div>}</div></section>
 
 
-    <section id="analytics" className="analytics-section"><div className="section-header"><div><span className="section-number">05</span><h2>Decision Analytics</h2></div><button className="export-button" onClick={exportManifest}>↓ Export reproducibility manifest</button></div><div className="convergence-banner"><div><span>FINAL CONVERGENCE STATE</span><strong>{latest?.convergence_status ?? "AWAITING CYCLE"}</strong></div><div className="convergence-meta"><span>FEASIBLE ALTERNATIVES</span><b>{latest?.feasible_alternatives_count ?? "—"}</b></div></div><div className="metric-grid"><MetricCard label="Hard-constraint violation rate" value={latest ? latest.hard_constraint_violation_rate.toFixed(2) : "—"} unit="%" tone="rust" /><MetricCard label="Provenance completeness" value={latest ? latest.provenance_completeness_percent.toFixed(2) : "—"} unit="%" /><MetricCard label="Schema validity" value={dashboard ? dashboard.schema_validity_percent.toFixed(2) : "—"} unit="%" tone="mint" /><MetricCard label="Latency / token usage" value={latest ? latest.latency_ms.toFixed(0) : "—"} unit={latest ? `ms · ${latest.token_usage} tok` : ""} /></div><div className="analytics-lower"><div className="history-block"><div className="subhead"><span>METRIC SNAPSHOT HISTORY</span><b>{dashboard?.metric_history.length ?? 0} RUNS</b></div>{dashboard?.metric_history.length ? dashboard.metric_history.slice(0, 5).map((metric) => <div className="history-row" key={metric.id}><span>#{metric.id}</span><strong>{metric.convergence_status}</strong><i>{metric.provenance_completeness_percent.toFixed(1)}% provenance</i><b>{new Date(metric.created_at).toLocaleTimeString()}</b></div>) : <p className="empty">Metric history will appear after the first completed cycle.</p>}</div><div className="influence-block"><div className="subhead"><span>RAR-DAI INFLUENCE RANKING</span><b>{activeInfluence.length} OBSERVATIONS</b></div>{activeInfluence.length ? activeInfluence.slice(0, 4).map((item, index) => <div className="weight-row" key={`${item.agent}-${item.proposition}`}><span>{String(index + 1).padStart(2, "0")}</span><div><strong>{item.agent}</strong><small>{item.proposition}</small></div><b>{item.normalized_weight === null ? "—" : `${(item.normalized_weight * 100).toFixed(1)}%`}</b></div>) : <p className="empty">No influence observations recorded for this scenario.</p>}</div></div></section>
+    <section id="analytics" className="analytics-section"><div className="section-header"><div><span className="section-number">06</span><h2>Decision Analytics</h2></div><button className="export-button" onClick={exportManifest}>↓ Export reproducibility manifest</button></div><div className="convergence-banner"><div><span>FINAL CONVERGENCE STATE</span><strong>{latest?.convergence_status ?? "AWAITING CYCLE"}</strong></div><div className="convergence-meta"><span>FEASIBLE ALTERNATIVES</span><b>{latest?.feasible_alternatives_count ?? "—"}</b></div></div><div className="metric-grid"><MetricCard label="Hard-constraint violation rate" value={latest ? latest.hard_constraint_violation_rate.toFixed(2) : "—"} unit="%" tone="rust" /><MetricCard label="Provenance completeness" value={latest ? latest.provenance_completeness_percent.toFixed(2) : "—"} unit="%" /><MetricCard label="Schema validity" value={dashboard ? dashboard.schema_validity_percent.toFixed(2) : "—"} unit="%" tone="mint" /><MetricCard label="Latency / token usage" value={latest ? latest.latency_ms.toFixed(0) : "—"} unit={latest ? `ms · ${latest.token_usage} tok` : ""} /></div><div className="analytics-lower"><div className="history-block"><div className="subhead"><span>METRIC SNAPSHOT HISTORY</span><b>{dashboard?.metric_history.length ?? 0} RUNS</b></div>{dashboard?.metric_history.length ? dashboard.metric_history.slice(0, 5).map((metric) => <div className="history-row" key={metric.id}><span>#{metric.id}</span><strong>{metric.convergence_status}</strong><i>{metric.provenance_completeness_percent.toFixed(1)}% provenance</i><b>{new Date(metric.created_at).toLocaleTimeString()}</b></div>) : <p className="empty">Metric history will appear after the first completed cycle.</p>}</div><div className="influence-block"><div className="subhead"><span>RAR-DAI INFLUENCE RANKING</span><b>{activeInfluence.length} OBSERVATIONS</b></div>{activeInfluence.length ? activeInfluence.slice(0, 4).map((item, index) => <div className="weight-row" key={`${item.agent}-${item.proposition}`}><span>{String(index + 1).padStart(2, "0")}</span><div><strong>{item.agent}</strong><small>{item.proposition}</small></div><b>{item.normalized_weight === null ? "—" : `${(item.normalized_weight * 100).toFixed(1)}%`}</b></div>) : <p className="empty">No influence observations recorded for this scenario.</p>}</div></div></section>
 
     <section id="setup" className="setup-section">
       <div className="section-header"><div><span className="section-number">01 / 02</span><h2>Heterogeneous Agent Studio</h2></div><button type="button" className="template-load-button" onClick={openTemplateModal} disabled={busy}>Muat 5 template APBN</button></div>

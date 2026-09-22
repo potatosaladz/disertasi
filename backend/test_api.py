@@ -817,6 +817,7 @@ def test_run_submission_and_status(client: TestClient, monkeypatch: pytest.Monke
     latest = client.get(f"/api/scenarios/{scenario_id}/runs/latest")
     history = client.get(f"/api/scenarios/{scenario_id}/runs")
     status_response = client.get("/api/runs/task-phase5")
+    graph_response = client.get("/api/runs/task-phase5/graph")
 
     assert latest.status_code == 200
     assert latest.json()["session_id"] == session_id
@@ -828,6 +829,20 @@ def test_run_submission_and_status(client: TestClient, monkeypatch: pytest.Monke
     assert status_response.status_code == 200
     assert status_response.json()["session_id"] == session_id
     assert status_response.json()["logs"] == response.json()["logs"]
+    assert graph_response.status_code == 200
+    graph_payload = graph_response.json()
+    assert graph_payload["session_id"] == session_id
+    assert {node["id"] for node in graph_payload["nodes"]} >= {
+        "scenario:start",
+        "stage:mandate",
+        "stage:peer-review",
+        "stage:rar-dai",
+        "stage:ddr",
+        "stage:quorum",
+        "consensus:final",
+    }
+    assert len([node for node in graph_payload["nodes"] if node["kind"] == "agent"]) == 2
+    assert not any(node["kind"] == "simulation" for node in graph_payload["nodes"])
 
     with SessionLocal() as session:
         run = session.get(ConsensusSession, session_id)
@@ -998,6 +1013,23 @@ def test_dashboard_matrix_and_manifest(client: TestClient) -> None:
     assert run_status_response.status_code == 200
     assert run_status_response.json()["simulation_artifacts"][0]["input"]["conflicts"][0]["components"] == ["dP"]
     assert run_status_response.json()["simulation_artifacts"][0]["output"]["evidence_status"] == "modelled"
+
+    graph_response = client.get(f"/api/scenarios/{scenario_id}/runs/{run_id}/graph")
+    assert graph_response.status_code == 200
+    graph = graph_response.json()
+    nodes = {node["id"]: node for node in graph["nodes"]}
+    edges = {edge["id"]: edge for edge in graph["edges"]}
+    assert nodes["simulation:1"]["status"] == "SUCCEEDED"
+    assert nodes["simulation:1"]["details"]["artifact_id"] > 0
+    assert nodes["simulation:1"]["details"]["output"]["evidence_status"] == "modelled"
+    assert nodes["stage:ddr"]["details"]["disagreement_count"] == 1
+    assert nodes["stage:ddr"]["details"]["simulation_trigger_count"] == 1
+    assert edges["edge:ddr-simulation:1"]["kind"] == "escalation"
+    assert edges["edge:simulation-feedback:1"]["kind"] == "feedback"
+    assert edges["edge:simulation-feedback:1"]["target"] == "stage:simulation-consensus:1"
+    assert graph["summary"]["simulation_triggered"] is True
+    assert "chain_of_thought" not in json.dumps(graph)
+    assert "raw_json" not in json.dumps(graph)
     assert dashboard.status_code == 200
     payload: dict[str, Any] = dashboard.json()
     assert payload["latest_metric"]["convergence_status"] == "INFEASIBLE"

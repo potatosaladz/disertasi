@@ -745,6 +745,7 @@ def _run_consensus_round(
 ) -> tuple[list[tuple[Agent, SRRResponse]], int]:
     consensus_results: list[tuple[Agent, SRRResponse]] = []
     round_tokens = 0
+    log_stage = "SIMULATION_CONSENSUS" if simulation_output is not None else "CONSENSUS"
     effective_peer_outputs = list(peer_outputs)
     if simulation_output is not None:
         effective_peer_outputs.append(
@@ -783,7 +784,7 @@ def _run_consensus_round(
                 consensus_results.append((agent, initial_response))
                 logs.append(
                     _log(
-                        "CONSENSUS",
+                        log_stage,
                         "WARNING",
                         f"{agent.name}: review response did not pass schema validation; retained validated SRR artifacts.",
                     )
@@ -791,7 +792,7 @@ def _run_consensus_round(
                 emit(logs)
                 continue
             consensus_results.append((agent, reviewed))
-            logs.append(_log("CONSENSUS", "SUCCESS", f"{agent.name}: peer review completed with {token_usage} tokens."))
+            logs.append(_log(log_stage, "SUCCESS", f"{agent.name}: peer review completed with {token_usage} tokens."))
             emit(logs)
             reasoning_log = reasoning_by_agent.get(agent.id)
             if reasoning_log is not None:
@@ -809,7 +810,7 @@ def _run_consensus_round(
             consensus_results.append((agent, initial_response))
             logs.append(
                 _log(
-                    "CONSENSUS",
+                    log_stage,
                     "WARNING",
                     f"{agent.name}: {type(error).__name__}; retained validated SRR artifacts.",
                 )

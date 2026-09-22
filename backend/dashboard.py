@@ -12,6 +12,7 @@ from .agent_templates import agent_revision, resolve_agent_system_prompt
 from .celery_client import celery_client
 from .core_algorithms import build_agent_system_prompt, resolve_llm_runtime_config
 from .database import SessionLocal
+from .graph_network import run_graph_payload
 from .mandate_snapshots import refresh_mandate_snapshot
 from .models import (
     Agent,
@@ -564,6 +565,26 @@ def run_status(task_id: str) -> dict[str, Any]:
     elif result.failed():
         payload["error"] = str(result.result)
     return payload
+
+
+@router.get("/runs/{task_id}/graph")
+def run_graph(task_id: str) -> dict[str, Any]:
+    with SessionLocal() as session:
+        run = session.scalar(
+            select(ConsensusSession).where(ConsensusSession.celery_task_id == task_id)
+        )
+        if run is None:
+            raise HTTPException(status_code=404, detail="Consensus run not found")
+        return run_graph_payload(session, run)
+
+
+@router.get("/scenarios/{scenario_id}/runs/{session_id}/graph")
+def scenario_run_graph(scenario_id: int, session_id: str) -> dict[str, Any]:
+    with SessionLocal() as session:
+        run = session.get(ConsensusSession, session_id)
+        if run is None or run.scenario_id != scenario_id:
+            raise HTTPException(status_code=404, detail="Consensus run not found")
+        return run_graph_payload(session, run)
 
 
 @router.get("/scenarios/{scenario_id}/dashboard")
