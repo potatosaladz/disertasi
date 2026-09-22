@@ -81,7 +81,7 @@ type Dashboard = {
   influence_observations: Influence[];
 };
 type RunLog = { stage: string; level: string; message: string };
-type RunState = { task_id: string; session_id: string; scenario_id: number; status: string; logs: RunLog[]; result?: { metric_snapshot_id: number; session_id: string; scenario_id: number } | null; error?: string };
+type RunState = { task_id: string | null; session_id: string; scenario_id: number; status: "QUEUED" | "RUNNING" | "SUCCEEDED" | "FAILED"; logs: RunLog[]; progress_stage?: string | null; result?: Record<string, unknown> | null; error?: string | null; created_at?: string | null; started_at?: string | null; completed_at?: string | null };
 type AgentDomainRules = { agent_id: number; name: string; role: string; template_key: string | null; mandate: string | null; primary_sources: string[]; constraints: string[]; owned_checks: string[]; synthesis_status: "generated" | "fallback"; scenario_mandate: string | null; scenario_focus: string[]; priority_questions: string[]; required_evidence: string[]; epistemic_logic_traceability: string[]; structured_consensus_protocol: string[]; regulatory_compliance_alignment: string[]; llm_model: string | null; token_usage: number | null; error: { code: string; message: string } | null };
 type DomainRules = { scenario_id: number; revision: string; generated: boolean; stale: boolean; agent_count: number; rules: { hard_constraints?: string[]; owned_checks?: string[]; principles?: string[]; primary_sources?: string[]; automatic_deficit_ceiling?: number }; agent_rules: AgentDomainRules[]; status: "success" | "partial" | "failed" | "stale" | "missing"; generated_count: number; failure_count: number; detail: string | null };
 type AgentForm = Omit<Agent, "id" | "has_llm_api_key" | "template_key" | "system_prompt"> & { llm_api_key: string };
@@ -158,8 +158,8 @@ export default function Home() {
   }
 
   function appendQueueLog(taskId: string, logs: RunLog[]) {
-    setTrackerHistory((current) => [...current, ...logs]);
-    trackerLogCounts.current[taskId] = 0;
+    setTrackerHistory(logs);
+    trackerLogCounts.current = { [taskId]: logs.length };
   }
 
   async function loadTemplates() {
@@ -183,8 +183,9 @@ export default function Home() {
     if (selectedScenario === null && nextScenarios.length > 0) setSelectedScenario(nextScenarios[nextScenarios.length - 1].id);
   }
 
-  async function loadDashboard(id: number) {
-    const response = await fetch(`${apiUrl}/api/scenarios/${id}/dashboard?refresh=${Date.now()}`, { cache: "no-store" });
+  async function loadDashboard(id: number, sessionId?: string) {
+    const sessionQuery = sessionId ? `&session_id=${encodeURIComponent(sessionId)}` : "";
+    const response = await fetch(`${apiUrl}/api/scenarios/${id}/dashboard?refresh=${Date.now()}${sessionQuery}`, { cache: "no-store" });
     if (!response.ok) {
       const detail = await response.text();
       throw new Error(detail || `Dashboard unavailable (${response.status})`);
@@ -194,6 +195,20 @@ export default function Home() {
     setDomainRules(payload.domain_rules);
   }
 
+  async function loadLatestRun(id: number) {
+    const response = await fetch(`${apiUrl}/api/scenarios/${id}/runs/latest?refresh=${Date.now()}`, { cache: "no-store" });
+    if (response.status === 404) {
+      setRun(null);
+      setTrackerHistory([]);
+      return;
+    }
+    if (!response.ok) throw new Error(`Run history unavailable (${response.status})`);
+    const payload: RunState = await response.json();
+    setRun(payload);
+    setTrackerHistory(payload.logs ?? []);
+    if (payload.task_id) trackerLogCounts.current[payload.task_id] = payload.logs?.length ?? 0;
+    if (payload.status === "SUCCEEDED" && payload.scenario_id === id) await loadDashboard(id, payload.session_id);
+  }
   async function loadDomainRules(id: number) {
     const response = await fetch(`${apiUrl}/api/scenarios/${id}/domain-rules?refresh=${Date.now()}`, { cache: "no-store" });
     if (!response.ok) {
@@ -215,7 +230,11 @@ export default function Home() {
     loadTemplates().catch((error) => setNotice(`Template agen gagal dimuat: ${error.message}`));
     loadSetup().catch(() => setNotice("API connection pending. Check the backend URL."));
   }, []);
-  useEffect(() => { if (selectedScenario !== null) loadDashboard(selectedScenario).catch(() => setNotice("No dashboard data for this scenario yet.")); }, [selectedScenario]);
+  useEffect(() => {
+    if (selectedScenario !== null) {
+      Promise.all([loadDashboard(selectedScenario), loadLatestRun(selectedScenario)]).catch(() => setNotice("No dashboard or run history data for this scenario yet."));
+    }
+  }, [selectedScenario]);
   useEffect(() => {
     const consoleElement = trackerConsoleRef.current;
     if (consoleElement) consoleElement.scrollTop = consoleElement.scrollHeight;
@@ -224,6 +243,10 @@ export default function Home() {
   useEffect(() => {
     if (!run || ["SUCCEEDED", "FAILED"].includes(run.status)) return;
     const timer = window.setInterval(async () => {
+      if (!run.task_id) {
+        await loadLatestRun(run.scenario_id);
+        return;
+      }
       const response = await fetch(`${apiUrl}/api/runs/${run.task_id}`, { cache: "no-store" });
       if (!response.ok) {
         setNotice(`Tracker API error (${response.status}).`);
@@ -231,10 +254,12 @@ export default function Home() {
       }
       const nextRun: RunState = await response.json();
       setRun(nextRun);
-      appendTrackerLogs(nextRun.task_id, nextRun.logs);
+      if (nextRun.task_id) appendTrackerLogs(nextRun.task_id, nextRun.logs);
       if (nextRun.status === "SUCCEEDED" && selectedScenario === nextRun.scenario_id) {
-        await loadDashboard(nextRun.scenario_id);
+        await loadDashboard(nextRun.scenario_id, nextRun.session_id);
         setNotice("Cycle complete. Dashboard metrics refreshed from PostgreSQL.");
+      } else if (nextRun.status === "FAILED") {
+        setNotice(nextRun.error ?? "Cycle failed. Persisted logs remain available in Live Tracker.");
       }
     }, 1200);
     return () => window.clearInterval(timer);

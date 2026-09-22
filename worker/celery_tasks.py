@@ -29,6 +29,7 @@ from backend.core_algorithms import (
     validate_decision_artifacts,
 )
 from backend.database import SessionLocal
+from backend.mandate_snapshots import refresh_mandate_snapshot
 from backend.models import (
     Agent,
     AgentInfluenceObservation,
@@ -50,6 +51,35 @@ ProgressReporter = Callable[[list[dict[str, str]]], None]
 
 def _log(stage: str, level: str, message: str) -> dict[str, str]:
     return {"stage": stage, "level": level, "message": message}
+
+
+def _merge_run_logs(
+    stored_logs: list[dict[str, str]] | None,
+    cycle_logs: list[dict[str, str]],
+) -> list[dict[str, str]]:
+    if cycle_logs and cycle_logs[0].get("stage") == "QUEUE":
+        return [dict(log) for log in cycle_logs]
+    queue_logs = [
+        dict(log) for log in stored_logs or [] if log.get("stage") == "QUEUE"
+    ]
+    return [*queue_logs, *(dict(log) for log in cycle_logs)]
+
+
+def persist_run_progress(
+    scenario_id: int,
+    session_id: str,
+    logs: list[dict[str, str]],
+) -> None:
+    with SessionLocal() as session:
+        run = session.get(ConsensusSession, session_id)
+        if run is None or run.scenario_id != scenario_id:
+            raise ValueError("Consensus session is missing or does not belong to the scenario")
+        run.logs = _merge_run_logs(run.logs, logs)
+        run.progress_stage = logs[-1]["stage"] if logs else run.progress_stage
+        if run.status == "QUEUED":
+            run.status = "RUNNING"
+            run.started_at = run.started_at or datetime.now(timezone.utc)
+        session.commit()
 
 
 def _extract_llm_response(response: object) -> tuple[str, int]:
@@ -177,18 +207,42 @@ def _load_session_context(
     if snapshot is None or snapshot.scenario_id != scenario_id:
         raise ValueError("Mandate snapshot is missing or does not belong to the scenario")
     current_agent_ids = {agent.id for agent in agents}
+    is_stale = (
+        snapshot.revision != agent_revision(agents, scenario)
+        or snapshot.agent_count != len(agents)
+    )
+    if is_stale:
+        logger.warning(
+            "Mandate snapshot %s for session %s is stale; refreshing automatically",
+            snapshot.revision,
+            session_id,
+        )
+        snapshot = refresh_mandate_snapshot(session, scenario, agents, snapshot)
+        run.mandate_snapshot_id = snapshot.id
+        run.mandate_revision = snapshot.revision
+        run.mandate_payload = {
+            "rules": snapshot.rules,
+            "agent_rules": snapshot.agent_rules,
+        }
+        session.flush()
     mandate_agent_ids = {
         item.get("agent_id")
         for item in run.mandate_payload.get("agent_rules", [])
         if isinstance(item, dict)
     }
-    if (
-        snapshot.revision != agent_revision(agents, scenario)
-        or snapshot.agent_count != len(agents)
-        or run.mandate_revision != snapshot.revision
-        or mandate_agent_ids != current_agent_ids
-    ):
-        raise ValueError("Mandate snapshot is stale; generate mandates again before deliberation")
+    if run.mandate_revision != snapshot.revision or mandate_agent_ids != current_agent_ids:
+        logger.warning(
+            "Consensus session %s mandate payload is stale; synchronizing with snapshot %s",
+            session_id,
+            snapshot.revision,
+        )
+        run.mandate_snapshot_id = snapshot.id
+        run.mandate_revision = snapshot.revision
+        run.mandate_payload = {
+            "rules": snapshot.rules,
+            "agent_rules": snapshot.agent_rules,
+        }
+        session.flush()
     return scenario, agents, snapshot, run
 def _default_llm_call(
     agent: Agent,
@@ -335,7 +389,12 @@ def execute_full_shcr_cycle(
     started_at = perf_counter()
     caller = llm_call or _default_llm_call
     reviewer = consensus_call or (_default_consensus_call if llm_call is None else None)
-    emit = progress or (lambda _logs: None)
+    external_emit = progress or (lambda _logs: None)
+
+    def emit(current_logs: list[dict[str, str]]) -> None:
+        persist_run_progress(scenario_id, session_id, current_logs)
+        external_emit(current_logs)
+
     logs = [
         _log(
             "INITIALIZE",
@@ -352,7 +411,7 @@ def execute_full_shcr_cycle(
             session_id,
         )
         run.status = "RUNNING"
-        run.started_at = datetime.now(timezone.utc)
+        run.started_at = run.started_at or datetime.now(timezone.utc)
         session.commit()
 
         if len(agents) < 2:
@@ -452,6 +511,8 @@ def execute_full_shcr_cycle(
             emit(logs)
             run.status = "FAILED"
             run.error = failure_message
+            run.logs = _merge_run_logs(run.logs, logs)
+            run.progress_stage = "COMPLETE"
             run.completed_at = datetime.now(timezone.utc)
             session.commit()
             raise RuntimeError(failure_message)
@@ -634,14 +695,9 @@ def execute_full_shcr_cycle(
             token_usage=total_tokens,
         )
         session.add(snapshot)
-        run.status = "SUCCEEDED"
-        run.completed_at = datetime.now(timezone.utc)
-        session.commit()
-        session.refresh(snapshot)
+        session.flush()
         logs.append(_log("COMPLETE", "SUCCESS", f"Cycle completed with state {convergence_status.value}, {total_tokens} tokens, and {latency_ms:.2f} ms latency."))
-        emit(logs)
-
-        return {
+        result_payload = {
             "metric_snapshot_id": snapshot.id,
             "session_id": session_id,
             "scenario_id": scenario.id,
@@ -653,6 +709,15 @@ def execute_full_shcr_cycle(
             "token_usage": total_tokens,
             "logs": logs,
         }
+        run.result_payload = result_payload
+        run.logs = _merge_run_logs(run.logs, logs)
+        run.progress_stage = "COMPLETE"
+        run.status = "SUCCEEDED"
+        run.completed_at = datetime.now(timezone.utc)
+        session.commit()
+        emit(logs)
+
+        return result_payload
 
 
 def run_full_shcr_cycle(scenario_id: int, session_id: str) -> dict[str, Any]:

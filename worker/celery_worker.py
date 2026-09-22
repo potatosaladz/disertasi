@@ -27,10 +27,19 @@ def run_full_shcr_cycle_task(
     scenario_id: int,
     session_id: str,
 ) -> dict[str, object]:
+    latest_logs: list[dict[str, str]] = []
+
     def report(logs: list[dict[str, str]]) -> None:
+        nonlocal latest_logs
+        latest_logs = [dict(log) for log in logs]
         self.update_state(
             state="PROGRESS",
-            meta={"logs": logs, "scenario_id": scenario_id, "session_id": session_id},
+            meta={
+                "logs": logs,
+                "stage": logs[-1]["stage"] if logs else None,
+                "scenario_id": scenario_id,
+                "session_id": session_id,
+            },
         )
 
     try:
@@ -39,8 +48,21 @@ def run_full_shcr_cycle_task(
         with SessionLocal() as session:
             run = session.get(ConsensusSession, session_id)
             if run is not None and run.scenario_id == scenario_id:
+                failure_stage = run.progress_stage or (
+                    latest_logs[-1]["stage"] if latest_logs else "FAILED"
+                )
+                failure_log = {
+                    "stage": failure_stage,
+                    "level": "ERROR",
+                    "message": f"{type(error).__name__}: {error}",
+                }
+                persisted_logs = list(run.logs or [])
+                if not persisted_logs or persisted_logs[-1] != failure_log:
+                    persisted_logs.append(failure_log)
                 run.status = "FAILED"
-                run.error = f"{type(error).__name__}: {error}"
+                run.error = failure_log["message"]
+                run.logs = persisted_logs
+                run.progress_stage = failure_stage
                 run.completed_at = datetime.now(timezone.utc)
                 session.commit()
         raise

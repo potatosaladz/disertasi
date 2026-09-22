@@ -72,10 +72,17 @@ BEGIN
             celery_task_id VARCHAR(255) UNIQUE,
             status VARCHAR(20) NOT NULL DEFAULT 'QUEUED',
             error TEXT,
+            logs JSONB NOT NULL DEFAULT '[]'::jsonb,
+            result_payload JSONB,
+            progress_stage VARCHAR(50),
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             started_at TIMESTAMPTZ,
             completed_at TIMESTAMPTZ
         );
+        ALTER TABLE consensus_sessions
+            ADD COLUMN IF NOT EXISTS logs JSONB NOT NULL DEFAULT '[]'::jsonb,
+            ADD COLUMN IF NOT EXISTS result_payload JSONB,
+            ADD COLUMN IF NOT EXISTS progress_stage VARCHAR(50);
         CREATE INDEX IF NOT EXISTS ix_consensus_sessions_scenario_id
             ON consensus_sessions (scenario_id);
         ALTER TABLE IF EXISTS reasoning_logs ADD COLUMN IF NOT EXISTS run_id VARCHAR(36) REFERENCES consensus_sessions(id) ON DELETE CASCADE;

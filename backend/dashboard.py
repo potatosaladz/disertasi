@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
 
@@ -11,6 +12,7 @@ from .agent_templates import agent_revision, resolve_agent_system_prompt
 from .celery_client import celery_client
 from .core_algorithms import build_agent_system_prompt, resolve_llm_runtime_config
 from .database import SessionLocal
+from .mandate_snapshots import refresh_mandate_snapshot
 from .models import (
     Agent,
     AgentInfluenceObservation,
@@ -306,6 +308,13 @@ def _dashboard_payload(scenario_id: int, session_id: str | None = None) -> dict[
 @router.post("/scenarios/{scenario_id}/runs", status_code=status.HTTP_202_ACCEPTED)
 def start_run(scenario_id: int) -> dict[str, Any]:
     session_id = str(uuid4())
+    queue_logs = [
+        {
+            "stage": "QUEUE",
+            "level": "INFO",
+            "message": "Cycle queued for worker execution.",
+        }
+    ]
     with SessionLocal() as session:
         scenario = session.get(Scenario, scenario_id)
         if scenario is None:
@@ -323,11 +332,43 @@ def start_run(scenario_id: int) -> dict[str, Any]:
                 ScenarioMandateSnapshot.revision == current_revision,
             )
         )
+        if mandate_snapshot is None:
+            stale_snapshot = session.scalar(
+                select(ScenarioMandateSnapshot)
+                .where(ScenarioMandateSnapshot.scenario_id == scenario_id)
+                .order_by(
+                    ScenarioMandateSnapshot.updated_at.desc(),
+                    ScenarioMandateSnapshot.id.desc(),
+                )
+            )
+            if stale_snapshot is not None:
+                mandate_snapshot = refresh_mandate_snapshot(
+                    session,
+                    scenario,
+                    agents,
+                    stale_snapshot,
+                )
         snapshot_agent_ids = {
             item.get("agent_id")
             for item in mandate_snapshot.agent_rules
             if isinstance(item, dict)
         } if mandate_snapshot is not None else set()
+        if mandate_snapshot is not None and (
+            not mandate_snapshot.generated
+            or mandate_snapshot.agent_count != len(agents)
+            or snapshot_agent_ids != {agent.id for agent in agents}
+        ):
+            mandate_snapshot = refresh_mandate_snapshot(
+                session,
+                scenario,
+                agents,
+                mandate_snapshot,
+            )
+            snapshot_agent_ids = {
+                item.get("agent_id")
+                for item in mandate_snapshot.agent_rules
+                if isinstance(item, dict)
+            }
         if (
             mandate_snapshot is None
             or not mandate_snapshot.generated
@@ -362,13 +403,29 @@ def start_run(scenario_id: int) -> dict[str, Any]:
                 "agent_rules": mandate_snapshot.agent_rules,
             },
             status="QUEUED",
+            logs=queue_logs,
+            progress_stage="QUEUE",
         )
         session.add(run)
         session.commit()
-    task = celery_client.send_task(
-        "shcr.run_full_shcr_cycle",
-        args=[scenario_id, session_id],
-    )
+    try:
+        task = celery_client.send_task(
+            "shcr.run_full_shcr_cycle",
+            args=[scenario_id, session_id],
+        )
+    except Exception as error:
+        with SessionLocal() as session:
+            run_record = session.get(ConsensusSession, session_id)
+            if run_record is not None:
+                run_record.status = "FAILED"
+                run_record.error = f"Task dispatch failed: {type(error).__name__}: {error}"
+                run_record.progress_stage = "DISPATCH_FAILED"
+                run_record.completed_at = datetime.now(timezone.utc)
+                session.commit()
+        raise HTTPException(
+            status_code=503,
+            detail="Consensus cycle could not be dispatched to the worker",
+        ) from error
     with SessionLocal() as session:
         run_record = session.get(ConsensusSession, session_id)
         if run_record is not None:
@@ -379,17 +436,65 @@ def start_run(scenario_id: int) -> dict[str, Any]:
         "session_id": session_id,
         "scenario_id": scenario_id,
         "status": "QUEUED",
-        "logs": [{"stage": "QUEUE", "level": "INFO", "message": "Cycle queued for worker execution."}],
+        "logs": queue_logs,
     }
+
+
+def _run_payload(session: ConsensusSession) -> dict[str, Any]:
+    return {
+        "task_id": session.celery_task_id,
+        "session_id": session.id,
+        "scenario_id": session.scenario_id,
+        "status": session.status,
+        "logs": list(session.logs or []),
+        "result": session.result_payload,
+        "error": session.error,
+        "progress_stage": session.progress_stage,
+        "created_at": session.created_at.isoformat() if session.created_at else None,
+        "started_at": session.started_at.isoformat() if session.started_at else None,
+        "completed_at": session.completed_at.isoformat() if session.completed_at else None,
+    }
+
+
+@router.get("/scenarios/{scenario_id}/runs")
+def scenario_runs(scenario_id: int) -> list[dict[str, Any]]:
+    with SessionLocal() as session:
+        if session.get(Scenario, scenario_id) is None:
+            raise HTTPException(status_code=404, detail="Scenario not found")
+        runs = list(
+            session.scalars(
+                select(ConsensusSession)
+                .where(ConsensusSession.scenario_id == scenario_id)
+                .order_by(ConsensusSession.created_at.desc(), ConsensusSession.id.desc())
+            )
+        )
+        return [_run_payload(run) for run in runs]
+
+
+@router.get("/scenarios/{scenario_id}/runs/latest")
+def latest_scenario_run(scenario_id: int) -> dict[str, Any]:
+    with SessionLocal() as session:
+        if session.get(Scenario, scenario_id) is None:
+            raise HTTPException(status_code=404, detail="Scenario not found")
+        run = session.scalar(
+            select(ConsensusSession)
+            .where(ConsensusSession.scenario_id == scenario_id)
+            .order_by(ConsensusSession.created_at.desc(), ConsensusSession.id.desc())
+        )
+        if run is None:
+            raise HTTPException(status_code=404, detail="No consensus runs found")
+        return _run_payload(run)
 
 
 @router.get("/runs/{task_id}")
 def run_status(task_id: str) -> dict[str, Any]:
-    result = AsyncResult(task_id, app=celery_client)
     with SessionLocal() as session:
         run = session.scalar(
             select(ConsensusSession).where(ConsensusSession.celery_task_id == task_id)
         )
+        if run is not None:
+            return _run_payload(run)
+    result = AsyncResult(task_id, app=celery_client)
     state_map = {
         "PENDING": "QUEUED",
         "RECEIVED": "QUEUED",
@@ -405,8 +510,8 @@ def run_status(task_id: str) -> dict[str, Any]:
         "status": state_map.get(result.state, result.state),
         "logs": [],
         "result": None,
-        "session_id": run.id if run else None,
-        "scenario_id": run.scenario_id if run else None,
+        "session_id": None,
+        "scenario_id": None,
     }
     if isinstance(result.info, dict):
         payload["logs"] = result.info.get("logs", [])

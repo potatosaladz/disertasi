@@ -811,9 +811,117 @@ def test_run_submission_and_status(client: TestClient, monkeypatch: pytest.Monke
     response = client.post(f"/api/scenarios/{scenario_id}/runs")
     assert response.status_code == 202
     assert response.json()["task_id"] == "task-phase5"
+    session_id = response.json()["session_id"]
+
+    latest = client.get(f"/api/scenarios/{scenario_id}/runs/latest")
+    history = client.get(f"/api/scenarios/{scenario_id}/runs")
+    status_response = client.get("/api/runs/task-phase5")
+
+    assert latest.status_code == 200
+    assert latest.json()["session_id"] == session_id
+    assert latest.json()["status"] == "QUEUED"
+    assert latest.json()["progress_stage"] == "QUEUE"
+    assert latest.json()["logs"][0]["stage"] == "QUEUE"
+    assert history.status_code == 200
+    assert history.json()[0]["session_id"] == session_id
+    assert status_response.status_code == 200
+    assert status_response.json()["session_id"] == session_id
+    assert status_response.json()["logs"] == response.json()["logs"]
 
     with SessionLocal() as session:
+        run = session.get(ConsensusSession, session_id)
+        assert run is not None
+        assert run.scenario_id == scenario_id
+        assert run.celery_task_id == "task-phase5"
+        assert run.logs == response.json()["logs"]
+        assert run.progress_stage == "QUEUE"
         session.delete(session.get(Scenario, scenario_id))
+        session.execute(delete(Agent).where(Agent.id.in_(agent_ids)))
+        session.commit()
+
+
+def test_run_submission_refreshes_stale_mandate_snapshot(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with SessionLocal() as session:
+        scenario = Scenario(
+            description=f"Stale run test {uuid.uuid4()}",
+            max_deficit_constraint=3.0,
+        )
+        agents = [
+            Agent(
+                name=f"stale-run-{uuid.uuid4()}",
+                role="Fiscal",
+                llm_base_url="https://fiscal.example/v1",
+                llm_api_key="fiscal-secret",
+                llm_model="fiscal-model",
+            ),
+            Agent(
+                name=f"stale-run-{uuid.uuid4()}",
+                role="Risk",
+                llm_base_url="https://risk.example/v1",
+                llm_api_key="risk-secret",
+                llm_model="risk-model",
+            ),
+        ]
+        session.add_all([scenario, *agents])
+        session.flush()
+        stale_revision = agent_revision(agents, scenario)
+        stale_snapshot = ScenarioMandateSnapshot(
+            scenario_id=scenario.id,
+            revision=stale_revision,
+            generated=True,
+            agent_count=2,
+            rules={},
+            agent_rules=[
+                {
+                    "agent_id": agent.id,
+                    "name": agent.name,
+                    "role": agent.role,
+                    "scenario_mandate": f"Mandate for {agent.name}",
+                    "synthesis_status": "generated",
+                }
+                for agent in agents
+            ],
+            status="success",
+            generated_count=2,
+            failure_count=0,
+        )
+        session.add(stale_snapshot)
+        session.flush()
+        agents[0].role = "Updated Fiscal"
+        session.commit()
+        scenario_id = scenario.id
+        agent_ids = [agent.id for agent in agents]
+
+    class FakeTask:
+        id = "task-stale-refresh"
+
+    monkeypatch.setattr(celery_client, "send_task", lambda *_args, **_kwargs: FakeTask())
+    response = client.post(f"/api/scenarios/{scenario_id}/runs")
+
+    assert response.status_code == 202
+    with SessionLocal() as session:
+        run = session.scalar(
+            select(ConsensusSession).where(
+                ConsensusSession.id == response.json()["session_id"]
+            )
+        )
+        current_scenario = session.get(Scenario, scenario_id)
+        current_agents = list(
+            session.scalars(
+                select(Agent)
+                .where(Agent.id.in_(agent_ids))
+                .order_by(Agent.id)
+            )
+        )
+        assert run is not None
+        assert current_scenario is not None
+        assert run.mandate_revision == agent_revision(current_agents, current_scenario)
+        assert run.mandate_revision != stale_revision
+        assert run.mandate_payload["agent_rules"][0]["role"] == "Updated Fiscal"
+        session.delete(current_scenario)
         session.execute(delete(Agent).where(Agent.id.in_(agent_ids)))
         session.commit()
 

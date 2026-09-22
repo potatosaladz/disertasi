@@ -17,6 +17,26 @@ _AGENT_COLUMNS: dict[str, str] = {
     "max_tokens": "INTEGER NOT NULL DEFAULT 4000",
 }
 
+_CONSENSUS_SESSION_COLUMNS: dict[str, str] = {
+    "logs": "JSONB NOT NULL DEFAULT '[]'::jsonb",
+    "result_payload": "JSONB",
+    "progress_stage": "VARCHAR(50)",
+}
+
+
+def _upgrade_consensus_sessions_table() -> None:
+    inspector = inspect(engine)
+    if "consensus_sessions" not in inspector.get_table_names():
+        return
+    columns = {column["name"] for column in inspector.get_columns("consensus_sessions")}
+    with engine.begin() as connection:
+        for name, definition in _CONSENSUS_SESSION_COLUMNS.items():
+            if name not in columns:
+                connection.execute(
+                    text(f'ALTER TABLE consensus_sessions ADD COLUMN "{name}" {definition}')
+                )
+
+
 _SESSION_COLUMNS: dict[str, str] = {
     "reasoning_logs": 'VARCHAR(36) REFERENCES consensus_sessions(id) ON DELETE CASCADE',
     "disagreement_logs": 'VARCHAR(36) REFERENCES consensus_sessions(id) ON DELETE CASCADE',
@@ -106,6 +126,7 @@ def initialize_database() -> None:
     Agent.metadata.create_all(bind=engine)
     _upgrade_agents_table()
     _upgrade_scenarios_table()
+    _upgrade_consensus_sessions_table()
     _upgrade_session_columns()
 
 

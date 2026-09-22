@@ -4,6 +4,108 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
+_NUMBER_TOKEN = r"[-+]?(?:\d{1,3}(?:[.,]\d{3})+|\d+)(?:[.,]\d+)?"
+_NUMBER_PATTERN = re.compile(_NUMBER_TOKEN)
+_PERCENT_PATTERN = re.compile(rf"(?<![\d.,])({_NUMBER_TOKEN})\s*%")
+_ZERO_PATTERN = re.compile(
+    r"^\s*(?:zero|nol|none|no impact|tanpa dampak|tidak ada dampak)\b"
+)
+_QUALITATIVE_SCORES: tuple[tuple[tuple[str, ...], float], ...] = (
+    (("very high", "sangat tinggi", "fully preserves", "optimal"), 0.9),
+    (("high", "tinggi"), 0.75),
+    (("low to medium", "rendah hingga sedang"), 0.4),
+    (("very low", "sangat rendah"), 0.1),
+    (("medium", "moderate", "sedang", "netral", "neutral"), 0.5),
+    (("low", "rendah"), 0.25),
+)
+
+
+def _parse_number_token(token: str) -> float:
+    value = token.strip()
+    if "." in value and "," in value:
+        if value.rfind(",") > value.rfind("."):
+            value = value.replace(".", "").replace(",", ".")
+        else:
+            value = value.replace(",", "")
+    elif value.count(",") > 1:
+        value = value.replace(",", "")
+    elif value.count(".") > 1:
+        value = value.replace(".", "")
+    elif "," in value:
+        value = value.replace(",", ".")
+    return float(value)
+
+
+def _clean_number(
+    value: object,
+    *,
+    prefer_percent: bool = False,
+    normalise_ratio: bool = False,
+    qualitative: bool = False,
+) -> object:
+    if isinstance(value, bool) or value is None:
+        return value
+    if isinstance(value, (int, float)):
+        number = float(value)
+    elif isinstance(value, str):
+        text = value.strip().replace("\u00a0", " ")
+        if not text:
+            return None
+        lowered = text.casefold()
+        if _ZERO_PATTERN.search(lowered):
+            return 0.0
+        if prefer_percent and re.search(r"\b(?:netral|neutral|unchanged|no change|tetap)\b", lowered):
+            return 0.0
+        percent_match = _PERCENT_PATTERN.search(text) if prefer_percent or normalise_ratio else None
+        if qualitative:
+            for labels, score in _QUALITATIVE_SCORES:
+                if any(label in lowered for label in labels):
+                    return score
+            explicit_match = re.search(
+                rf"(?:utility|score|nilai)\s*[:=]?\s*({_NUMBER_TOKEN})",
+                text,
+                flags=re.IGNORECASE,
+            ) or re.match(rf"^\s*({_NUMBER_TOKEN})(?:\s|$)", text)
+            number_match = percent_match or explicit_match
+            if number_match is None:
+                return 0.5
+        else:
+            number_match = percent_match or _NUMBER_PATTERN.search(text)
+        if number_match is None:
+            return value
+        number = _parse_number_token(number_match.group(1) if percent_match else number_match.group(0))
+        if normalise_ratio and (percent_match is not None or re.search(r"/\s*100\b", text)):
+            number /= 100.0
+    else:
+        return value
+    if normalise_ratio and 1 < number <= 100:
+        number /= 100.0
+    return number
+
+
+def _normalise_numeric_fields(
+    payload: dict[str, object],
+    fields: tuple[str, ...],
+    *,
+    prefer_percent: bool = False,
+    normalise_ratio: bool = False,
+    qualitative: bool = False,
+) -> None:
+    for field in fields:
+        if field not in payload:
+            continue
+        original = payload[field]
+        cleaned = _clean_number(
+            original,
+            prefer_percent=prefer_percent,
+            normalise_ratio=normalise_ratio,
+            qualitative=qualitative,
+        )
+        payload[field] = cleaned
+        if isinstance(original, str) and cleaned != original:
+            payload.setdefault(f"{field}_raw", original)
+
+
 class SRRItem(BaseModel):
     model_config = ConfigDict(extra="allow")
 
@@ -60,7 +162,7 @@ class Constraint(SRRItem):
 
 
 class Recommendation(SRRItem):
-    pass
+    content: str = ""
 
 
 class Alternative(BaseModel):
@@ -85,11 +187,18 @@ class Alternative(BaseModel):
                 "deficit": ("deficit_impact", "projected_deficit", "deficitImpact"),
                 "utility": ("score", "benefit", "utility_score", "utilityScore"),
             }.items():
-                if target not in payload:
+                if target not in payload or payload[target] in (None, ""):
                     for alias in aliases:
-                        if alias in payload:
+                        if alias in payload and payload[alias] not in (None, ""):
                             payload[target] = payload[alias]
                             break
+            _normalise_numeric_fields(payload, ("deficit",), prefer_percent=True)
+            _normalise_numeric_fields(
+                payload,
+                ("utility",),
+                normalise_ratio=True,
+                qualitative=True,
+            )
             return payload
         return value
 
@@ -147,18 +256,33 @@ class SRRResponse(BaseModel):
         if isinstance(payload.get("recommendation"), list):
             payload["recommendation"] = payload["recommendation"][0] if payload["recommendation"] else None
         if isinstance(payload.get("recommendation"), dict):
-            recommendation = payload["recommendation"]
+            recommendation = dict(payload["recommendation"])
             if "confidence" not in payload and isinstance(recommendation.get("confidence"), (int, float, str)):
                 payload["confidence"] = recommendation["confidence"]
-        confidence = payload.get("confidence")
-        if isinstance(confidence, str):
-            confidence = confidence.strip().rstrip("%")
-            try:
-                payload["confidence"] = float(confidence)
-            except ValueError:
-                pass
-        if isinstance(payload.get("confidence"), (int, float)) and 1 < payload["confidence"] <= 100:
-            payload["confidence"] = payload["confidence"] / 100
+            if not recommendation.get("content"):
+                for key in (
+                    "text",
+                    "decision",
+                    "action",
+                    "recommendation",
+                    "rationale",
+                    "summary",
+                    "authorized_scope",
+                ):
+                    recommendation_candidate = recommendation.get(key)
+                    if (
+                        isinstance(recommendation_candidate, str)
+                        and recommendation_candidate.strip()
+                    ):
+                        recommendation["content"] = recommendation_candidate.strip()
+                        break
+            payload["recommendation"] = recommendation if recommendation.get("content") else None
+        _normalise_numeric_fields(payload, ("confidence",), normalise_ratio=True)
+        _normalise_numeric_fields(
+            payload,
+            ("material_information_retention_macro_f1",),
+            normalise_ratio=True,
+        )
         return payload
 
     def provenance_items(self) -> list[SRRItem | Alternative]:

@@ -8,13 +8,22 @@ from backend.database import SessionLocal
 from backend.models import (
     Agent,
     AgentInfluenceObservation,
+    ConsensusSession,
     DisagreementLog,
     MetricSnapshot,
     ReasoningLog,
     Scenario,
 )
-from backend.agent_templates import AGENTS
-from worker.celery_tasks import _default_llm_call, _extract_llm_response, execute_full_shcr_cycle
+from backend.agent_templates import AGENTS, agent_revision
+from worker.celery_tasks import (
+    _create_isolated_session,
+    _default_llm_call,
+    _extract_llm_response,
+    _load_session_context,
+    _validated_response,
+    execute_full_shcr_cycle,
+    persist_run_progress,
+)
 from backend.core_algorithms import resolve_llm_runtime_config
 from worker.srr_models import Evidence, SRRResponse
 
@@ -191,7 +200,94 @@ def test_flexible_srr_response_normalises_required_artifacts() -> None:
     assert parsed.confidence == 0.75
 
 
-def test_default_llm_call_uses_canonical_template_mandate(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_flexible_srr_response_sanitises_formatted_numbers_and_optional_recommendation() -> None:
+    parsed = SRRResponse.model_validate(
+        {
+            "evidence": ["Budget baseline"],
+            "predictions": ["Revenue remains stable"],
+            "risks": ["Implementation delay"],
+            "uncertainties": ["Demand response"],
+            "alternatives": [
+                {
+                    "name": "Cohort rollout",
+                    "deficit": "2.68% of GDP (Rp689.368T total)",
+                    "utility": "Sangat tinggi; risiko nol terhadap plafon 3% PDB",
+                },
+                {
+                    "name": "Mass rollout",
+                    "deficit": "Meningkatkan defisit sekitar 0,04-0,05% PDB",
+                    "utility": "Rendah hingga sedang",
+                },
+                {
+                    "name": "Zero budget",
+                    "deficit": "Nol",
+                    "utility": "0,85",
+                },
+            ],
+            "recommendation": {"decision": "Approve cohort rollout"},
+            "confidence": "94%",
+        }
+    )
+
+    assert parsed.alternatives[0].deficit == pytest.approx(2.68)
+    assert parsed.alternatives[0].utility == pytest.approx(0.9)
+    assert parsed.alternatives[1].deficit == pytest.approx(0.05)
+    assert parsed.alternatives[1].utility == pytest.approx(0.4)
+    assert parsed.alternatives[2].deficit == 0.0
+    assert parsed.alternatives[2].utility == pytest.approx(0.85)
+    assert parsed.recommendation is not None
+    assert parsed.recommendation.content == "Approve cohort rollout"
+    assert parsed.confidence == pytest.approx(0.94)
+
+
+def test_optional_empty_recommendation_is_accepted() -> None:
+    parsed = SRRResponse.model_validate({"recommendation": {"content": ""}})
+    assert parsed.recommendation is None
+
+
+def test_validated_response_accepts_formatted_fiscal_deficits() -> None:
+    raw_json, parsed, validation_error = _validated_response(
+        json.dumps(
+            {
+                "evidence": ["Budget baseline"],
+                "predictions": ["Revenue remains stable"],
+                "risks": ["Implementation delay"],
+                "uncertainties": ["Demand response"],
+                "alternatives": [
+                    {
+                        "name": "Cohort rollout",
+                        "deficit": "2.68% of GDP (Rp689.368T total)",
+                        "utility": "Sangat tinggi; risiko nol terhadap plafon 3% PDB",
+                    },
+                    {
+                        "name": "Mass rollout",
+                        "deficit": "Rp11 triliun (~0,05% PDB)",
+                        "utility": "Sangat rendah",
+                    },
+                ],
+                "recommendation": {"action": "CONDITIONAL_APPROVAL"},
+                "confidence": "92%",
+            }
+        )
+    )
+
+    assert validation_error is None
+    assert parsed is not None
+    assert raw_json["alternatives"][0]["deficit"] == "2.68% of GDP (Rp689.368T total)"
+    assert [item.deficit for item in parsed.alternatives] == [
+        pytest.approx(2.68),
+        pytest.approx(0.05),
+    ]
+    assert parsed.alternatives[0].utility == pytest.approx(0.9)
+    assert parsed.alternatives[1].utility == pytest.approx(0.1)
+    assert parsed.recommendation is not None
+    assert parsed.recommendation.content == "CONDITIONAL_APPROVAL"
+    assert parsed.confidence == pytest.approx(0.92)
+
+
+def test_default_llm_call_uses_canonical_template_mandate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     captured: dict[str, object] = {}
 
     class FakeCompletions:
@@ -300,6 +396,49 @@ def test_runtime_configuration_rejects_placeholder_defaults() -> None:
                 llm_model="local-model",
             )
         )
+
+
+def test_worker_refreshes_snapshot_that_became_stale_after_queue(
+    scenario_id: int,
+) -> None:
+    session_id = _create_isolated_session(scenario_id)
+    with SessionLocal() as session:
+        scenario = session.get(Scenario, scenario_id)
+        agents = list(session.scalars(select(Agent).order_by(Agent.id)))
+        assert scenario is not None
+        old_revision = agent_revision(agents, scenario)
+        agents[0].role = "Updated after queue"
+        session.commit()
+
+    with SessionLocal() as session:
+        scenario, agents, snapshot, run = _load_session_context(
+            session,
+            scenario_id,
+            session_id,
+        )
+        assert snapshot.revision == agent_revision(agents, scenario)
+        assert snapshot.revision != old_revision
+        assert run.mandate_revision == snapshot.revision
+        assert run.mandate_payload["agent_rules"][0]["role"] == "Updated after queue"
+        session.rollback()
+
+
+def test_worker_progress_is_persisted(scenario_id: int) -> None:
+    session_id = _create_isolated_session(scenario_id)
+    progress_logs = [
+        {"stage": "INITIALIZE", "level": "INFO", "message": "Starting cycle."},
+        {"stage": "SRR", "level": "INFO", "message": "Calling agents."},
+    ]
+
+    persist_run_progress(scenario_id, session_id, progress_logs)
+
+    with SessionLocal() as session:
+        run = session.get(ConsensusSession, session_id)
+        assert run is not None
+        assert run.status == "RUNNING"
+        assert run.progress_stage == "SRR"
+        assert run.started_at is not None
+        assert run.logs == progress_logs
 
 
 def test_consensus_round_reviews_peer_outputs(scenario_id: int) -> None:
@@ -412,6 +551,19 @@ def test_run_full_shcr_cycle_populates_postgres(scenario_id: int) -> None:
             )
         )
         assert sum(item.normalized_weight or 0.0 for item in observations) == pytest.approx(1.0)
+
+        run = session.get(ConsensusSession, result["session_id"])
+        assert run is not None
+        assert run.status == "SUCCEEDED"
+        assert run.progress_stage == "COMPLETE"
+        assert run.started_at is not None
+        assert run.completed_at is not None
+        assert run.logs[-1]["stage"] == "COMPLETE"
+        assert run.result_payload is not None
+        assert run.result_payload["metric_snapshot_id"] == snapshot.id
+        assert run.result_payload["scenario_id"] == scenario_id
+        assert run.result_payload["session_id"] == run.id
+        assert run.result_payload["token_usage"] == 250
 
 
 def test_sparse_llm_json_fails_deliberation_quorum(scenario_id: int) -> None:
