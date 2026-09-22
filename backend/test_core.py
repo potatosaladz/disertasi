@@ -5,18 +5,27 @@ import pytest
 from backend.core_algorithms import (
     Alternative,
     HardConstraints,
+    build_agent_system_prompt,
     build_agent_user_prompt,
     build_consensus_prompt,
     build_mandate_synthesis_prompt,
     build_mandate_synthesis_system_prompt,
     calculate_dynamic_influence,
-    extract_llm_completion,
-    llm_request_headers,
-    build_agent_system_prompt,
     calculate_violation_rate,
     detect_divergence_vector,
     extract_json_object,
+    extract_llm_completion,
+    llm_request_headers,
     neuro_symbolic_filter,
+)
+from backend.simulation_agent import (
+    SIMULATION_AGENT_NAME,
+    SIMULATION_SOURCE_TAG,
+    build_deterministic_simulation,
+    build_native_simulation_agent,
+    build_simulation_consensus_prompt,
+    build_simulation_system_prompt,
+    sanitize_simulation_payload,
 )
 
 
@@ -134,6 +143,82 @@ def test_reasoning_prompts_require_decision_artifacts_and_peer_review() -> None:
     assert "evidence-backed impact claims" in user_prompt
     assert "Review the structured outputs from every agent" in consensus_prompt
     assert "Preserve valid dissent" in consensus_prompt
+
+
+def test_native_simulation_agent_is_hardcoded_and_prompted_for_safe_arbitration() -> None:
+    native_agent = build_native_simulation_agent()
+    system_prompt = build_simulation_system_prompt()
+    follow_up_prompt = build_simulation_consensus_prompt(
+        "Revenue Agent",
+        "Revenue",
+        [{"agent": "Risk Agent", "srr": {"predictions": ["lower growth"]}}],
+        {"resolution": "Use a phased implementation", "evidence_status": "modelled"},
+    )
+
+    assert native_agent.name == SIMULATION_AGENT_NAME
+    assert native_agent.llm_base_url is None
+    assert "agents" not in native_agent.__dict__
+    assert "invokes you automatically" in system_prompt
+    assert "Do not reveal hidden chain-of-thought" in system_prompt
+    assert "modelled evidence" in follow_up_prompt
+    assert "preserve valid dissent" in follow_up_prompt.lower()
+
+
+def test_deterministic_simulation_filters_hard_constraint_and_tags_outputs() -> None:
+    simulation = build_deterministic_simulation(
+        "Evaluate a fiscal programme",
+        3.0,
+        [
+            {
+                "agent_i": "Fiscal",
+                "agent_j": "Risk",
+                "components": ["dP", "dREC"],
+                "route": "Simulation Agent Requested",
+            }
+        ],
+        [
+            {
+                "agent": "Fiscal",
+                "role": "Fiscal",
+                "srr": {
+                    "alternatives": [
+                        {"name": "Feasible", "deficit": 2.4, "utility": 0.8},
+                        {"name": "Illegal", "deficit": 3.5, "utility": 0.99},
+                    ],
+                    "risks": [{"content": "Execution delay"}],
+                    "uncertainties": [{"content": "Demand response"}],
+                },
+            }
+        ],
+    )
+
+    assert simulation["agent_name"] == SIMULATION_AGENT_NAME
+    assert simulation["evidence_status"] == "modelled"
+    assert simulation["alternatives"][0]["name"] == "Feasible"
+    assert simulation["alternatives"][0]["source_tag"] == SIMULATION_SOURCE_TAG
+    assert all(item["deficit"] <= 3.0 for item in simulation["alternatives"])
+
+
+def test_simulation_payload_removes_private_reasoning_recursively() -> None:
+    payload = sanitize_simulation_payload(
+        {
+            "resolution": "Use phased implementation",
+            "analysis": "private",
+            "alternatives": [
+                {
+                    "name": "Phased",
+                    "chain_of_thought": "private",
+                    "metadata": {"hidden_reasoning": "private", "status": "modelled"},
+                }
+            ],
+        }
+    )
+
+    assert "analysis" not in payload
+    alternative = payload["alternatives"][0]
+    assert "chain_of_thought" not in alternative
+    assert "hidden_reasoning" not in alternative["metadata"]
+    assert alternative["metadata"]["status"] == "modelled"
 
 
 def test_rar_dai_zero_gate() -> None:

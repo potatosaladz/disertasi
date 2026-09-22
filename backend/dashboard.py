@@ -22,6 +22,7 @@ from .models import (
     ReasoningLog,
     Scenario,
     ScenarioMandateSnapshot,
+    SimulationArtifact,
 )
 
 router = APIRouter(prefix="/api")
@@ -109,6 +110,23 @@ def _safe_agent_rules(raw_rules: object) -> list[dict[str, Any]]:
                 rule[field] = [str(rule[field])] if rule[field] else []
         normalised.append(rule)
     return normalised
+
+
+def _simulation_payload(artifact: SimulationArtifact) -> dict[str, Any]:
+    return {
+        "id": artifact.id,
+        "session_id": artifact.run_id,
+        "scenario_id": artifact.scenario_id,
+        "trigger": artifact.trigger,
+        "round_number": artifact.round_number,
+        "status": artifact.status,
+        "simulation_version": artifact.simulation_version,
+        "input": artifact.input_payload,
+        "output": artifact.output_payload,
+        "latency_ms": artifact.latency_ms,
+        "token_usage": artifact.token_usage,
+        "created_at": artifact.created_at.isoformat(),
+    }
 
 
 def _metric_payload(snapshot: MetricSnapshot) -> dict[str, Any]:
@@ -236,6 +254,16 @@ def _dashboard_payload(scenario_id: int, session_id: str | None = None) -> dict[
             )
             .order_by(DisagreementLog.id)
         ).all()
+        simulations = list(
+            session.scalars(
+                select(SimulationArtifact)
+                .where(
+                    SimulationArtifact.scenario_id == scenario_id,
+                    SimulationArtifact.run_id == artifact_session_id,
+                )
+                .order_by(SimulationArtifact.round_number, SimulationArtifact.id)
+            )
+        )
         influences = session.execute(
             select(AgentInfluenceObservation, Agent.name)
             .join(Agent, AgentInfluenceObservation.agent_id == Agent.id)
@@ -286,6 +314,9 @@ def _dashboard_payload(scenario_id: int, session_id: str | None = None) -> dict[
                     "resolution_mechanism": _resolution_mechanism(log),
                 }
                 for log, left_name, right_name in disagreements
+            ],
+            "simulation_artifacts": [
+                _simulation_payload(artifact) for artifact in simulations
             ],
             "influence_observations": [
                 {
@@ -441,12 +472,23 @@ def start_run(scenario_id: int) -> dict[str, Any]:
 
 
 def _run_payload(session: ConsensusSession) -> dict[str, Any]:
+    with SessionLocal() as database:
+        simulations = list(
+            database.scalars(
+                select(SimulationArtifact)
+                .where(SimulationArtifact.run_id == session.id)
+                .order_by(SimulationArtifact.round_number, SimulationArtifact.id)
+            )
+        )
     return {
         "task_id": session.celery_task_id,
         "session_id": session.id,
         "scenario_id": session.scenario_id,
         "status": session.status,
         "logs": list(session.logs or []),
+        "simulation_artifacts": [
+            _simulation_payload(artifact) for artifact in simulations
+        ],
         "result": session.result_payload,
         "error": session.error,
         "progress_stage": session.progress_stage,
@@ -610,6 +652,7 @@ def reproducibility_manifest(
             ],
             "influence_observations": dashboard["influence_observations"],
             "disagreements": dashboard["disagreements"],
+            "simulation_artifacts": dashboard["simulation_artifacts"],
             "metrics": dashboard["metric_history"],
             "schema_validity_percent": dashboard["schema_validity_percent"],
         }

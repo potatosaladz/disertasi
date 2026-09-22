@@ -37,6 +37,37 @@ def _upgrade_consensus_sessions_table() -> None:
                 )
 
 
+_SIMULATION_COLUMNS: dict[str, str] = {
+    "round_number": "INTEGER NOT NULL DEFAULT 1",
+    "trigger": "VARCHAR(100) NOT NULL",
+    "input_payload": "JSONB NOT NULL",
+    "output_payload": "JSONB NOT NULL",
+    "status": "VARCHAR(30) NOT NULL",
+    "simulation_version": "VARCHAR(64) NOT NULL",
+    "latency_ms": "DOUBLE PRECISION NOT NULL DEFAULT 0",
+    "token_usage": "INTEGER NOT NULL DEFAULT 0",
+}
+
+
+def _upgrade_simulation_artifacts_table() -> None:
+    inspector = inspect(engine)
+    if "simulation_artifacts" not in inspector.get_table_names():
+        return
+    columns = {column["name"] for column in inspector.get_columns("simulation_artifacts")}
+    with engine.begin() as connection:
+        for name, definition in _SIMULATION_COLUMNS.items():
+            if name not in columns:
+                connection.execute(
+                    text(f'ALTER TABLE simulation_artifacts ADD COLUMN "{name}" {definition}')
+                )
+        connection.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_simulation_artifacts_run_id ON simulation_artifacts (run_id)"
+        ))
+        connection.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_simulation_artifacts_scenario_id ON simulation_artifacts (scenario_id)"
+        ))
+
+
 _SESSION_COLUMNS: dict[str, str] = {
     "reasoning_logs": 'VARCHAR(36) REFERENCES consensus_sessions(id) ON DELETE CASCADE',
     "disagreement_logs": 'VARCHAR(36) REFERENCES consensus_sessions(id) ON DELETE CASCADE',
@@ -127,6 +158,7 @@ def initialize_database() -> None:
     _upgrade_agents_table()
     _upgrade_scenarios_table()
     _upgrade_consensus_sessions_table()
+    _upgrade_simulation_artifacts_table()
     _upgrade_session_columns()
 
 

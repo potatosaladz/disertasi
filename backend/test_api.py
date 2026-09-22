@@ -19,6 +19,7 @@ from backend.models import (
     ReasoningLog,
     Scenario,
     ScenarioMandateSnapshot,
+    SimulationArtifact,
 )
 
 
@@ -958,6 +959,7 @@ def test_dashboard_matrix_and_manifest(client: TestClient) -> None:
                 mandate_snapshot_id=mandate.id,
                 mandate_revision=revision,
                 mandate_payload={"rules": {}, "agent_rules": mandate.agent_rules},
+                celery_task_id=f"simulation-dashboard-{run_id}",
                 status="SUCCEEDED",
             )
         )
@@ -968,18 +970,41 @@ def test_dashboard_matrix_and_manifest(client: TestClient) -> None:
             ReasoningLog(run_id=run_id, agent_id=agent_j.id, scenario_id=scenario.id, raw_json={"prompt": "j"}, parsed_srr_objects={"evidence": []}, is_schema_valid=False, provenance_count=0),
         ])
         session.add(DisagreementLog(run_id=run_id, scenario_id=scenario.id, agent_i=agent_i.id, agent_j=agent_j.id, dE=True, dP=True, dREC=False))
+        session.add(
+            SimulationArtifact(
+                run_id=run_id,
+                scenario_id=scenario.id,
+                trigger="Simulation Agent Requested",
+                round_number=1,
+                input_payload={"conflicts": [{"components": ["dP"]}]},
+                output_payload={
+                    "agent_name": "Simulation Agent / Arbiter Simulasi Makro-Fiskal",
+                    "resolution": "Use a phased compromise",
+                    "evidence_status": "modelled",
+                },
+                status="SUCCEEDED",
+                simulation_version="native-simulation-v1",
+                latency_ms=10.0,
+                token_usage=20,
+            )
+        )
         session.commit()
         scenario_id = scenario.id
 
     dashboard = client.get(
         f"/api/scenarios/{scenario_id}/dashboard?session_id={run_id}"
     )
+    run_status_response = client.get(f"/api/runs/simulation-dashboard-{run_id}")
+    assert run_status_response.status_code == 200
+    assert run_status_response.json()["simulation_artifacts"][0]["input"]["conflicts"][0]["components"] == ["dP"]
+    assert run_status_response.json()["simulation_artifacts"][0]["output"]["evidence_status"] == "modelled"
     assert dashboard.status_code == 200
     payload: dict[str, Any] = dashboard.json()
     assert payload["latest_metric"]["convergence_status"] == "INFEASIBLE"
     assert payload["schema_validity_percent"] == 50.0
     assert payload["disagreements"][0]["dE"] is True
     assert payload["disagreements"][0]["resolution_mechanism"] == "Provenance Retrieval Triggered"
+    assert payload["simulation_artifacts"][0]["output"]["evidence_status"] == "modelled"
 
     manifest = client.get(f"/api/scenarios/{scenario_id}/manifest")
     assert manifest.status_code == 200
@@ -988,9 +1013,11 @@ def test_dashboard_matrix_and_manifest(client: TestClient) -> None:
     assert "llm_api_key" not in manifest_payload["agents"][0]
     assert manifest_payload["llm_outputs"][0]["raw_json"]["prompt"] in {"i", "j"}
     assert manifest_payload["metrics"][0]["convergence_status"] == "INFEASIBLE"
+    assert manifest_payload["simulation_artifacts"][0]["output"]["resolution"] == "Use a phased compromise"
 
     with SessionLocal() as session:
         session.execute(delete(DisagreementLog).where(DisagreementLog.scenario_id == scenario_id))
+        session.execute(delete(SimulationArtifact).where(SimulationArtifact.scenario_id == scenario_id))
         session.execute(delete(ReasoningLog).where(ReasoningLog.scenario_id == scenario_id))
         session.execute(delete(MetricSnapshot).where(MetricSnapshot.scenario_id == scenario_id))
         session.execute(delete(Scenario).where(Scenario.id == scenario_id))

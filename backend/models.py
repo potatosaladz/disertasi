@@ -156,6 +156,38 @@ class ConsensusSession(Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
+class SimulationArtifact(Base):
+    __tablename__ = "simulation_artifacts"
+    __table_args__ = (
+        UniqueConstraint(
+            "run_id",
+            "simulation_version",
+            "round_number",
+            name="uq_simulation_run_version_round",
+        ),
+        CheckConstraint("round_number > 0", name="ck_simulation_round_positive"),
+        CheckConstraint("latency_ms >= 0", name="ck_simulation_latency_nonnegative"),
+        CheckConstraint("token_usage >= 0", name="ck_simulation_tokens_nonnegative"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    run_id: Mapped[str] = mapped_column(
+        ForeignKey("consensus_sessions.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    scenario_id: Mapped[int] = mapped_column(
+        ForeignKey("scenarios.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    trigger: Mapped[str] = mapped_column(String(100), nullable=False)
+    round_number: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")
+    input_payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    output_payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    status: Mapped[str] = mapped_column(String(30), nullable=False)
+    simulation_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    latency_ms: Mapped[float] = mapped_column(Float, nullable=False, default=0.0, server_default="0")
+    token_usage: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 class ReasoningLog(Base):
     __tablename__ = "reasoning_logs"
     __table_args__ = (

@@ -3,7 +3,7 @@ import socket
 from collections.abc import Callable
 from datetime import datetime, timezone
 from time import perf_counter
-from typing import Any
+from typing import Any, Protocol
 from uuid import uuid4
 
 from openai import APIConnectionError, APITimeoutError, OpenAI
@@ -40,12 +40,49 @@ from backend.models import (
     ReasoningLog,
     Scenario,
     ScenarioMandateSnapshot,
+    SimulationArtifact,
 )
-from worker.srr_models import SRRResponse
+from backend.simulation_agent import (
+    MAX_SIMULATION_ROUNDS,
+    SIMULATION_AGENT_NAME,
+    SIMULATION_AGENT_VERSION,
+    SIMULATION_TRIGGER,
+    build_deterministic_simulation,
+    build_simulation_consensus_prompt,
+    build_simulation_prompt,
+    build_simulation_system_prompt,
+    resolve_simulation_runtime_agent,
+    sanitize_simulation_payload,
+)
+from worker.srr_models import SRRResponse, SimulationResponse
 
 logger = logging.getLogger(__name__)
+class LLMConfiguredAgent(Protocol):
+    @property
+    def name(self) -> str: ...
+
+    @property
+    def llm_base_url(self) -> str | None: ...
+
+    @property
+    def llm_api_key(self) -> str | None: ...
+
+    @property
+    def llm_model(self) -> str | None: ...
+
+    @property
+    def temperature(self) -> float: ...
+
+    @property
+    def max_tokens(self) -> int: ...
+
+
 LLMCaller = Callable[[Agent, Scenario], tuple[str, int]]
 ConsensusCaller = Callable[[Agent, Scenario, list[dict[str, Any]]], tuple[str, int]]
+SimulationCaller = Callable[
+    [Scenario, list[dict[str, Any]], list[dict[str, Any]]],
+    tuple[str, int],
+]
 ProgressReporter = Callable[[list[dict[str, str]]], None]
 
 
@@ -87,7 +124,7 @@ def _extract_llm_response(response: object) -> tuple[str, int]:
 
 
 def _create_llm_completion(
-    agent: Agent,
+    agent: LLMConfiguredAgent,
     messages: list[ChatCompletionMessageParam],
     operation: str,
 ) -> tuple[str, int]:
@@ -309,14 +346,78 @@ def _default_consensus_call(
         ],
         "consensus_review",
     )
+def _default_simulation_call(
+    scenario: Scenario,
+    conflicts: list[dict[str, Any]],
+    peer_outputs: list[dict[str, Any]],
+    agents: list[Agent],
+) -> tuple[str, int]:
+    runtime_source = resolve_simulation_runtime_agent(agents)
+    if runtime_source is None:
+        raise ValueError("No configured LLM runtime is available for the native Simulation Agent")
+    return _create_llm_completion(
+        runtime_source,
+        [
+            {"role": "system", "content": build_simulation_system_prompt()},
+            {
+                "role": "user",
+                "content": build_simulation_prompt(
+                    scenario.description,
+                    scenario.program_cost,
+                    scenario.max_deficit_constraint,
+                    conflicts,
+                    peer_outputs,
+                ),
+            },
+        ],
+        "native_simulation_arbitration",
+    )
 
+
+def _default_simulation_consensus_call(
+    agent: Agent,
+    scenario: Scenario,
+    peer_outputs: list[dict[str, Any]],
+    simulation_output: dict[str, Any],
+    scenario_mandate: str | None = None,
+) -> tuple[str, int]:
+    return _create_llm_completion(
+        agent,
+        [
+            {
+                "role": "system",
+                "content": build_agent_system_prompt(
+                    agent.role,
+                    resolve_agent_system_prompt(agent),
+                    scenario_mandate,
+                ),
+            },
+            {
+                "role": "user",
+                "content": build_simulation_consensus_prompt(
+                    agent.name,
+                    agent.role,
+                    peer_outputs,
+                    simulation_output,
+                )
+                + "\n\n"
+                + build_agent_user_prompt(
+                    agent.role,
+                    scenario.description,
+                    scenario.program_cost,
+                    scenario.max_deficit_constraint,
+                ),
+            },
+        ],
+        "simulation_assisted_consensus",
+    )
 
 
 def _parse_response(raw_content: str) -> tuple[dict[str, Any], SRRResponse | None, str | None]:
     try:
         payload = extract_json_object(raw_content)
     except ValueError as error:
-        return {"unparsed_content": raw_content, "parse_error": str(error)}, None, str(error)
+        return {"parse_error": str(error)}, None, str(error)
     try:
         return payload, SRRResponse.model_validate(payload), None
     except ValidationError as error:
@@ -340,6 +441,199 @@ def _validated_response(raw_content: str) -> tuple[dict[str, Any], SRRResponse |
     if missing:
         return raw_json, None, f"missing decision artifacts: {', '.join(missing)}"
     return raw_json, parsed, None
+
+
+def _persist_simulation_artifact(
+    session: Any,
+    scenario: Scenario,
+    session_id: str,
+    input_payload: dict[str, Any],
+    output_payload: dict[str, Any],
+    status: str,
+    latency_ms: float,
+    token_usage: int,
+    round_number: int,
+) -> SimulationArtifact:
+    artifact = session.scalar(
+        select(SimulationArtifact).where(
+            SimulationArtifact.run_id == session_id,
+            SimulationArtifact.simulation_version == SIMULATION_AGENT_VERSION,
+            SimulationArtifact.round_number == round_number,
+        )
+    )
+    if artifact is None:
+        artifact = SimulationArtifact(
+            run_id=session_id,
+            scenario_id=scenario.id,
+            trigger=SIMULATION_TRIGGER,
+            round_number=round_number,
+            input_payload=input_payload,
+            output_payload=output_payload,
+            status=status,
+            simulation_version=SIMULATION_AGENT_VERSION,
+            latency_ms=latency_ms,
+            token_usage=token_usage,
+        )
+        session.add(artifact)
+    else:
+        artifact.input_payload = input_payload
+        artifact.output_payload = output_payload
+        artifact.status = status
+        artifact.latency_ms = latency_ms
+        artifact.token_usage = token_usage
+    session.flush()
+    return artifact
+
+
+def _run_native_simulation(
+    session: Any,
+    scenario: Scenario,
+    session_id: str,
+    agents: list[Agent],
+    conflicts: list[dict[str, Any]],
+    peer_outputs: list[dict[str, Any]],
+    simulation_call: SimulationCaller | None,
+    logs: list[dict[str, str]],
+    emit: ProgressReporter,
+    round_number: int,
+) -> tuple[dict[str, Any] | None, int]:
+    started = perf_counter()
+    logs.append(_log("SIMULATION", "INFO", f"{SIMULATION_AGENT_NAME} invoked automatically for {len(conflicts)} DDR conflict(s)."))
+    emit(logs)
+    safe_peer_outputs = [
+        sanitize_simulation_payload(dict(peer)) for peer in peer_outputs
+    ]
+    simulation_input = {
+        "conflicts": conflicts,
+        "sectoral_inputs": [
+            {
+                "agent": peer.get("agent"),
+                "role": peer.get("role"),
+                "predictions": (
+                    peer["srr"].get("predictions", [])
+                    if isinstance(peer.get("srr"), dict)
+                    else []
+                ),
+                "alternatives": (
+                    peer["srr"].get("alternatives", [])
+                    if isinstance(peer.get("srr"), dict)
+                    else []
+                ),
+                "recommendation": (
+                    peer["srr"].get("recommendation")
+                    if isinstance(peer.get("srr"), dict)
+                    else None
+                ),
+            }
+            for peer in safe_peer_outputs
+        ],
+        "scenario": {
+            "description": scenario.description,
+            "program_cost": scenario.program_cost,
+            "max_deficit_constraint": scenario.max_deficit_constraint,
+        },
+    }
+    _persist_simulation_artifact(
+        session,
+        scenario,
+        session_id,
+        simulation_input,
+        {
+            "agent_name": SIMULATION_AGENT_NAME,
+            "simulation_version": SIMULATION_AGENT_VERSION,
+            "status": "RUNNING",
+            "evidence_status": "modelled",
+            "message": "Simulation request accepted; awaiting structured arbitration output.",
+        },
+        "RUNNING",
+        0.0,
+        0,
+        round_number,
+    )
+    session.commit()
+    try:
+        fallback_reason: str | None = None
+        try:
+            if simulation_call is not None:
+                raw_content, token_usage = simulation_call(scenario, conflicts, peer_outputs)
+                raw_payload = extract_json_object(raw_content)
+            else:
+                runtime_source = resolve_simulation_runtime_agent(agents)
+                if runtime_source is None:
+                    raise ValueError("Native simulation LLM runtime is unavailable")
+                raw_content, token_usage = _default_simulation_call(
+                    scenario,
+                    conflicts,
+                    peer_outputs,
+                    agents,
+                )
+                raw_payload = extract_json_object(raw_content)
+            parsed = SimulationResponse.model_validate(raw_payload)
+            missing = validate_decision_artifacts(parsed)
+            if missing:
+                raise ValueError(f"simulation missing decision artifacts: {', '.join(missing)}")
+        except Exception as provider_error:
+            fallback_reason = f"{type(provider_error).__name__}: {provider_error}"
+            raw_payload = build_deterministic_simulation(
+                scenario.description,
+                scenario.max_deficit_constraint,
+                conflicts,
+                peer_outputs,
+            )
+            parsed = SimulationResponse.model_validate(raw_payload)
+            token_usage = 0
+        output_payload = sanitize_simulation_payload(parsed.model_dump(mode="json"))
+        if fallback_reason is not None:
+            output_payload["fallback_reason"] = fallback_reason
+        latency_ms = (perf_counter() - started) * 1000.0
+        _persist_simulation_artifact(
+            session,
+            scenario,
+            session_id,
+            simulation_input,
+            output_payload,
+            "SUCCEEDED",
+            latency_ms,
+            token_usage,
+            round_number,
+        )
+        session.commit()
+        logs.append(
+            _log(
+                "SIMULATION",
+                "WARNING" if fallback_reason else "SUCCESS",
+                (
+                    f"{SIMULATION_AGENT_NAME} used deterministic fallback after provider failure."
+                    if fallback_reason
+                    else f"{SIMULATION_AGENT_NAME} produced a structured modelled resolution."
+                ),
+            )
+        )
+        emit(logs)
+        return output_payload, token_usage
+    except Exception as error:
+        output_payload = {
+            "agent_name": SIMULATION_AGENT_NAME,
+            "simulation_version": SIMULATION_AGENT_VERSION,
+            "evidence_status": "modelled",
+            "error": f"{type(error).__name__}: {error}",
+        }
+        latency_ms = (perf_counter() - started) * 1000.0
+        _persist_simulation_artifact(
+            session,
+            scenario,
+            session_id,
+            simulation_input,
+            output_payload,
+            "FAILED",
+            latency_ms,
+            0,
+            round_number,
+        )
+        session.commit()
+        logs.append(_log("SIMULATION", "ERROR", output_payload["error"]))
+        emit(logs)
+        return None, 0
 
 
 def _determine_convergence(
@@ -373,12 +667,165 @@ def _determine_convergence(
     return ConvergenceStatus.FULL_CONSENSUS
 
 
+def _collect_prediction_conflicts(
+    parsed_by_agent: list[tuple[Agent, SRRResponse]],
+) -> list[dict[str, Any]]:
+    conflicts: list[dict[str, Any]] = []
+    for index, (agent_i, response_i) in enumerate(parsed_by_agent):
+        for agent_j, response_j in parsed_by_agent[index + 1 :]:
+            vector = detect_divergence_vector(
+                response_i.divergence_object(),
+                response_j.divergence_object(),
+            )
+            if vector["dP"]:
+                conflicts.append(
+                    {
+                        "agent_i": agent_i.name,
+                        "agent_j": agent_j.name,
+                        "components": [key for key, value in vector.items() if value],
+                        "route": SIMULATION_TRIGGER,
+                    }
+                )
+    return conflicts
+
+
+def _detect_ddr_conflicts(
+    session: Any,
+    scenario: Scenario,
+    session_id: str,
+    parsed_by_agent: list[tuple[Agent, SRRResponse]],
+    logs: list[dict[str, str]],
+    emit: ProgressReporter,
+) -> list[dict[str, Any]]:
+    conflicts: list[dict[str, Any]] = []
+    for index, (agent_i, response_i) in enumerate(parsed_by_agent):
+        for agent_j, response_j in parsed_by_agent[index + 1 :]:
+            vector = detect_divergence_vector(
+                response_i.divergence_object(),
+                response_j.divergence_object(),
+            )
+            route = SIMULATION_TRIGGER if vector["dP"] else None
+            components = [key for key, value in vector.items() if value]
+            active_conflicts = ", ".join(components) or "none"
+            logs.append(_log("DDR", "WARNING" if components else "SUCCESS", f"{agent_i.name} vs {agent_j.name}: conflicts={active_conflicts}; route={route or 'none'}."))
+            emit(logs)
+            session.add(
+                DisagreementLog(
+                    run_id=session_id,
+                    scenario_id=scenario.id,
+                    agent_i=agent_i.id,
+                    agent_j=agent_j.id,
+                    resolution_route=route,
+                    **vector,
+                )
+            )
+            if route:
+                conflicts.append(
+                    {
+                        "agent_i": agent_i.name,
+                        "agent_j": agent_j.name,
+                        "components": components,
+                        "route": route,
+                    }
+                )
+    return conflicts
+
+
+def _run_consensus_round(
+    agents: list[Agent],
+    scenario: Scenario,
+    run: ConsensusSession,
+    parsed_by_agent: list[tuple[Agent, SRRResponse]],
+    reasoning_by_agent: dict[int, ReasoningLog],
+    consensus_call: Callable[..., tuple[str, int]] | None,
+    peer_outputs: list[dict[str, Any]],
+    simulation_output: dict[str, Any] | None,
+    logs: list[dict[str, str]],
+    emit: ProgressReporter,
+) -> tuple[list[tuple[Agent, SRRResponse]], int]:
+    consensus_results: list[tuple[Agent, SRRResponse]] = []
+    round_tokens = 0
+    effective_peer_outputs = list(peer_outputs)
+    if simulation_output is not None:
+        effective_peer_outputs.append(
+            {
+                "agent": SIMULATION_AGENT_NAME,
+                "role": "Native macro-fiscal simulation arbiter",
+                "srr": simulation_output,
+            }
+        )
+    if simulation_output is None:
+        logs.append(_log("CONSENSUS", "INFO", "Sending peer outputs to each agent for structured consensus review."))
+        emit(logs)
+    for agent, initial_response in parsed_by_agent:
+        try:
+            if consensus_call is None:
+                if simulation_output is None:
+                    raw_content, token_usage = _default_consensus_call(
+                        agent,
+                        scenario,
+                        peer_outputs,
+                        _mandate_for_agent(run.mandate_payload, agent.id),
+                    )
+                else:
+                    raw_content, token_usage = _default_simulation_consensus_call(
+                        agent,
+                        scenario,
+                        peer_outputs,
+                        simulation_output,
+                        _mandate_for_agent(run.mandate_payload, agent.id),
+                    )
+            else:
+                raw_content, token_usage = consensus_call(agent, scenario, effective_peer_outputs)
+            round_tokens += token_usage
+            raw_json, reviewed, _ = _validated_response(raw_content)
+            if reviewed is None:
+                consensus_results.append((agent, initial_response))
+                logs.append(
+                    _log(
+                        "CONSENSUS",
+                        "WARNING",
+                        f"{agent.name}: review response did not pass schema validation; retained validated SRR artifacts.",
+                    )
+                )
+                emit(logs)
+                continue
+            consensus_results.append((agent, reviewed))
+            logs.append(_log("CONSENSUS", "SUCCESS", f"{agent.name}: peer review completed with {token_usage} tokens."))
+            emit(logs)
+            reasoning_log = reasoning_by_agent.get(agent.id)
+            if reasoning_log is not None:
+                reasoning_log.raw_json = raw_json
+                reasoning_log.parsed_srr_objects = reviewed.model_dump(mode="json")
+                reasoning_log.provenance_count = _provenance_counts(reviewed)[0]
+        except Exception as error:
+            if isinstance(
+                error,
+                (APIConnectionError, APITimeoutError, ConnectionError, TimeoutError, OSError, socket.error),
+            ):
+                logger.exception("Local LLM connection failed during consensus review for agent %s", agent.id)
+            else:
+                logger.exception("Consensus review failed for agent %s", agent.id)
+            consensus_results.append((agent, initial_response))
+            logs.append(
+                _log(
+                    "CONSENSUS",
+                    "WARNING",
+                    f"{agent.name}: {type(error).__name__}; retained validated SRR artifacts.",
+                )
+            )
+            emit(logs)
+    return consensus_results, round_tokens
+
+
 def execute_full_shcr_cycle(
     scenario_id: int,
     session_id: Any,
     llm_call: Any = None,
     consensus_call: ConsensusCaller | None = None,
     progress: ProgressReporter | None = None,
+    simulation_call: SimulationCaller | None = None,
+    enable_simulation: bool = True,
 ) -> dict[str, Any]:
     if not isinstance(session_id, str):
         legacy_llm_call = session_id
@@ -521,8 +968,6 @@ def execute_full_shcr_cycle(
             logs.append(_log("CONSENSUS", "INFO", "Consensus review callback not configured; retaining supplied test outputs."))
             emit(logs)
         else:
-            logs.append(_log("CONSENSUS", "INFO", "Sending peer outputs to each agent for structured consensus review."))
-            emit(logs)
             peer_outputs = [
                 {
                     "agent": agent.name,
@@ -531,59 +976,29 @@ def execute_full_shcr_cycle(
                 }
                 for agent, response in parsed_by_agent
             ]
-            consensus_results: list[tuple[Agent, SRRResponse]] = []
-            for agent, initial_response in parsed_by_agent:
-                try:
-                    if consensus_call is None:
-                        raw_content, token_usage = _default_consensus_call(
-                            agent,
-                            scenario,
-                            peer_outputs,
-                            _mandate_for_agent(run.mandate_payload, agent.id),
-                        )
-                    else:
-                        raw_content, token_usage = reviewer(agent, scenario, peer_outputs)
-                    total_tokens += token_usage
-                    raw_json, reviewed, _ = _validated_response(raw_content)
-                    if reviewed is None:
-                        consensus_results.append((agent, initial_response))
-                        logs.append(
-                            _log(
-                                "CONSENSUS",
-                                "WARNING",
-                                f"{agent.name}: review response did not pass schema validation; retained validated SRR artifacts.",
-                            )
-                        )
-                        emit(logs)
-                        continue
-                    consensus_results.append((agent, reviewed))
-                    logs.append(_log("CONSENSUS", "SUCCESS", f"{agent.name}: peer review completed with {token_usage} tokens."))
-                    emit(logs)
-                    reasoning_log = reasoning_by_agent[agent.id]
-                    reasoning_log.raw_json = raw_json
-                    reasoning_log.parsed_srr_objects = reviewed.model_dump(mode="json")
-                    reasoning_log.provenance_count = _provenance_counts(reviewed)[0]
-                except Exception as error:
-                    if isinstance(
-                        error,
-                        (APIConnectionError, APITimeoutError, ConnectionError, TimeoutError, OSError, socket.error),
-                    ):
-                        logger.exception("Local LLM connection failed during consensus review for agent %s", agent.id)
-                    else:
-                        logger.exception("Consensus review failed for agent %s", agent.id)
-                    consensus_results.append((agent, initial_response))
-                    logs.append(
-                        _log(
-                            "CONSENSUS",
-                            "WARNING",
-                            f"{agent.name}: {type(error).__name__}; retained validated SRR artifacts.",
-                        )
-                    )
-                    emit(logs)
+            consensus_results, round_tokens = _run_consensus_round(
+                agents,
+                scenario,
+                run,
+                parsed_by_agent,
+                reasoning_by_agent,
+                consensus_call,
+                peer_outputs,
+                None,
+                logs,
+                emit,
+            )
+            total_tokens += round_tokens
             if len(consensus_results) < 2:
                 failure_message = "Structured consensus failed to produce a two-agent quorum."
                 logs.append(_log("COMPLETE", "ERROR", failure_message))
                 emit(logs)
+                run.status = "FAILED"
+                run.error = failure_message
+                run.logs = _merge_run_logs(run.logs, logs)
+                run.progress_stage = "COMPLETE"
+                run.completed_at = datetime.now(timezone.utc)
+                session.commit()
                 raise RuntimeError(failure_message)
             parsed_by_agent = consensus_results
 
@@ -628,29 +1043,109 @@ def execute_full_shcr_cycle(
                 observation.raw_score = float(result["raw_score"])
                 observation.normalized_weight = float(result["normalized_weight"])
 
-        for index, (agent_i, response_i) in enumerate(parsed_by_agent):
-            for agent_j, response_j in parsed_by_agent[index + 1 :]:
-                vector = detect_divergence_vector(
-                    response_i.divergence_object(),
-                    response_j.divergence_object(),
+        conflicts = _detect_ddr_conflicts(
+            session,
+            scenario,
+            session_id,
+            parsed_by_agent,
+            logs,
+            emit,
+        )
+        simulation_rounds = 0
+        simulation_artifact_id: int | None = None
+        remaining_conflicts = conflicts
+        while (
+            enable_simulation
+            and reviewer is not None
+            and remaining_conflicts
+            and simulation_rounds < MAX_SIMULATION_ROUNDS
+        ):
+            round_number = simulation_rounds + 1
+            peer_outputs = [
+                {
+                    "agent": agent.name,
+                    "role": agent.role,
+                    "srr": response.model_dump(mode="json"),
+                }
+                for agent, response in parsed_by_agent
+            ]
+            simulation_output, simulation_tokens = _run_native_simulation(
+                session,
+                scenario,
+                session_id,
+                agents if llm_call is None else [],
+                remaining_conflicts,
+                peer_outputs,
+                simulation_call,
+                logs,
+                emit,
+                round_number,
+            )
+            total_tokens += simulation_tokens
+            artifact = session.scalar(
+                select(SimulationArtifact).where(
+                    SimulationArtifact.run_id == session_id,
+                    SimulationArtifact.simulation_version == SIMULATION_AGENT_VERSION,
+                    SimulationArtifact.round_number == round_number,
                 )
-                route = "Simulation Agent Requested" if vector["dP"] else None
-                if route:
-                    logger.info(route)
-                active_conflicts = ", ".join(key for key, value in vector.items() if value) or "none"
-                logs.append(_log("DDR", "WARNING" if active_conflicts != "none" else "SUCCESS", f"{agent_i.name} vs {agent_j.name}: conflicts={active_conflicts}; route={route or 'none'}."))
-                emit(logs)
-                session.add(
-                    DisagreementLog(
-                        run_id=session_id,
-                        scenario_id=scenario.id,
-                        agent_i=agent_i.id,
-                        agent_j=agent_j.id,
-                        resolution_route=route,
-                        **vector,
-                    )
+            )
+            if simulation_artifact_id is None and artifact is not None:
+                simulation_artifact_id = artifact.id
+            if simulation_output is None:
+                break
+            simulation_rounds = round_number
+            logs.append(
+                _log(
+                    "SIMULATION_CONSENSUS",
+                    "INFO",
+                    f"Feeding native simulation round {round_number} back to all sectoral agents.",
                 )
+            )
+            emit(logs)
+            simulation_results, round_tokens = _run_consensus_round(
+                agents,
+                scenario,
+                run,
+                parsed_by_agent,
+                reasoning_by_agent,
+                consensus_call,
+                peer_outputs,
+                simulation_output,
+                logs,
+                emit,
+            )
+            total_tokens += round_tokens
+            if len(simulation_results) < 2:
+                break
+            parsed_by_agent = simulation_results
+            remaining_conflicts = _collect_prediction_conflicts(parsed_by_agent)
+            if artifact is not None:
+                artifact_payload = dict(artifact.output_payload)
+                artifact_payload["follow_up_consensus_status"] = "completed"
+                artifact_payload["remaining_prediction_conflicts"] = len(remaining_conflicts)
+                artifact.output_payload = artifact_payload
+                session.commit()
+            logs.append(
+                _log(
+                    "SIMULATION_CONSENSUS",
+                    "SUCCESS" if not remaining_conflicts else "WARNING",
+                    f"Follow-up round {round_number} completed with {len(remaining_conflicts)} remaining prediction conflict(s).",
+                )
+            )
+            emit(logs)
+        if remaining_conflicts and simulation_rounds == MAX_SIMULATION_ROUNDS:
+            logs.append(
+                _log(
+                    "SIMULATION_CONSENSUS",
+                    "WARNING",
+                    f"Stopped after the bounded maximum of {MAX_SIMULATION_ROUNDS} simulation rounds; valid dissent remains explicit.",
+                )
+            )
+            emit(logs)
 
+        final_provenance = [_provenance_counts(response) for _, response in parsed_by_agent]
+        tagged_items = sum(tagged for tagged, _ in final_provenance)
+        total_items = sum(total for _, total in final_provenance)
         logs.append(_log("CAR", "INFO", f"Applying hard deficit constraint <= {scenario.max_deficit_constraint}%."))
         emit(logs)
         parsed_responses = [response for _, response in parsed_by_agent]
@@ -707,6 +1202,9 @@ def execute_full_shcr_cycle(
             "convergence_status": convergence_status.value,
             "latency_ms": latency_ms,
             "token_usage": total_tokens,
+            "simulation_artifact_id": simulation_artifact_id,
+            "simulation_rounds": simulation_rounds,
+            "simulation_triggered": bool(conflicts),
             "logs": logs,
         }
         run.result_payload = result_payload

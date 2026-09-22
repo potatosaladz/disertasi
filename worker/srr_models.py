@@ -106,6 +106,38 @@ def _normalise_numeric_fields(
             payload.setdefault(f"{field}_raw", original)
 
 
+def _coerce_text(value: object) -> str:
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, dict):
+        for key in (
+            "content",
+            "summary",
+            "decision",
+            "resolution",
+            "rationale",
+            "arbitrated_path",
+            "sandbox_run",
+            "status",
+        ):
+            candidate = value.get(key)
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate.strip()
+        return "; ".join(
+            f"{key}: {item}" for key, item in value.items() if isinstance(item, (str, int, float))
+        )
+    if value is None:
+        return ""
+    return str(value)
+
+
+def _coerce_text_list(value: object) -> list[str]:
+    if isinstance(value, list):
+        return [text for item in value if (text := _coerce_text(item))]
+    text = _coerce_text(value)
+    return [text] if text else []
+
+
 class SRRItem(BaseModel):
     model_config = ConfigDict(extra="allow")
 
@@ -311,6 +343,48 @@ class SRRResponse(BaseModel):
             "C": [item.content for item in self.constraints],
             "REC": self.recommendation.content if self.recommendation is not None else None,
         }
+
+
+class SimulationAlternative(Alternative):
+    source_tag: str = "SIMULATION_MODELLED"
+    evidence_status: Literal["modelled"] = "modelled"
+
+
+class SimulationResponse(SRRResponse):
+    simulation_summary: str = Field(min_length=1)
+    conflict_summary: list[str] = Field(min_length=1)
+    resolution: str = Field(min_length=1)
+    modelled_variables: list[str] = Field(default_factory=list)
+    limitations: list[str] = Field(default_factory=list)
+    evidence_status: Literal["modelled"] = "modelled"
+    agent_name: str = "Simulation Agent / Arbiter Simulasi Makro-Fiskal"
+    simulation_version: str = "native-simulation-v1"
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalise_simulation_payload(cls, value: object) -> object:
+        if not isinstance(value, dict):
+            return value
+        payload = dict(value)
+        for field in ("simulation_summary", "resolution"):
+            payload[field] = _coerce_text(payload.get(field))
+        for field in ("conflict_summary", "modelled_variables", "limitations"):
+            payload[field] = _coerce_text_list(payload.get(field))
+        payload.setdefault("evidence_status", "modelled")
+        alternatives = payload.get("alternatives")
+        if isinstance(alternatives, list):
+            for alternative in alternatives:
+                if isinstance(alternative, dict):
+                    alternative["source_tag"] = "SIMULATION_MODELLED"
+                    alternative["evidence_status"] = "modelled"
+        return payload
+
+    @model_validator(mode="after")
+    def tag_modelled_alternatives(self) -> "SimulationResponse":
+        for alternative in self.alternatives:
+            alternative.source_tag = "SIMULATION_MODELLED"
+            setattr(alternative, "evidence_status", "modelled")
+        return self
 
 
 ConvergenceName = Literal[

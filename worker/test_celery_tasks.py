@@ -13,6 +13,7 @@ from backend.models import (
     MetricSnapshot,
     ReasoningLog,
     Scenario,
+    SimulationArtifact,
 )
 from backend.agent_templates import AGENTS, agent_revision
 from worker.celery_tasks import (
@@ -25,6 +26,7 @@ from worker.celery_tasks import (
     persist_run_progress,
 )
 from backend.core_algorithms import resolve_llm_runtime_config
+from backend.simulation_agent import SIMULATION_AGENT_NAME, SIMULATION_AGENT_VERSION
 from worker.srr_models import Evidence, SRRResponse
 
 
@@ -80,6 +82,7 @@ def scenario_id() -> Iterator[int]:
             )
         )
         session.execute(delete(MetricSnapshot).where(MetricSnapshot.scenario_id == identifier))
+        session.execute(delete(SimulationArtifact).where(SimulationArtifact.scenario_id == identifier))
         session.execute(delete(DisagreementLog).where(DisagreementLog.scenario_id == identifier))
         session.execute(delete(ReasoningLog).where(ReasoningLog.scenario_id == identifier))
         session.execute(
@@ -468,6 +471,7 @@ def test_consensus_round_reviews_peer_outputs(scenario_id: int) -> None:
         scenario_id,
         lambda _agent, _scenario: next(first_round),
         consensus_call,
+        enable_simulation=False,
     )
 
     assert len(peer_batches) == 2
@@ -476,7 +480,169 @@ def test_consensus_round_reviews_peer_outputs(scenario_id: int) -> None:
     assert any(log["stage"] == "CONSENSUS" for log in result["logs"])
 
 
-def test_invalid_consensus_review_retains_validated_initial_artifacts(scenario_id: int) -> None:
+def test_ddr_invokes_native_simulation_and_feeds_follow_up_round(
+    scenario_id: int,
+) -> None:
+    result_session_id = _create_isolated_session(scenario_id)
+    first_round = iter(
+        [
+            (response_payload(prediction="Growth 2%", utility=0.8, recommendation="Adopt A"), 10),
+            (response_payload(prediction="Growth 1%", utility=0.6, recommendation="Adopt B"), 11),
+        ]
+    )
+    reviewed = iter(
+        [
+            (response_payload(prediction="Growth 1.8%", utility=0.75, recommendation="Adopt A"), 12),
+            (response_payload(prediction="Growth 1.2%", utility=0.65, recommendation="Adopt B"), 13),
+            (response_payload(prediction="Growth 1.6%", utility=0.75, recommendation="Adopt C"), 14),
+            (response_payload(prediction="Growth 1.4%", utility=0.75, recommendation="Adopt C"), 15),
+            (response_payload(prediction="Growth 1.5%", utility=0.75, recommendation="Adopt C"), 16),
+            (response_payload(prediction="Growth 1.5%", utility=0.75, recommendation="Adopt C"), 17),
+        ]
+    )
+    peer_batches: list[list[dict[str, object]]] = []
+    simulation_calls: list[list[dict[str, object]]] = []
+    live_artifact_states: list[tuple[str, dict[str, object]]] = []
+
+    def consensus_call(
+        _agent: Agent,
+        _scenario: Scenario,
+        peers: list[dict[str, object]],
+    ) -> tuple[str, int]:
+        peer_batches.append(peers)
+        return next(reviewed)
+
+    def simulation_call(
+        _scenario: Scenario,
+        _conflicts: list[dict[str, object]],
+        _peers: list[dict[str, object]],
+    ) -> tuple[str, int]:
+        with SessionLocal() as live_session:
+            live_artifact = live_session.scalar(
+                select(SimulationArtifact).where(
+                    SimulationArtifact.run_id == result_session_id
+                )
+            ) if result_session_id else None
+            if live_artifact is not None:
+                live_artifact_states.append((live_artifact.status, live_artifact.output_payload))
+        simulation_calls.append(_conflicts)
+        return (
+            json.dumps(
+                {
+                    "evidence": ["Structured sectoral outputs"],
+                    "predictions": ["Phased rollout remains within ceiling"],
+                    "risks": ["Implementation delay"],
+                    "uncertainties": ["Demand response"],
+                    "alternatives": [
+                        {
+                            "name": "Modelled phased compromise",
+                            "deficit": 2.4,
+                            "utility": 0.8,
+                        }
+                    ],
+                    "recommendation": {"content": "Adopt phased compromise"},
+                    "confidence": 0.75,
+                    "simulation_summary": "Dissent was modelled in a bounded fiscal sandbox.",
+                    "conflict_summary": ["Prediction divergence"],
+                    "resolution": "Adopt phased compromise",
+                    "modelled_variables": ["deficit"],
+                    "limitations": ["Not legal authority"],
+                    "evidence_status": "modelled",
+                }
+            ),
+            7,
+        )
+
+    result = execute_full_shcr_cycle(
+        scenario_id,
+        result_session_id,
+        llm_call=lambda _agent, _scenario: next(first_round),
+        consensus_call=consensus_call,
+        simulation_call=simulation_call,
+    )
+
+    assert result["simulation_triggered"] is True
+    assert result["simulation_rounds"] == 2
+    assert len(simulation_calls) == 2
+    assert live_artifact_states[0][0] == "RUNNING"
+    assert str(live_artifact_states[0][1]["message"]).startswith("Simulation request accepted")
+    assert result["simulation_artifact_id"] is not None
+    assert len(peer_batches) == 6
+    assert any(item["agent"] == SIMULATION_AGENT_NAME for item in peer_batches[2])
+    assert any(log["stage"] == "SIMULATION" for log in result["logs"])
+    assert any(log["stage"] == "SIMULATION_CONSENSUS" for log in result["logs"])
+    with SessionLocal() as session:
+        artifacts = list(
+            session.scalars(
+                select(SimulationArtifact).where(
+                    SimulationArtifact.run_id == result["session_id"]
+                )
+            )
+        )
+        assert len(artifacts) == 2
+        assert all(
+            artifact.simulation_version == SIMULATION_AGENT_VERSION
+            for artifact in artifacts
+        )
+        assert all(artifact.status == "SUCCEEDED" for artifact in artifacts)
+        assert artifacts[-1].output_payload["evidence_status"] == "modelled"
+        assert artifacts[-1].output_payload["alternatives"][0]["source_tag"] == "SIMULATION_MODELLED"
+        assert artifacts[-1].output_payload["remaining_prediction_conflicts"] == 0
+        native_agent = session.scalar(
+            select(Agent).where(Agent.name == SIMULATION_AGENT_NAME)
+        )
+        assert native_agent is None
+
+
+def test_native_simulation_falls_back_when_provider_fails(
+    scenario_id: int,
+) -> None:
+    first_round = iter(
+        [
+            (response_payload(prediction="Growth 2%", utility=0.8, recommendation="Adopt A"), 10),
+            (response_payload(prediction="Growth 1%", utility=0.6, recommendation="Adopt B"), 11),
+        ]
+    )
+    reviewed = iter(
+        [
+            (response_payload(prediction="Growth 1.8%", utility=0.75, recommendation="Adopt A"), 12),
+            (response_payload(prediction="Growth 1.2%", utility=0.65, recommendation="Adopt B"), 13),
+            (response_payload(prediction="Growth 1.5%", utility=0.75, recommendation="Adopt C"), 14),
+            (response_payload(prediction="Growth 1.5%", utility=0.75, recommendation="Adopt C"), 15),
+        ]
+    )
+
+    def failing_simulation(
+        _scenario: Scenario,
+        _conflicts: list[dict[str, object]],
+        _peers: list[dict[str, object]],
+    ) -> tuple[str, int]:
+        raise ConnectionError("simulation provider unavailable")
+
+    result = execute_full_shcr_cycle(
+        scenario_id,
+        lambda _agent, _scenario: next(first_round),
+        lambda _agent, _scenario, _peers: next(reviewed),
+        simulation_call=failing_simulation,
+    )
+
+    assert result["metric_snapshot_id"] > 0
+    assert result["simulation_rounds"] == 1
+    with SessionLocal() as session:
+        artifact = session.scalar(
+            select(SimulationArtifact).where(
+                SimulationArtifact.run_id == result["session_id"]
+            )
+        )
+        assert artifact is not None
+        assert artifact.status == "SUCCEEDED"
+        assert artifact.output_payload["fallback_reason"].startswith("ConnectionError")
+        assert artifact.output_payload["evidence_status"] == "modelled"
+
+
+def test_invalid_consensus_review_retains_validated_initial_artifacts(
+    scenario_id: int,
+) -> None:
     responses = iter(
         [
             (response_payload(prediction="Growth 2%", utility=0.8, recommendation="Adopt A"), 120),
@@ -488,6 +654,7 @@ def test_invalid_consensus_review_retains_validated_initial_artifacts(scenario_i
         scenario_id,
         lambda _agent, _scenario: next(responses),
         lambda _agent, _scenario, _peers: ("{}", 10),
+        enable_simulation=False,
     )
 
     consensus_logs = [log for log in result["logs"] if log["stage"] == "CONSENSUS"]

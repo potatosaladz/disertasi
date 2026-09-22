@@ -93,5 +93,24 @@ BEGIN
         CREATE INDEX IF NOT EXISTS ix_disagreement_logs_run_id ON disagreement_logs (run_id);
         CREATE INDEX IF NOT EXISTS ix_metric_snapshots_run_id ON metric_snapshots (run_id);
         CREATE INDEX IF NOT EXISTS ix_agent_influence_observations_run_id ON agent_influence_observations (run_id);
+        CREATE TABLE IF NOT EXISTS simulation_artifacts (
+            id SERIAL PRIMARY KEY,
+            run_id VARCHAR(36) NOT NULL REFERENCES consensus_sessions(id) ON DELETE CASCADE,
+            scenario_id INTEGER NOT NULL REFERENCES scenarios(id) ON DELETE CASCADE,
+            trigger VARCHAR(100) NOT NULL,
+            round_number INTEGER NOT NULL DEFAULT 1 CHECK (round_number > 0),
+            input_payload JSONB NOT NULL,
+            output_payload JSONB NOT NULL,
+            status VARCHAR(30) NOT NULL,
+            simulation_version VARCHAR(64) NOT NULL,
+            latency_ms DOUBLE PRECISION NOT NULL DEFAULT 0 CHECK (latency_ms >= 0),
+            token_usage INTEGER NOT NULL DEFAULT 0 CHECK (token_usage >= 0),
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            CONSTRAINT uq_simulation_run_version_round UNIQUE (run_id, simulation_version, round_number)
+        );
+        CREATE INDEX IF NOT EXISTS ix_simulation_artifacts_run_id
+            ON simulation_artifacts (run_id);
+        CREATE INDEX IF NOT EXISTS ix_simulation_artifacts_scenario_id
+            ON simulation_artifacts (scenario_id);
     END IF;
 END $$;
