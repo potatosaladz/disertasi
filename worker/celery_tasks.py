@@ -19,12 +19,14 @@ from backend.core_algorithms import (
     build_consensus_prompt,
     calculate_dynamic_influence,
     calculate_violation_rate,
+    describe_divergence_vector,
     detect_divergence_vector,
     extract_json_object,
     extract_llm_completion,
     llm_request_headers,
     log_llm_outbound,
     neuro_symbolic_filter,
+    resolve_disagreement_route,
     resolve_llm_runtime_config,
     validate_decision_artifacts,
 )
@@ -443,6 +445,30 @@ def _validated_response(raw_content: str) -> tuple[dict[str, Any], SRRResponse |
     return raw_json, parsed, None
 
 
+def _record_deliberation_stage(
+    reasoning_by_agent: dict[int, ReasoningLog],
+    parsed_by_agent: list[tuple[Agent, SRRResponse]],
+    stage: str,
+    round_number: int,
+) -> None:
+    for agent, response in parsed_by_agent:
+        reasoning_log = reasoning_by_agent.get(agent.id)
+        if reasoning_log is None:
+            continue
+        artifacts = sanitize_simulation_payload(response.model_dump(mode="json"))
+        tagged, _ = _provenance_counts(response)
+        reasoning_log.parsed_srr_objects = artifacts
+        reasoning_log.provenance_count = tagged
+        reasoning_log.deliberation_history = [
+            *list(reasoning_log.deliberation_history or []),
+            {
+                "stage": stage,
+                "round_number": round_number,
+                "artifacts": artifacts,
+            },
+        ]
+
+
 def _persist_simulation_artifact(
     session: Any,
     scenario: Scenario,
@@ -667,6 +693,94 @@ def _determine_convergence(
     return ConvergenceStatus.FULL_CONSENSUS
 
 
+def _agent_interactions(
+    agent: Agent,
+    response: SRRResponse,
+    parsed_by_agent: list[tuple[Agent, SRRResponse]],
+) -> list[dict[str, Any]]:
+    interactions: list[dict[str, Any]] = []
+    for peer, peer_response in parsed_by_agent:
+        if peer.id == agent.id:
+            continue
+        vector = detect_divergence_vector(
+            response.divergence_object(),
+            peer_response.divergence_object(),
+        )
+        active_components = [key for key, value in vector.items() if value]
+        interactions.append(
+            {
+                "peer_agent_id": peer.id,
+                "peer_agent_name": peer.name,
+                "active_components": active_components,
+                "agreement_ratio": round(1.0 - len(active_components) / len(vector), 4),
+            }
+        )
+    return interactions
+
+
+def _ensure_influence_observations(
+    session: Any,
+    scenario: Scenario,
+    session_id: str,
+    parsed_by_agent: list[tuple[Agent, SRRResponse]],
+    observations: list[AgentInfluenceObservation],
+) -> list[AgentInfluenceObservation]:
+    by_agent = {observation.agent_id: observation for observation in observations}
+    for agent, response in parsed_by_agent:
+        interactions = _agent_interactions(agent, response, parsed_by_agent)
+        artifact_groups = (
+            response.evidence,
+            response.predictions,
+            response.risks,
+            response.uncertainties,
+            response.alternatives,
+        )
+        complete_groups = sum(bool(group) for group in artifact_groups)
+        completeness = complete_groups / len(artifact_groups)
+        tagged, total = _provenance_counts(response)
+        provenance_quality = tagged / total if total else 0.0
+        peer_alignment = (
+            sum(item["agreement_ratio"] for item in interactions) / len(interactions)
+            if interactions
+            else 1.0
+        )
+        uncertainty_count = len(response.uncertainties)
+        inspectable_count = sum(len(group) for group in artifact_groups)
+        uncertainty_burden = min(1.0, uncertainty_count / max(1, inspectable_count))
+        observation = by_agent.get(agent.id)
+        if observation is None:
+            observation = AgentInfluenceObservation(
+                run_id=session_id,
+                agent_id=agent.id,
+                scenario_id=scenario.id,
+                proposition=scenario.description,
+                X=completeness,
+                Q=provenance_quality,
+                H=1.0,
+                S=peer_alignment,
+                U=uncertainty_burden,
+                gate=1,
+            )
+            session.add(observation)
+            observations.append(observation)
+            by_agent[agent.id] = observation
+        observation.interaction_payload = interactions
+        observation.calculation_payload = {
+            "version": "rar-dai-v1",
+            "formula": "raw_score = theta_x*X + theta_q*Q + theta_h*H + theta_s*S - theta_u*U; normalized_weight = gated_softmax(raw_score)",
+            "dimensions": {
+                "X": "decision-artifact completeness ratio",
+                "Q": "source-tagged provenance ratio",
+                "H": "current-run recency factor",
+                "S": "mean pairwise DDR agreement ratio",
+                "U": "uncertainty artifact burden",
+            },
+            "interaction_count": len(interactions),
+        }
+    session.flush()
+    return observations
+
+
 def _collect_prediction_conflicts(
     parsed_by_agent: list[tuple[Agent, SRRResponse]],
 ) -> list[dict[str, Any]]:
@@ -689,26 +803,162 @@ def _collect_prediction_conflicts(
     return conflicts
 
 
+def _fiscal_alternative_payload(response: SRRResponse, ceiling: float) -> list[dict[str, Any]]:
+    return [
+        {
+            "name": alternative.name,
+            "projected_deficit_percent": alternative.deficit,
+            "utility": alternative.utility,
+            "headroom_percent": round(ceiling - alternative.deficit, 4),
+            "within_statutory_ceiling": alternative.deficit <= ceiling,
+            "source_tag": alternative.source_tag,
+        }
+        for alternative in response.alternatives
+    ]
+
+
+def _legal_basis_payload(
+    response_i: SRRResponse,
+    response_j: SRRResponse,
+) -> list[dict[str, str]]:
+    references = {
+        "UU17_2003_P12": "UU Keuangan Negara (UU 17/2003) Pasal 12 — batas defisit terhadap PDB.",
+        "UU17_2025_POSTURE": "UU APBN 2026 — postur dan baseline fiskal tahun anggaran 2026.",
+        "UU17_2025_P28": "UU APBN 2026 Pasal 28 — otoritas pembiayaan dan pengelolaan fiskal.",
+    }
+    source_tags = {
+        item.source_tag
+        for response in (response_i, response_j)
+        for item in response.provenance_items()
+        if item.source_tag
+    }
+    source_tags.add("UU17_2003_P12")
+    return [
+        {"source_tag": source_tag, "basis": references.get(source_tag, source_tag)}
+        for source_tag in sorted(source_tags)
+        if source_tag.startswith(("UU", "UUD", "PP", "PMK"))
+    ]
+
+
+def _conflict_detail_payload(
+    scenario: Scenario,
+    agent_i: Agent,
+    response_i: SRRResponse,
+    agent_j: Agent,
+    response_j: SRRResponse,
+    vector: dict[str, bool],
+    route: str | None,
+    influence_by_agent: dict[int, AgentInfluenceObservation],
+) -> dict[str, Any]:
+    artifacts_i = response_i.model_dump(mode="json")
+    artifacts_j = response_j.model_dump(mode="json")
+    component_fields = {
+        "dE": "evidence",
+        "dA": "assumptions",
+        "dP": "predictions",
+        "dR": "risks",
+        "dU": "uncertainties",
+        "dO": "objectives",
+        "dC": "constraints",
+        "dREC": "recommendation",
+    }
+    categories = []
+    for narrative in describe_divergence_vector(vector):
+        field = component_fields[narrative["component"]]
+        categories.append(
+            {
+                **narrative,
+                "agent_i_artifacts": artifacts_i.get(field),
+                "agent_j_artifacts": artifacts_j.get(field),
+            }
+        )
+    observation_i = influence_by_agent.get(agent_i.id)
+    observation_j = influence_by_agent.get(agent_j.id)
+    alternatives_i = _fiscal_alternative_payload(
+        response_i, scenario.max_deficit_constraint
+    )
+    alternatives_j = _fiscal_alternative_payload(
+        response_j, scenario.max_deficit_constraint
+    )
+    return sanitize_simulation_payload(
+        {
+            "active_components": [key for key, value in vector.items() if value],
+            "categories": categories,
+            "fiscal_calculation": {
+                "formula": "headroom_percent = statutory_deficit_ceiling_percent - agent_reported_projected_deficit_percent",
+                "statutory_deficit_ceiling_percent": scenario.max_deficit_constraint,
+                "program_cost": scenario.program_cost,
+                "program_cost_to_gdp_ratio": None,
+                "calculation_note": "Rasio biaya program terhadap PDB tidak dihitung tanpa denominator PDB terverifikasi; angka defisit berasal dari alternatif terstruktur agen.",
+                "agent_i_alternatives": alternatives_i,
+                "agent_j_alternatives": alternatives_j,
+            },
+            "influence_context": {
+                "agent_i_weight": observation_i.normalized_weight if observation_i else None,
+                "agent_j_weight": observation_j.normalized_weight if observation_j else None,
+                "combined_weight": round(
+                    sum(
+                        value
+                        for value in (
+                            observation_i.normalized_weight if observation_i else None,
+                            observation_j.normalized_weight if observation_j else None,
+                        )
+                        if value is not None
+                    ),
+                    6,
+                ),
+                "formula": "gated softmax over evidence quality, completeness, recency, peer alignment, and uncertainty burden",
+            },
+            "legal_basis": _legal_basis_payload(response_i, response_j),
+            "resolution": {
+                "route": route or "No Resolution Required",
+                "status": "ESCALATED" if route else "CLEAR",
+                "conclusion": (
+                    "Perbedaan proyeksi diteruskan ke Simulation Agent untuk kompromi fiskal berbatas."
+                    if vector.get("dP")
+                    else "Konflik dipertahankan sebagai dissent terstruktur untuk mekanisme resolusi terkait."
+                    if route
+                    else "Tidak ada perbedaan material pada pasangan agen ini."
+                ),
+            },
+        }
+    )
+
+
 def _detect_ddr_conflicts(
     session: Any,
     scenario: Scenario,
     session_id: str,
     parsed_by_agent: list[tuple[Agent, SRRResponse]],
+    influence_observations: list[AgentInfluenceObservation],
     logs: list[dict[str, str]],
     emit: ProgressReporter,
 ) -> list[dict[str, Any]]:
     conflicts: list[dict[str, Any]] = []
+    influence_by_agent = {
+        observation.agent_id: observation for observation in influence_observations
+    }
     for index, (agent_i, response_i) in enumerate(parsed_by_agent):
         for agent_j, response_j in parsed_by_agent[index + 1 :]:
             vector = detect_divergence_vector(
                 response_i.divergence_object(),
                 response_j.divergence_object(),
             )
-            route = SIMULATION_TRIGGER if vector["dP"] else None
             components = [key for key, value in vector.items() if value]
+            route = resolve_disagreement_route(vector) if components else None
             active_conflicts = ", ".join(components) or "none"
             logs.append(_log("DDR", "WARNING" if components else "SUCCESS", f"{agent_i.name} vs {agent_j.name}: conflicts={active_conflicts}; route={route or 'none'}."))
             emit(logs)
+            detail_payload = _conflict_detail_payload(
+                scenario,
+                agent_i,
+                response_i,
+                agent_j,
+                response_j,
+                vector,
+                route,
+                influence_by_agent,
+            )
             session.add(
                 DisagreementLog(
                     run_id=session_id,
@@ -716,16 +966,18 @@ def _detect_ddr_conflicts(
                     agent_i=agent_i.id,
                     agent_j=agent_j.id,
                     resolution_route=route,
+                    detail_payload=detail_payload,
                     **vector,
                 )
             )
-            if route:
+            if vector["dP"]:
                 conflicts.append(
                     {
                         "agent_i": agent_i.name,
                         "agent_j": agent_j.name,
                         "components": components,
                         "route": route,
+                        "narrative": detail_payload["categories"],
                     }
                 )
     return conflicts
@@ -736,7 +988,6 @@ def _run_consensus_round(
     scenario: Scenario,
     run: ConsensusSession,
     parsed_by_agent: list[tuple[Agent, SRRResponse]],
-    reasoning_by_agent: dict[int, ReasoningLog],
     consensus_call: Callable[..., tuple[str, int]] | None,
     peer_outputs: list[dict[str, Any]],
     simulation_output: dict[str, Any] | None,
@@ -779,7 +1030,7 @@ def _run_consensus_round(
             else:
                 raw_content, token_usage = consensus_call(agent, scenario, effective_peer_outputs)
             round_tokens += token_usage
-            raw_json, reviewed, _ = _validated_response(raw_content)
+            _, reviewed, _ = _validated_response(raw_content)
             if reviewed is None:
                 consensus_results.append((agent, initial_response))
                 logs.append(
@@ -794,11 +1045,6 @@ def _run_consensus_round(
             consensus_results.append((agent, reviewed))
             logs.append(_log(log_stage, "SUCCESS", f"{agent.name}: peer review completed with {token_usage} tokens."))
             emit(logs)
-            reasoning_log = reasoning_by_agent.get(agent.id)
-            if reasoning_log is not None:
-                reasoning_log.raw_json = raw_json
-                reasoning_log.parsed_srr_objects = reviewed.model_dump(mode="json")
-                reasoning_log.provenance_count = _provenance_counts(reviewed)[0]
         except Exception as error:
             if isinstance(
                 error,
@@ -924,7 +1170,7 @@ def execute_full_shcr_cycle(
                         agent_id=agent.id,
                         scenario_id=scenario.id,
                         run_id=session_id,
-                        raw_json=raw_json,
+                        raw_json=sanitize_simulation_payload(raw_json),
                         parsed_srr_objects={},
                         is_schema_valid=False,
                         provenance_count=0,
@@ -942,8 +1188,17 @@ def execute_full_shcr_cycle(
                 agent_id=agent.id,
                 scenario_id=scenario.id,
                 run_id=session_id,
-                raw_json=raw_json,
+                raw_json=sanitize_simulation_payload(raw_json),
                 parsed_srr_objects=parsed.model_dump(mode="json"),
+                deliberation_history=[
+                    {
+                        "stage": "INITIAL",
+                        "round_number": 0,
+                        "artifacts": sanitize_simulation_payload(
+                            parsed.model_dump(mode="json")
+                        ),
+                    }
+                ],
                 is_schema_valid=True,
                 provenance_count=tagged,
             )
@@ -965,6 +1220,7 @@ def execute_full_shcr_cycle(
             session.commit()
             raise RuntimeError(failure_message)
 
+        session.commit()
         if reviewer is None:
             logs.append(_log("CONSENSUS", "INFO", "Consensus review callback not configured; retaining supplied test outputs."))
             emit(logs)
@@ -982,7 +1238,6 @@ def execute_full_shcr_cycle(
                 scenario,
                 run,
                 parsed_by_agent,
-                reasoning_by_agent,
                 consensus_call,
                 peer_outputs,
                 None,
@@ -1002,6 +1257,21 @@ def execute_full_shcr_cycle(
                 session.commit()
                 raise RuntimeError(failure_message)
             parsed_by_agent = consensus_results
+
+        _record_deliberation_stage(
+            reasoning_by_agent,
+            parsed_by_agent,
+            "PRE_ARBITRATION",
+            0,
+        )
+        observations = _ensure_influence_observations(
+            session,
+            scenario,
+            session_id,
+            parsed_by_agent,
+            observations,
+        )
+        session.commit()
 
         final_provenance = [_provenance_counts(response) for _, response in parsed_by_agent]
         tagged_items = sum(tagged for tagged, _ in final_provenance)
@@ -1041,14 +1311,34 @@ def execute_full_shcr_cycle(
                 influence_results,
                 strict=True,
             ):
+                weighted_agent = agents_by_id[observation.agent_id]
                 observation.raw_score = float(result["raw_score"])
                 observation.normalized_weight = float(result["normalized_weight"])
+                observation.calculation_payload = {
+                    **dict(observation.calculation_payload or {}),
+                    "inputs": {
+                        "theta_x": weighted_agent.theta_x,
+                        "theta_q": weighted_agent.theta_q,
+                        "theta_h": weighted_agent.theta_h,
+                        "theta_s": weighted_agent.theta_s,
+                        "theta_u": weighted_agent.theta_u,
+                        "X": observation.X,
+                        "Q": observation.Q,
+                        "H": observation.H,
+                        "S": observation.S,
+                        "U": observation.U,
+                        "gate": observation.gate,
+                    },
+                    "raw_score": observation.raw_score,
+                    "normalized_weight": observation.normalized_weight,
+                }
 
         conflicts = _detect_ddr_conflicts(
             session,
             scenario,
             session_id,
             parsed_by_agent,
+            influence_observations,
             logs,
             emit,
         )
@@ -1108,7 +1398,6 @@ def execute_full_shcr_cycle(
                 scenario,
                 run,
                 parsed_by_agent,
-                reasoning_by_agent,
                 consensus_call,
                 peer_outputs,
                 simulation_output,
@@ -1119,6 +1408,13 @@ def execute_full_shcr_cycle(
             if len(simulation_results) < 2:
                 break
             parsed_by_agent = simulation_results
+            _record_deliberation_stage(
+                reasoning_by_agent,
+                parsed_by_agent,
+                "POST_SIMULATION",
+                round_number,
+            )
+            session.commit()
             remaining_conflicts = _collect_prediction_conflicts(parsed_by_agent)
             if artifact is not None:
                 artifact_payload = dict(artifact.output_payload)
@@ -1143,6 +1439,14 @@ def execute_full_shcr_cycle(
                 )
             )
             emit(logs)
+
+        _record_deliberation_stage(
+            reasoning_by_agent,
+            parsed_by_agent,
+            "FINAL",
+            simulation_rounds,
+        )
+        session.commit()
 
         final_provenance = [_provenance_counts(response) for _, response in parsed_by_agent]
         tagged_items = sum(tagged for tagged, _ in final_provenance)

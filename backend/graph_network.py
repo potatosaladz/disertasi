@@ -297,6 +297,7 @@ def run_graph_payload(database: Any, run: ConsensusSession) -> dict[str, Any]:
                     "schema_valid": reasoning_log.is_schema_valid if reasoning_log else None,
                     "provenance_count": reasoning_log.provenance_count if reasoning_log else 0,
                     "decision_artifacts": reasoning_log.parsed_srr_objects if reasoning_log else {},
+                    "deliberation_history": reasoning_log.deliberation_history if reasoning_log else [],
                     "logs": [
                         item
                         for item in log_refs["SRR"]
@@ -366,6 +367,8 @@ def run_graph_payload(database: Any, run: ConsensusSession) -> dict[str, Any]:
                         "proposition": item.proposition,
                         "raw_score": item.raw_score,
                         "normalized_weight": item.normalized_weight,
+                        "interactions": item.interaction_payload,
+                        "calculation": item.calculation_payload,
                     }
                     for item in influence_observations
                 ],
@@ -397,6 +400,7 @@ def run_graph_payload(database: Any, run: ConsensusSession) -> dict[str, Any]:
                 if getattr(item, component)
             ],
             "route": item.resolution_route,
+            "detail": item.detail_payload,
         }
         for item, left_name, right_name in disagreement_rows
     ]

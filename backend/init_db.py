@@ -23,6 +23,63 @@ _CONSENSUS_SESSION_COLUMNS: dict[str, str] = {
     "progress_stage": "VARCHAR(50)",
 }
 
+_REASONING_LOG_COLUMNS: dict[str, str] = {
+    "deliberation_history": "JSONB NOT NULL DEFAULT '[]'::jsonb",
+}
+
+_INFLUENCE_OBSERVATION_COLUMNS: dict[str, str] = {
+    "interaction_payload": "JSONB NOT NULL DEFAULT '[]'::jsonb",
+    "calculation_payload": "JSONB NOT NULL DEFAULT '{}'::jsonb",
+}
+
+_DISAGREEMENT_LOG_COLUMNS: dict[str, str] = {
+    "detail_payload": "JSONB NOT NULL DEFAULT '{}'::jsonb",
+}
+
+
+def _upgrade_disagreement_logs_table() -> None:
+    inspector = inspect(engine)
+    if "disagreement_logs" not in inspector.get_table_names():
+        return
+    columns = {column["name"] for column in inspector.get_columns("disagreement_logs")}
+    with engine.begin() as connection:
+        for name, definition in _DISAGREEMENT_LOG_COLUMNS.items():
+            if name not in columns:
+                connection.execute(
+                    text(f'ALTER TABLE disagreement_logs ADD COLUMN "{name}" {definition}')
+                )
+
+
+def _upgrade_influence_observations_table() -> None:
+    inspector = inspect(engine)
+    if "agent_influence_observations" not in inspector.get_table_names():
+        return
+    columns = {
+        column["name"]
+        for column in inspector.get_columns("agent_influence_observations")
+    }
+    with engine.begin() as connection:
+        for name, definition in _INFLUENCE_OBSERVATION_COLUMNS.items():
+            if name not in columns:
+                connection.execute(
+                    text(
+                        f'ALTER TABLE agent_influence_observations ADD COLUMN "{name}" {definition}'
+                    )
+                )
+
+
+def _upgrade_reasoning_logs_table() -> None:
+    inspector = inspect(engine)
+    if "reasoning_logs" not in inspector.get_table_names():
+        return
+    columns = {column["name"] for column in inspector.get_columns("reasoning_logs")}
+    with engine.begin() as connection:
+        for name, definition in _REASONING_LOG_COLUMNS.items():
+            if name not in columns:
+                connection.execute(
+                    text(f'ALTER TABLE reasoning_logs ADD COLUMN "{name}" {definition}')
+                )
+
 
 def _upgrade_consensus_sessions_table() -> None:
     inspector = inspect(engine)
@@ -158,6 +215,9 @@ def initialize_database() -> None:
     _upgrade_agents_table()
     _upgrade_scenarios_table()
     _upgrade_consensus_sessions_table()
+    _upgrade_reasoning_logs_table()
+    _upgrade_influence_observations_table()
+    _upgrade_disagreement_logs_table()
     _upgrade_simulation_artifacts_table()
     _upgrade_session_columns()
 

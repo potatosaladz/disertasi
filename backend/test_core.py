@@ -272,6 +272,17 @@ def test_safe_softmax_handles_large_scores() -> None:
     assert results[0]["normalized_weight"] == pytest.approx(0.5)
 
 
+def test_safe_softmax_skips_extreme_inactive_score() -> None:
+    active = make_agent()
+    inactive = make_agent(gate=0)
+    inactive["X"] = 1_000_000.0
+
+    results = calculate_dynamic_influence([active, inactive], ["p", "p"])
+
+    assert results[0]["normalized_weight"] == 1.0
+    assert results[1]["normalized_weight"] == 0.0
+
+
 def test_softmax_sum() -> None:
     agents = [
         make_agent(uncertainty=0.0),

@@ -981,7 +981,7 @@ def test_dashboard_matrix_and_manifest(client: TestClient) -> None:
         session.add(MetricSnapshot(run_id=run_id, scenario_id=scenario.id, provenance_completeness_percent=75.0, material_information_retention_macro_f1=0.8, hard_constraint_violation_rate=20.0, feasible_alternatives_count=4, convergence_status="INFEASIBLE", latency_ms=120.0, token_usage=500))
         session.add(MetricSnapshot(scenario_id=scenario.id, provenance_completeness_percent=10.0, material_information_retention_macro_f1=0.1, hard_constraint_violation_rate=90.0, feasible_alternatives_count=1, convergence_status="NO_CONSENSUS", latency_ms=50.0, token_usage=100))
         session.add_all([
-            ReasoningLog(run_id=run_id, agent_id=agent_i.id, scenario_id=scenario.id, raw_json={"prompt": "i"}, parsed_srr_objects={"evidence": []}, is_schema_valid=True, provenance_count=2),
+            ReasoningLog(run_id=run_id, agent_id=agent_i.id, scenario_id=scenario.id, raw_json={"prompt": "i"}, parsed_srr_objects={"evidence": [{"content": "Fiscal baseline"}]}, deliberation_history=[{"stage": "INITIAL", "round_number": 0, "artifacts": {"reasoning_summary": "Prioritize fiscal space", "constraints": [{"content": "Deficit cap"}], "recommendation": {"content": "Use phased financing"}, "confidence": 0.8, "evidence": [{"content": "Fiscal baseline"}], "predictions": [{"content": "Stable deficit"}], "risks": [{"content": "Revenue shortfall"}], "uncertainties": [{"content": "Growth"}], "alternatives": [{"name": "Phased financing", "deficit": 2.5, "utility": 0.8}]}}, {"stage": "PRE_ARBITRATION", "round_number": 0, "artifacts": {"reasoning_summary": "Adopt phased financing before arbitration", "constraints": [{"content": "Deficit cap"}], "recommendation": {"content": "Use phased financing"}, "confidence": 0.82, "evidence": [{"content": "Fiscal baseline"}], "predictions": [{"content": "Stable deficit"}], "risks": [{"content": "Revenue shortfall"}], "uncertainties": [{"content": "Growth"}], "alternatives": [{"name": "Phased financing", "deficit": 2.5, "utility": 0.8}]}}], is_schema_valid=True, provenance_count=2),
             ReasoningLog(run_id=run_id, agent_id=agent_j.id, scenario_id=scenario.id, raw_json={"prompt": "j"}, parsed_srr_objects={"evidence": []}, is_schema_valid=False, provenance_count=0),
         ])
         session.add(DisagreementLog(run_id=run_id, scenario_id=scenario.id, agent_i=agent_i.id, agent_j=agent_j.id, dE=True, dP=True, dREC=False))
@@ -1013,6 +1013,20 @@ def test_dashboard_matrix_and_manifest(client: TestClient) -> None:
     assert run_status_response.status_code == 200
     assert run_status_response.json()["simulation_artifacts"][0]["input"]["conflicts"][0]["components"] == ["dP"]
     assert run_status_response.json()["simulation_artifacts"][0]["output"]["evidence_status"] == "modelled"
+    run_agents = run_status_response.json()["agent_breakdown"]
+    assert run_agents[0]["agent_opinion"] == "Adopt phased financing before arbitration"
+    assert run_agents[0]["recommendation"]["content"] == "Use phased financing"
+    assert run_agents[0]["confidence"] == 0.82
+    assert run_agents[0]["constraints_considered"][0]["content"] == "Deficit cap"
+    assert len(run_agents[0]["deliberation_stages"]) == 2
+
+    ddr_response = client.get(f"/api/runs/simulation-dashboard-{run_id}/ddr")
+    assert ddr_response.status_code == 200
+    ddr_payload = ddr_response.json()["disagreements"][0]
+    assert ddr_payload["active_components"] == ["dE", "dP"]
+    assert ddr_payload["conflict_categories"][0]["category"] == "Evidence & provenance"
+    assert "compromise_formula" in ddr_payload["fiscal_calculation"]
+    assert ddr_payload["resolution_detail"]["arbiter_conclusion"] == "Use a phased compromise"
 
     graph_response = client.get(f"/api/scenarios/{scenario_id}/runs/{run_id}/graph")
     assert graph_response.status_code == 200
@@ -1035,7 +1049,9 @@ def test_dashboard_matrix_and_manifest(client: TestClient) -> None:
     assert payload["latest_metric"]["convergence_status"] == "INFEASIBLE"
     assert payload["schema_validity_percent"] == 50.0
     assert payload["disagreements"][0]["dE"] is True
-    assert payload["disagreements"][0]["resolution_mechanism"] == "Provenance Retrieval Triggered"
+    assert payload["disagreements"][0]["resolution_mechanism"] == "Simulation Agent Requested"
+    assert payload["agent_breakdown"][0]["pre_arbitration"]["agent_opinion"] == "Adopt phased financing before arbitration"
+    assert payload["agent_breakdown"][0]["alternatives"][0]["name"] == "Phased financing"
     assert payload["simulation_artifacts"][0]["output"]["evidence_status"] == "modelled"
 
     manifest = client.get(f"/api/scenarios/{scenario_id}/manifest")
@@ -1045,6 +1061,7 @@ def test_dashboard_matrix_and_manifest(client: TestClient) -> None:
     assert "llm_api_key" not in manifest_payload["agents"][0]
     assert manifest_payload["llm_outputs"][0]["raw_json"]["prompt"] in {"i", "j"}
     assert manifest_payload["metrics"][0]["convergence_status"] == "INFEASIBLE"
+    assert manifest_payload["agent_breakdown"][0]["evidence"][0]["content"] == "Fiscal baseline"
     assert manifest_payload["simulation_artifacts"][0]["output"]["resolution"] == "Use a phased compromise"
 
     with SessionLocal() as session:

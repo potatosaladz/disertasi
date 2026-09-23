@@ -86,9 +86,13 @@ BEGIN
         CREATE INDEX IF NOT EXISTS ix_consensus_sessions_scenario_id
             ON consensus_sessions (scenario_id);
         ALTER TABLE IF EXISTS reasoning_logs ADD COLUMN IF NOT EXISTS run_id VARCHAR(36) REFERENCES consensus_sessions(id) ON DELETE CASCADE;
+        ALTER TABLE IF EXISTS reasoning_logs ADD COLUMN IF NOT EXISTS deliberation_history JSONB NOT NULL DEFAULT '[]'::jsonb;
         ALTER TABLE IF EXISTS disagreement_logs ADD COLUMN IF NOT EXISTS run_id VARCHAR(36) REFERENCES consensus_sessions(id) ON DELETE CASCADE;
+        ALTER TABLE IF EXISTS disagreement_logs ADD COLUMN IF NOT EXISTS detail_payload JSONB NOT NULL DEFAULT '{}'::jsonb;
         ALTER TABLE IF EXISTS metric_snapshots ADD COLUMN IF NOT EXISTS run_id VARCHAR(36) REFERENCES consensus_sessions(id) ON DELETE CASCADE;
         ALTER TABLE IF EXISTS agent_influence_observations ADD COLUMN IF NOT EXISTS run_id VARCHAR(36) REFERENCES consensus_sessions(id) ON DELETE CASCADE;
+        ALTER TABLE IF EXISTS agent_influence_observations ADD COLUMN IF NOT EXISTS interaction_payload JSONB NOT NULL DEFAULT '[]'::jsonb;
+        ALTER TABLE IF EXISTS agent_influence_observations ADD COLUMN IF NOT EXISTS calculation_payload JSONB NOT NULL DEFAULT '{}'::jsonb;
         CREATE INDEX IF NOT EXISTS ix_reasoning_logs_run_id ON reasoning_logs (run_id);
         CREATE INDEX IF NOT EXISTS ix_disagreement_logs_run_id ON disagreement_logs (run_id);
         CREATE INDEX IF NOT EXISTS ix_metric_snapshots_run_id ON metric_snapshots (run_id);

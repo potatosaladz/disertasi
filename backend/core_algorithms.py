@@ -27,12 +27,23 @@ DDR_COMPONENT_FIELDS = {
     "dC": "C",
     "dREC": "REC",
 }
+DDR_COMPONENT_DETAILS = {
+    "dE": ("Evidence & provenance", "Bukti atau rujukan sumber yang dipakai kedua agen berbeda."),
+    "dA": ("Assumptions", "Asumsi dasar yang menopang argumen kedua agen tidak sama."),
+    "dP": ("Fiscal projection", "Proyeksi dampak, termasuk arah atau besaran defisit, berbeda dan memerlukan simulasi."),
+    "dR": ("Risk assessment", "Profil risiko kebijakan dinilai berbeda oleh kedua agen."),
+    "dU": ("Uncertainty", "Sumber ketidakpastian atau batas pengetahuan yang dicatat kedua agen berbeda."),
+    "dO": ("Policy objective", "Tujuan atau prioritas kebijakan yang digunakan kedua agen tidak identik."),
+    "dC": ("Statutory constraint", "Constraint atau statutory gate yang diterapkan kedua agen berbeda."),
+    "dREC": ("Recommendation", "Rekomendasi kebijakan parsial kedua agen berbeda."),
+}
 T = TypeVar("T")
 
 SRR_OUTPUT_INSTRUCTIONS = (
     "Return only one valid SRR JSON object. A decision-complete response must include non-empty "
     "evidence, predictions, risks, uncertainties, and alternatives arrays, plus recommendation and "
-    "confidence. Include assumptions, objectives, constraints, and "
+    "confidence. Include a concise reasoning_summary that states the agent's inspectable policy opinion, "
+    "plus assumptions, objectives, constraints, and "
     "material_information_retention_macro_f1 when supported. Every typed item must contain content "
     "and an optional source_tag. Every alternative must contain name, deficit, utility, and optional "
     "source_tag. Additional structured fields are allowed. Analyze impacts, risks, uncertainties, "
@@ -358,7 +369,7 @@ def calculate_dynamic_influence(
 
     max_score = max(active_scores)
     numerators = [
-        gate * math.exp(score - max_score)
+        math.exp(score - max_score) if gate == 1 else 0.0
         for score, gate in zip(scores, gates, strict=True)
     ]
     denominator = math.fsum(numerators)
@@ -405,6 +416,32 @@ def _component_value(item: object, component: str, semantic_field: str) -> Any:
         return getattr(item, semantic_field)
     except AttributeError as error:
         raise ValueError(f"Missing required field: {component}") from error
+
+
+def describe_divergence_vector(vector: Mapping[str, object]) -> list[dict[str, str]]:
+    return [
+        {
+            "component": component,
+            "category": DDR_COMPONENT_DETAILS[component][0],
+            "narrative": DDR_COMPONENT_DETAILS[component][1],
+        }
+        for component in DDR_COMPONENT_FIELDS
+        if bool(vector.get(component))
+    ]
+
+
+def resolve_disagreement_route(vector: Mapping[str, object]) -> str:
+    if bool(vector.get("dP")):
+        return "Simulation Agent Requested"
+    if bool(vector.get("dC")):
+        return "Constraint Arbitration Required"
+    if bool(vector.get("dE")):
+        return "Provenance Retrieval Triggered"
+    if bool(vector.get("dREC")) or bool(vector.get("dO")):
+        return "Pareto Reconciliation"
+    if any(bool(vector.get(component)) for component in ("dA", "dR", "dU")):
+        return "Evidence Review Required"
+    return "No Resolution Required"
 
 
 def detect_divergence_vector(

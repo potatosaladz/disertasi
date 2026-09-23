@@ -152,7 +152,22 @@ class SRRItem(BaseModel):
         if isinstance(value, dict):
             payload = dict(value)
             if not payload.get("content"):
-                for key in ("text", "description", "claim", "value", "recommendation", "action", "rationale", "alternative", "summary"):
+                for key in (
+                    "content",
+                    "text",
+                    "description",
+                    "claim",
+                    "value",
+                    "recommendation",
+                    "decision",
+                    "verdict",
+                    "key_action",
+                    "preferred_alternative",
+                    "action",
+                    "rationale",
+                    "alternative",
+                    "summary",
+                ):
                     if isinstance(payload.get(key), str) and payload[key].strip():
                         payload["content"] = payload[key].strip()
                         break
@@ -238,6 +253,7 @@ class Alternative(BaseModel):
 class SRRResponse(BaseModel):
     model_config = ConfigDict(extra="allow")
 
+    reasoning_summary: str | None = None
     evidence: list[Evidence] = Field(default_factory=list)
     assumptions: list[Assumption] = Field(default_factory=list)
     predictions: list[Prediction] = Field(default_factory=list)
@@ -266,6 +282,7 @@ class SRRResponse(BaseModel):
                 payload = {**nested, **{key: item for key, item in payload.items() if key != wrapper}}
                 break
         aliases = {
+            "reasoning_summary": ("agent_opinion", "opinion", "summary", "rationale"),
             "evidence": ("evidences", "required_evidence", "evidence_requirements"),
             "predictions": ("prediction", "forecast", "forecasts"),
             "risks": ("risk", "threats"),
@@ -285,6 +302,27 @@ class SRRResponse(BaseModel):
                 payload[field] = [item.strip() for item in re.split(r"[;\n]+", payload[field]) if item.strip()]
             elif isinstance(payload.get(field), dict):
                 payload[field] = [payload[field]]
+        alternatives = payload.get("alternatives")
+        if isinstance(alternatives, list):
+            valid_alternatives: list[dict[str, object]] = []
+            discarded_alternatives: list[dict[str, object]] = []
+            for alternative in alternatives:
+                try:
+                    valid_alternatives.append(
+                        Alternative.model_validate(alternative).model_dump(mode="json")
+                    )
+                except (ValueError, TypeError):
+                    if isinstance(alternative, dict):
+                        discarded_alternatives.append(
+                            {
+                                "name": str(alternative.get("name") or "Unnamed alternative"),
+                                "deficit_raw": alternative.get("deficit"),
+                                "reason": "Deficit or utility is not numerically verifiable.",
+                            }
+                        )
+            payload["alternatives"] = valid_alternatives
+            if discarded_alternatives:
+                payload["discarded_alternatives"] = discarded_alternatives
         if isinstance(payload.get("recommendation"), list):
             payload["recommendation"] = payload["recommendation"][0] if payload["recommendation"] else None
         if isinstance(payload.get("recommendation"), dict):
@@ -297,6 +335,9 @@ class SRRResponse(BaseModel):
                     "decision",
                     "action",
                     "recommendation",
+                    "verdict",
+                    "key_action",
+                    "preferred_alternative",
                     "rationale",
                     "summary",
                     "authorized_scope",
@@ -345,6 +386,11 @@ class SRRResponse(BaseModel):
         }
 
 
+_SIMULATION_SUMMARY_FALLBACK = (
+    "Simulasi makro-fiskal otomatis diselesaikan oleh arbiter native."
+)
+
+
 class SimulationAlternative(Alternative):
     source_tag: str = "SIMULATION_MODELLED"
     evidence_status: Literal["modelled"] = "modelled"
@@ -366,8 +412,19 @@ class SimulationResponse(SRRResponse):
         if not isinstance(value, dict):
             return value
         payload = dict(value)
-        for field in ("simulation_summary", "resolution"):
-            payload[field] = _coerce_text(payload.get(field))
+        for wrapper in ("analysis", "result", "data", "output", "srr"):
+            nested = payload.get(wrapper)
+            if isinstance(nested, dict):
+                payload = {
+                    **nested,
+                    **{key: item for key, item in payload.items() if key != wrapper},
+                }
+                break
+        simulation_summary = _coerce_text(payload.get("simulation_summary"))
+        payload["simulation_summary"] = (
+            simulation_summary or _SIMULATION_SUMMARY_FALLBACK
+        )
+        payload["resolution"] = _coerce_text(payload.get("resolution"))
         for field in ("conflict_summary", "modelled_variables", "limitations"):
             payload[field] = _coerce_text_list(payload.get(field))
         payload.setdefault("evidence_status", "modelled")

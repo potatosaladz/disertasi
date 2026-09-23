@@ -27,7 +27,7 @@ from worker.celery_tasks import (
 )
 from backend.core_algorithms import resolve_llm_runtime_config
 from backend.simulation_agent import SIMULATION_AGENT_NAME, SIMULATION_AGENT_VERSION
-from worker.srr_models import Evidence, SRRResponse
+from worker.srr_models import Evidence, SRRResponse, SimulationResponse
 
 
 @pytest.fixture
@@ -246,6 +246,77 @@ def test_flexible_srr_response_sanitises_formatted_numbers_and_optional_recommen
 def test_optional_empty_recommendation_is_accepted() -> None:
     parsed = SRRResponse.model_validate({"recommendation": {"content": ""}})
     assert parsed.recommendation is None
+
+
+def test_unverifiable_alternative_is_discarded_without_fabricating_deficit() -> None:
+    parsed = SRRResponse.model_validate(
+        {
+            "evidence": ["Budget baseline"],
+            "predictions": ["Stable deficit"],
+            "risks": ["Execution risk"],
+            "uncertainties": ["Demand response"],
+            "alternatives": [
+                {"name": "Verified phased", "deficit": "2.4%", "utility": 0.8},
+                {
+                    "name": "Unquantified option",
+                    "deficit": "Material increase without verified GDP ratio",
+                    "utility": 0.2,
+                },
+            ],
+            "recommendation": {
+                "key_action": "Adopt verified phased implementation",
+            },
+            "confidence": 0.8,
+        }
+    )
+    assert [item.name for item in parsed.alternatives] == ["Verified phased"]
+    assert parsed.recommendation is not None
+    assert parsed.recommendation.content == "Adopt verified phased implementation"
+    assert parsed.model_extra is not None
+    assert parsed.model_extra["discarded_alternatives"][0]["deficit_raw"] == (
+        "Material increase without verified GDP ratio"
+    )
+
+
+def test_simulation_response_uses_summary_fallback_for_empty_llm_value() -> None:
+    parsed = SimulationResponse.model_validate(
+        {
+            "simulation_summary": "   ",
+            "conflict_summary": ["Prediction divergence"],
+            "resolution": "Use a phased compromise",
+            "evidence": ["Structured sectoral outputs"],
+            "predictions": ["Deficit remains bounded"],
+            "risks": ["Implementation delay"],
+            "uncertainties": ["Demand response"],
+            "alternatives": [{"name": "Phased", "deficit": 2.4, "utility": 0.8}],
+            "recommendation": {"content": "Use phased compromise"},
+            "confidence": 0.8,
+        }
+    )
+    assert parsed.simulation_summary == (
+        "Simulasi makro-fiskal otomatis diselesaikan oleh arbiter native."
+    )
+
+
+def test_recommendation_verdict_alias_is_normalised() -> None:
+    parsed = SRRResponse.model_validate(
+        {
+            "evidence": ["Budget baseline"],
+            "predictions": ["Stable deficit"],
+            "risks": ["Yield pressure"],
+            "uncertainties": ["Demand response"],
+            "alternatives": [{"name": "Cohort", "deficit": 2.0, "utility": 0.8}],
+            "recommendation": {
+                "status": "APPROVED_WITH_CONDITIONS",
+                "verdict": "Approve the cohort rollout",
+                "conditions": ["Stay within the legal ceiling"],
+            },
+            "confidence": 0.9,
+        }
+    )
+    assert parsed.recommendation is not None
+    assert parsed.recommendation.content == "Approve the cohort rollout"
+
 
 
 def test_validated_response_accepts_formatted_fiscal_deficits() -> None:
@@ -480,6 +551,53 @@ def test_consensus_round_reviews_peer_outputs(scenario_id: int) -> None:
     assert any(log["stage"] == "CONSENSUS" for log in result["logs"])
 
 
+def test_run_creates_rar_dai_observations_when_no_seed_exists(
+    scenario_id: int,
+) -> None:
+    session_id = _create_isolated_session(scenario_id)
+    with SessionLocal() as session:
+        session.execute(
+            delete(AgentInfluenceObservation).where(
+                AgentInfluenceObservation.run_id == session_id
+            )
+        )
+        session.commit()
+    first_round = iter(
+        [
+            (response_payload(prediction="Growth 2%", utility=0.8, recommendation="Adopt A"), 10),
+            (response_payload(prediction="Growth 1%", utility=0.6, recommendation="Adopt B"), 11),
+        ]
+    )
+    reviewed = iter(
+        [
+            (response_payload(prediction="Growth 1.5%", utility=0.75, recommendation="Adopt C"), 12),
+            (response_payload(prediction="Growth 1.5%", utility=0.75, recommendation="Adopt C"), 13),
+        ]
+    )
+
+    execute_full_shcr_cycle(
+        scenario_id,
+        session_id,
+        llm_call=lambda _agent, _scenario: next(first_round),
+        consensus_call=lambda _agent, _scenario, _peers: next(reviewed),
+        enable_simulation=False,
+    )
+
+    with SessionLocal() as session:
+        observations = list(
+            session.scalars(
+                select(AgentInfluenceObservation)
+                .where(AgentInfluenceObservation.run_id == session_id)
+                .order_by(AgentInfluenceObservation.agent_id)
+            )
+        )
+        assert len(observations) == 2
+        assert sum(item.normalized_weight or 0.0 for item in observations) == pytest.approx(1.0)
+        assert all(len(item.interaction_payload) == 1 for item in observations)
+        assert all(item.calculation_payload["version"] == "rar-dai-v1" for item in observations)
+        assert all(item.proposition == "Phase 3 mocked fiscal scenario" for item in observations)
+
+
 def test_ddr_invokes_native_simulation_and_feeds_follow_up_round(
     scenario_id: int,
 ) -> None:
@@ -576,7 +694,7 @@ def test_ddr_invokes_native_simulation_and_feeds_follow_up_round(
             session.scalars(
                 select(SimulationArtifact).where(
                     SimulationArtifact.run_id == result["session_id"]
-                )
+                ).order_by(SimulationArtifact.round_number)
             )
         )
         assert len(artifacts) == 2
@@ -708,6 +826,9 @@ def test_run_full_shcr_cycle_populates_postgres(scenario_id: int) -> None:
         assert disagreement is not None
         assert disagreement.dP is True
         assert disagreement.resolution_route == "Simulation Agent Requested"
+        assert disagreement.detail_payload["categories"]
+        assert disagreement.detail_payload["fiscal_calculation"]["formula"].startswith("headroom_percent")
+        assert disagreement.detail_payload["legal_basis"]
 
         observations = list(
             session.scalars(
@@ -717,7 +838,11 @@ def test_run_full_shcr_cycle_populates_postgres(scenario_id: int) -> None:
                 )
             )
         )
+        assert len(observations) == 2
         assert sum(item.normalized_weight or 0.0 for item in observations) == pytest.approx(1.0)
+        assert all(item.interaction_payload for item in observations)
+        assert all(item.calculation_payload["version"] == "rar-dai-v1" for item in observations)
+        assert all("normalized_weight" in item.calculation_payload for item in observations)
 
         run = session.get(ConsensusSession, result["session_id"])
         assert run is not None
