@@ -6,6 +6,8 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import aliased
 
+from .analytical_events import normalize_event
+from .localization import DEFAULT_LANGUAGE, Language, localize_payload
 from .models import (
     Agent,
     AgentInfluenceObservation,
@@ -16,17 +18,9 @@ from .models import (
     Scenario,
     SimulationArtifact,
 )
+from .sanitization import sanitize_public_value
 
 GraphStatus = str
-
-_PRIVATE_DETAIL_KEYS = {
-    "analysis",
-    "chain_of_thought",
-    "chainofthought",
-    "hidden_reasoning",
-    "reasoning_trace",
-    "thoughts",
-}
 
 _STAGE_ORDER = {
     "QUEUE": 0,
@@ -122,27 +116,23 @@ def _edge_status(source_status: GraphStatus, target_status: GraphStatus) -> Grap
 
 
 def _safe_detail(value: object) -> object:
-    if isinstance(value, dict):
-        return {
-            key: _safe_detail(item)
-            for key, item in value.items()
-            if key.casefold() not in _PRIVATE_DETAIL_KEYS
-        }
-    if isinstance(value, list):
-        return [_safe_detail(item) for item in value]
-    return value
+    return sanitize_public_value(value)
 
 
-def _safe_log(log: dict[str, Any], index: int) -> dict[str, Any]:
-    return {
-        "index": index,
-        "stage": log.get("stage"),
-        "level": log.get("level"),
-        "message": log.get("message"),
-    }
+def _safe_log(log: dict[str, Any], index: int, lang: Language) -> dict[str, Any]:
+    event = normalize_event(log)
+    localized = localize_payload(event, lang)
+    safe_localized = sanitize_public_value(localized)
+    if not isinstance(safe_localized, dict):
+        return {"index": index}
+    return {"index": index, **safe_localized}
 
 
-def run_graph_payload(database: Any, run: ConsensusSession) -> dict[str, Any]:
+def run_graph_payload(
+    database: Any,
+    run: ConsensusSession,
+    lang: Language = DEFAULT_LANGUAGE,
+) -> dict[str, Any]:
     scenario = database.get(Scenario, run.scenario_id)
     if scenario is None:
         raise ValueError("Scenario for consensus run does not exist")
@@ -195,7 +185,7 @@ def run_graph_payload(database: Any, run: ConsensusSession) -> dict[str, Any]:
     logs = [dict(item) for item in (run.logs or [])]
     log_refs = {
         stage: [
-            _safe_log(log, index)
+            _safe_log(log, index, lang)
             for index, log in enumerate(logs)
             if log.get("stage") == stage
         ]
@@ -491,9 +481,14 @@ def run_graph_payload(database: Any, run: ConsensusSession) -> dict[str, Any]:
                 artifact.round_number - 1,
                 details={
                     "artifact_id": artifact.id,
+                    "round_number": artifact.round_number,
                     "remaining_prediction_conflicts": remaining,
                     "follow_up_consensus_status": follow_up,
-                    "logs": log_refs["SIMULATION_CONSENSUS"],
+                    "logs": [
+                        item
+                        for item in log_refs["SIMULATION_CONSENSUS"]
+                        if item.get("round_number") == artifact.round_number
+                    ],
                 },
             )
         )
@@ -609,7 +604,53 @@ def run_graph_payload(database: Any, run: ConsensusSession) -> dict[str, Any]:
         ),
     )
 
-    return {
+    graph_labels = {
+        "scenario:start": {"id": "Mulai Skenario & Sesi Baru", "en": "Start Scenario & New Session"},
+        "stage:mandate": {"id": "1. Sintesis Mandat Agen Sektoral", "en": "1. Sectoral Agent Mandate Synthesis"},
+        "stage:peer-review": {"id": "2. Peer Review & Pertukaran Output", "en": "2. Peer Review & Output Exchange"},
+        "stage:rar-dai": {"id": "RAR → DAI: Pengaruh Dinamis", "en": "RAR → DAI: Dynamic Influence"},
+        "stage:ddr": {"id": "3. DDR: Konflik / Deadlock?", "en": "3. DDR: Conflict / Deadlock?"},
+        "stage:quorum": {"id": "6. Pengujian Quorum & Validasi Artefak", "en": "6. Quorum Test & Artifact Validation"},
+        "consensus:final": {"id": "7. Konsensus Final & Output Kebijakan", "en": "7. Final Consensus & Policy Output"},
+    }
+    for node in nodes:
+        translation = graph_labels.get(node["id"])
+        if node["id"].startswith("simulation:"):
+            translation = {"id": f"4–5. Simulation Agent / Ronde {node['details'].get('round_number')}", "en": f"4–5. Simulation Agent / Round {node['details'].get('round_number')}"}
+        elif node["id"].startswith("stage:simulation-consensus:"):
+            round_number = node["details"].get("round_number")
+            translation = {"id": f"Resolusi → Peer Review / Ronde {round_number}", "en": f"Resolution → Peer Review / Round {round_number}"}
+        if translation:
+            node["label_i18n"] = translation
+            node["label"] = translation[lang]
+    graph_edge_labels = {
+        "edge:start-mandate": {"id": "Inisialisasi sesi", "en": "Session initialization"},
+        "edge:peer-rar-dai": {"id": "Skor RAR → bobot DAI", "en": "RAR scores → DAI weights"},
+        "edge:rar-dai-ddr": {"id": "Analisis divergensi berbobot", "en": "Weighted divergence analysis"},
+        "edge:ddr-quorum": {"id": "Tanpa eskalasi / penyelesaian berbatas", "en": "No escalation / bounded completion"},
+        "edge:quorum-retry": {"id": "Gagal → tinjau ulang", "en": "Failed → review again"},
+        "edge:quorum-final": {"id": "Kuorum lolos", "en": "Quorum passed"},
+    }
+    for edge in edges:
+        translation = graph_edge_labels.get(edge["id"])
+        if edge["id"].startswith("edge:mandate-agent:"):
+            translation = {"id": "Mandat & parameter", "en": "Mandate & parameters"}
+        elif edge["id"].startswith("edge:agent-peer:"):
+            translation = {"id": "Keluaran rekan", "en": "Peer output"}
+        elif edge["id"].startswith("edge:ddr-simulation:"):
+            translation = {"id": "Simulation Agent diminta", "en": "Simulation Agent requested"}
+        elif edge["id"].startswith("edge:simulation-feedback:"):
+            translation = {"id": "Umpan balik hasil resolusi", "en": "Resolution feedback"}
+        elif edge["id"].startswith("edge:consensus-loop:"):
+            remaining = edge.get("label", "—").split(" ", maxsplit=1)[0]
+            translation = {
+                "id": f"{remaining} konflik prediksi tersisa",
+                "en": f"{remaining} prediction conflicts remaining",
+            }
+        if translation:
+            edge["label_i18n"] = translation
+            edge["label"] = translation[lang]
+    payload = {
         "schema_version": "1.0",
         "task_id": run.celery_task_id,
         "session_id": run.id,
@@ -628,3 +669,8 @@ def run_graph_payload(database: Any, run: ConsensusSession) -> dict[str, Any]:
             "convergence_status": metric.convergence_status.value if metric else None,
         },
     }
+    localized = localize_payload(payload, lang)
+    if not isinstance(localized, dict):
+        raise ValueError("Localized graph payload must be an object")
+    localized["language"] = lang
+    return localized

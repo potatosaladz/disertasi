@@ -4,6 +4,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .agent_templates import agent_revision, get_agent_spec, mandate_seed
+from .core_algorithms import STATUTORY_DEFICIT_CEILING_PERCENT_GDP
 from .models import Agent, Scenario, ScenarioMandateSnapshot
 
 
@@ -32,7 +33,7 @@ def _default_dynamic_fields(agent: Agent, scenario: Scenario) -> dict[str, objec
             "Classify disagreements, preserve valid dissent, and escalate unresolved conflicts through DDR and CAR"
         ],
         "regulatory_compliance_alignment": [
-            f"Enforce the {scenario.max_deficit_constraint}% GDP deficit ceiling and reject unverified fiscal offsets"
+            f"Enforce the {min(scenario.max_deficit_constraint, STATUTORY_DEFICIT_CEILING_PERCENT_GDP)}% GDP deficit ceiling and reject unverified fiscal offsets"
         ],
         "llm_model": agent.llm_model,
         "latency_ms": None,
@@ -78,7 +79,10 @@ def _combined_rules(agents: list[Agent], scenario: Scenario) -> dict[str, object
         "owned_checks": sorted({item for spec in specs for item in spec.owned_checks}),
         "principles": sorted({item for spec in specs for item in spec.decision_principles}),
         "primary_sources": sorted({item for spec in specs for item in spec.primary_sources}),
-        "automatic_deficit_ceiling": scenario.max_deficit_constraint,
+        "automatic_deficit_ceiling": min(
+            scenario.max_deficit_constraint,
+            STATUTORY_DEFICIT_CEILING_PERCENT_GDP,
+        ),
     }
 
 

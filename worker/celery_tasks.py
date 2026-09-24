@@ -1,3 +1,5 @@
+import hashlib
+import json
 import logging
 import socket
 from collections.abc import Callable
@@ -12,22 +14,22 @@ from pydantic import ValidationError
 from sqlalchemy import select
 
 from backend.agent_templates import agent_revision, mandate_seed, resolve_agent_system_prompt
+from backend.analytical_events import analytical_event, normalize_event
 from backend.core_algorithms import (
-    HardConstraints,
     build_agent_system_prompt,
     build_agent_user_prompt,
     build_consensus_prompt,
     calculate_dynamic_influence,
     calculate_violation_rate,
-    describe_divergence_vector,
+    DDR_COMPONENT_DETAILS,
     detect_divergence_vector,
     extract_json_object,
     extract_llm_completion,
     llm_request_headers,
     log_llm_outbound,
-    neuro_symbolic_filter,
     resolve_disagreement_route,
     resolve_llm_runtime_config,
+    STATUTORY_DEFICIT_CEILING_PERCENT_GDP,
     validate_decision_artifacts,
 )
 from backend.database import SessionLocal
@@ -56,6 +58,7 @@ from backend.simulation_agent import (
     resolve_simulation_runtime_agent,
     sanitize_simulation_payload,
 )
+from worker.car_solver import evaluate_car_constraints
 from worker.srr_models import SRRResponse, SimulationResponse
 
 logger = logging.getLogger(__name__)
@@ -85,17 +88,86 @@ SimulationCaller = Callable[
     [Scenario, list[dict[str, Any]], list[dict[str, Any]]],
     tuple[str, int],
 ]
-ProgressReporter = Callable[[list[dict[str, str]]], None]
+ProgressReporter = Callable[[list[dict[str, Any]]], None]
 
 
-def _log(stage: str, level: str, message: str) -> dict[str, str]:
-    return {"stage": stage, "level": level, "message": message}
+def _event_id_message(stage: str, message: str) -> str:
+    replacements = {
+        "Sending peer outputs to each agent for structured consensus review.": "Mengirim keluaran rekan ke setiap agen untuk tinjauan konsensus terstruktur.",
+        "Consensus review callback not configured; retaining supplied test outputs.": "Callback tinjauan konsensus tidak dikonfigurasi; keluaran uji yang diberikan dipertahankan.",
+        "Calculating disagreement vectors.": "Menghitung vektor perbedaan.",
+        "Persisting convergence, provenance, latency, and token metrics.": "Menyimpan metrik konvergensi, provenance, latensi, dan token.",
+    }
+    if message in replacements:
+        return replacements[message]
+    if message.startswith("Calling "):
+        return message.replace("Calling ", "Memanggil ", 1).replace(" using ", " menggunakan ", 1)
+    if message.startswith("Cycle completed with state "):
+        return message.replace("Cycle completed with state ", "Siklus selesai dengan status ", 1).replace(" tokens, and ", " token, dan ", 1).replace(" ms latency.", " ms latensi.")
+    if message.startswith("Follow-up round "):
+        return message.replace("Follow-up round ", "Ronde tindak lanjut ", 1).replace(" completed with ", " selesai dengan ", 1).replace(" remaining prediction conflict(s).", " konflik prediksi tersisa.")
+    if stage == "DDR" and ": conflicts=" in message:
+        return message.replace(": conflicts=", ": konflik=", 1).replace("; route=", "; jalur=", 1).replace("none", "tidak ada")
+    if stage == "SRR" and ": valid SRR with " in message:
+        return message.replace(": valid SRR with ", ": SRR valid dengan ", 1).replace(" sourced artifacts and ", " artefak bersumber dan ", 1).replace(" tokens.", " token.")
+    if stage == "SRR" and ": unusable LLM response:" in message:
+        return message.replace(": unusable LLM response:", ": respons LLM tidak dapat digunakan:", 1)
+    if stage in {"CONSENSUS", "SIMULATION_CONSENSUS"} and ": peer review completed with " in message:
+        return message.replace(": peer review completed with ", ": tinjauan rekan selesai dengan ", 1).replace(" tokens.", " token.")
+    if "retained validated SRR artifacts" in message:
+        return message.replace("retained validated SRR artifacts", "artefak SRR tervalidasi dipertahankan")
+    if message.startswith("Feeding native simulation round "):
+        return message.replace("Feeding native simulation round ", "Mengirim hasil simulasi native ronde ", 1).replace(" back to all sectoral agents.", " kembali ke semua agen sektoral.")
+    if message.startswith("Stopped after the bounded maximum of "):
+        return message.replace("Stopped after the bounded maximum of ", "Dihentikan setelah batas maksimum ", 1).replace(" simulation rounds; valid dissent remains explicit.", " ronde simulasi; dissent yang valid tetap dinyatakan eksplisit.")
+    if message.startswith("Deliberation quorum failed:"):
+        return message.replace("Deliberation quorum failed:", "Kuorum deliberasi gagal:", 1)
+    if message.startswith("Structured consensus failed"):
+        return message.replace("Structured consensus failed", "Konsensus terstruktur gagal", 1)
+    if stage == "SIMULATION":
+        return f"Simulasi gagal: {message}"
+    if stage == "SRR":
+        return f"Kegagalan agen SRR: {message}"
+    return f"Peristiwa {stage}: {message}"
+
+
+def _log(
+    stage: str,
+    level: str,
+    message: str,
+    *,
+    id_message: str | None = None,
+    code: str | None = None,
+    agent_id: int | None = None,
+    agent_name: str | None = None,
+    round_number: int | None = None,
+    metric: dict[str, Any] | None = None,
+    statutory: dict[str, Any] | None = None,
+    economic: dict[str, Any] | None = None,
+    fallback: dict[str, Any] | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return analytical_event(
+        stage,
+        level,
+        code or f"{stage}_{level}",
+        id_message or _event_id_message(stage, message),
+        message,
+        agent_id=agent_id,
+        agent_name=agent_name,
+        round_number=round_number,
+        metric=metric,
+        statutory=statutory,
+        economic=economic,
+        fallback=fallback,
+        metadata=metadata,
+    )
 
 
 def _merge_run_logs(
-    stored_logs: list[dict[str, str]] | None,
-    cycle_logs: list[dict[str, str]],
-) -> list[dict[str, str]]:
+    stored_logs: list[dict[str, Any]] | None,
+    cycle_logs: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
     if cycle_logs and cycle_logs[0].get("stage") == "QUEUE":
         return [dict(log) for log in cycle_logs]
     queue_logs = [
@@ -107,14 +179,22 @@ def _merge_run_logs(
 def persist_run_progress(
     scenario_id: int,
     session_id: str,
-    logs: list[dict[str, str]],
+    logs: list[dict[str, Any]],
 ) -> None:
     with SessionLocal() as session:
         run = session.get(ConsensusSession, session_id)
         if run is None or run.scenario_id != scenario_id:
             raise ValueError("Consensus session is missing or does not belong to the scenario")
-        run.logs = _merge_run_logs(run.logs, logs)
-        run.progress_stage = logs[-1]["stage"] if logs else run.progress_stage
+        enriched_logs: list[dict[str, Any]] = []
+        for raw_log in logs:
+            event = normalize_event(raw_log)
+            event["run_id"] = session_id
+            event["task_id"] = run.celery_task_id
+            event["scenario_id"] = scenario_id
+            enriched_logs.append(event)
+        logs[:] = enriched_logs
+        run.logs = _merge_run_logs(run.logs, enriched_logs)
+        run.progress_stage = enriched_logs[-1]["stage"] if enriched_logs else run.progress_stage
         if run.status == "QUEUED":
             run.status = "RUNNING"
             run.started_at = run.started_at or datetime.now(timezone.utc)
@@ -175,7 +255,18 @@ def _create_isolated_session(scenario_id: int) -> str:
         scenario = session.get(Scenario, scenario_id)
         if scenario is None:
             raise ValueError(f"Scenario {scenario_id} does not exist")
-        agents = list(session.scalars(select(Agent).order_by(Agent.id)))
+        scoped_agent_ids = list(
+            session.scalars(
+                select(AgentInfluenceObservation.agent_id).where(
+                    AgentInfluenceObservation.scenario_id == scenario_id,
+                    AgentInfluenceObservation.run_id.is_(None),
+                )
+            )
+        )
+        agent_query = select(Agent)
+        if scoped_agent_ids:
+            agent_query = agent_query.where(Agent.id.in_(scoped_agent_ids))
+        agents = list(session.scalars(agent_query.order_by(Agent.id)))
         revision = agent_revision(agents, scenario)
         snapshot = session.scalar(
             select(ScenarioMandateSnapshot).where(
@@ -239,7 +330,18 @@ def _load_session_context(
     scenario = session.get(Scenario, scenario_id)
     if scenario is None:
         raise ValueError(f"Scenario {scenario_id} does not exist")
-    agents = list(session.scalars(select(Agent).order_by(Agent.id)))
+    mandate_agent_ids = [
+        item.get("agent_id")
+        for item in run.mandate_payload.get("agent_rules", [])
+        if isinstance(item, dict) and isinstance(item.get("agent_id"), int)
+    ]
+    agents = list(
+        session.scalars(
+            select(Agent)
+            .where(Agent.id.in_(mandate_agent_ids))
+            .order_by(Agent.id)
+        )
+    )
     if not agents:
         raise ValueError("At least one agent is required")
     snapshot = session.get(ScenarioMandateSnapshot, run.mandate_snapshot_id)
@@ -264,12 +366,12 @@ def _load_session_context(
             "agent_rules": snapshot.agent_rules,
         }
         session.flush()
-    mandate_agent_ids = {
+    payload_agent_ids = {
         item.get("agent_id")
         for item in run.mandate_payload.get("agent_rules", [])
         if isinstance(item, dict)
     }
-    if run.mandate_revision != snapshot.revision or mandate_agent_ids != current_agent_ids:
+    if run.mandate_revision != snapshot.revision or payload_agent_ids != current_agent_ids:
         logger.warning(
             "Consensus session %s mandate payload is stale; synchronizing with snapshot %s",
             session_id,
@@ -519,12 +621,25 @@ def _run_native_simulation(
     conflicts: list[dict[str, Any]],
     peer_outputs: list[dict[str, Any]],
     simulation_call: SimulationCaller | None,
-    logs: list[dict[str, str]],
+    logs: list[dict[str, Any]],
     emit: ProgressReporter,
     round_number: int,
 ) -> tuple[dict[str, Any] | None, int]:
     started = perf_counter()
-    logs.append(_log("SIMULATION", "INFO", f"{SIMULATION_AGENT_NAME} invoked automatically for {len(conflicts)} DDR conflict(s)."))
+    logs.append(
+        _log(
+            "SIMULATION",
+            "INFO",
+            f"{SIMULATION_AGENT_NAME} invoked automatically for {len(conflicts)} DDR conflict(s).",
+            code="SIMULATION_REQUESTED",
+            id_message=f"{SIMULATION_AGENT_NAME} dipanggil otomatis untuk {len(conflicts)} konflik DDR.",
+            round_number=round_number,
+            metric={"name": "ddr_conflict_count", "value": len(conflicts), "unit": "pairs", "status": "calculated"},
+            statutory={"status": "pending-car", "constraint": "DEFICIT_3PCT", "ceiling_percent_gdp": STATUTORY_DEFICIT_CEILING_PERCENT_GDP, "scenario_policy_ceiling_percent_gdp": scenario.max_deficit_constraint, "source_tags": ["UU17_2003_P12"]},
+            economic={"status": "modelled", "inputs": {"program_cost": scenario.program_cost}, "outputs": {}, "reason": "Simulation uses structured sectoral alternatives; unsupported coefficients remain not-calculated."},
+            metadata={"resolution_path": SIMULATION_TRIGGER},
+        )
+    )
     emit(logs)
     safe_peer_outputs = [
         sanitize_simulation_payload(dict(peer)) for peer in peer_outputs
@@ -577,6 +692,7 @@ def _run_native_simulation(
         round_number,
     )
     session.commit()
+    token_usage = 0
     try:
         fallback_reason: str | None = None
         try:
@@ -599,7 +715,7 @@ def _run_native_simulation(
             if missing:
                 raise ValueError(f"simulation missing decision artifacts: {', '.join(missing)}")
         except Exception as provider_error:
-            fallback_reason = f"{type(provider_error).__name__}: {provider_error}"
+            fallback_reason = type(provider_error).__name__
             raw_payload = build_deterministic_simulation(
                 scenario.description,
                 scenario.max_deficit_constraint,
@@ -607,8 +723,14 @@ def _run_native_simulation(
                 peer_outputs,
             )
             parsed = SimulationResponse.model_validate(raw_payload)
-            token_usage = 0
         output_payload = sanitize_simulation_payload(parsed.model_dump(mode="json"))
+        output_payload["fallback"] = {
+            "used": fallback_reason is not None,
+            "kind": "deterministic-native" if fallback_reason else None,
+            "reason": fallback_reason,
+            "retained_artifact": "structured sectoral alternatives pending CAR evaluation",
+            "consensus_impact": "Fallback output is fed back to sectoral agents as modelled evidence only.",
+        }
         if fallback_reason is not None:
             output_payload["fallback_reason"] = fallback_reason
         latency_ms = (perf_counter() - started) * 1000.0
@@ -633,6 +755,18 @@ def _run_native_simulation(
                     if fallback_reason
                     else f"{SIMULATION_AGENT_NAME} produced a structured modelled resolution."
                 ),
+                code="SIMULATION_FALLBACK_USED" if fallback_reason else "SIMULATION_RESOLUTION_PRODUCED",
+                id_message=(
+                    f"{SIMULATION_AGENT_NAME} menggunakan fallback deterministik setelah kegagalan provider."
+                    if fallback_reason
+                    else f"{SIMULATION_AGENT_NAME} menghasilkan resolusi modelled terstruktur."
+                ),
+                round_number=round_number,
+                metric={"name": "modelled_alternative_count", "value": len(output_payload.get("alternatives", [])), "unit": "alternatives", "status": "calculated"},
+                statutory={"status": "pending-car", "constraint": "DEFICIT_3PCT", "ceiling_percent_gdp": STATUTORY_DEFICIT_CEILING_PERCENT_GDP, "scenario_policy_ceiling_percent_gdp": scenario.max_deficit_constraint, "source_tags": ["UU17_2003_P12"]},
+                economic={"status": output_payload.get("calculation_status", "modelled"), "inputs": {"sectoral_input_count": len(peer_outputs)}, "outputs": {"resolution_status": output_payload.get("resolution_status")}, "impact": "Result remains modelled evidence and must pass CAR."},
+                fallback=output_payload["fallback"],
+                metadata={"resolution_path": SIMULATION_TRIGGER},
             )
         )
         emit(logs)
@@ -642,7 +776,7 @@ def _run_native_simulation(
             "agent_name": SIMULATION_AGENT_NAME,
             "simulation_version": SIMULATION_AGENT_VERSION,
             "evidence_status": "modelled",
-            "error": f"{type(error).__name__}: {error}",
+            "error": f"{type(error).__name__}",
         }
         latency_ms = (perf_counter() - started) * 1000.0
         _persist_simulation_artifact(
@@ -657,7 +791,17 @@ def _run_native_simulation(
             round_number,
         )
         session.commit()
-        logs.append(_log("SIMULATION", "ERROR", output_payload["error"]))
+        logs.append(
+            _log(
+                "SIMULATION",
+                "ERROR",
+                output_payload["error"],
+                code="SIMULATION_FAILED",
+                round_number=round_number,
+                fallback={"used": False, "kind": None, "reason": output_payload["error"]},
+                metadata={"error_type": type(error).__name__},
+            )
+        )
         emit(logs)
         return None, 0
 
@@ -673,22 +817,30 @@ def _determine_convergence(
         return ConvergenceStatus.INFEASIBLE
 
     recommendations = {
-        response.recommendation.content if response.recommendation is not None else None
+        " ".join(
+            response.recommendation.content.casefold().split()
+        )
+        if response.recommendation is not None
+        else None
         for response in parsed_responses
     }
-    alternatives_by_name: dict[str, list[Any]] = {}
-    for alternative in feasible_alternatives:
-        alternatives_by_name.setdefault(alternative.name, []).append(alternative)
-    conflicting_utilities = any(
-        len({alternative.utility for alternative in alternatives}) > 1
-        for alternatives in alternatives_by_name.values()
-    )
-    multiple_utility_alternatives = (
-        len(alternatives_by_name) > 1
-        and len({alternative.utility for alternative in feasible_alternatives}) > 1
-    )
+    feasible_ids = {id(alternative) for alternative in feasible_alternatives}
+    alternative_profiles = {
+        tuple(
+            sorted(
+                (
+                    " ".join(alternative.name.casefold().split()),
+                    round(alternative.deficit, 8),
+                    round(alternative.utility, 8),
+                )
+                for alternative in response.alternatives
+                if id(alternative) in feasible_ids
+            )
+        )
+        for response in parsed_responses
+    }
 
-    if conflicting_utilities or multiple_utility_alternatives or len(recommendations) > 1:
+    if len(alternative_profiles) > 1 or len(recommendations) > 1:
         return ConvergenceStatus.PARETO_SET
     return ConvergenceStatus.FULL_CONSENSUS
 
@@ -764,18 +916,53 @@ def _ensure_influence_observations(
             session.add(observation)
             observations.append(observation)
             by_agent[agent.id] = observation
+        observation.X = completeness
+        observation.Q = provenance_quality
+        observation.H = 1.0
+        observation.S = peer_alignment
+        observation.U = uncertainty_burden
+        observation.gate = 1
         observation.interaction_payload = interactions
         observation.calculation_payload = {
-            "version": "rar-dai-v1",
+            "version": "rar-dai-v2",
             "formula": "raw_score = theta_x*X + theta_q*Q + theta_h*H + theta_s*S - theta_u*U; normalized_weight = gated_softmax(raw_score)",
+            "calculation_status": "calculated",
+            "gate_reason": "Decision-complete SRR passed schema validation.",
             "dimensions": {
-                "X": "decision-artifact completeness ratio",
-                "Q": "source-tagged provenance ratio",
-                "H": "current-run recency factor",
-                "S": "mean pairwise DDR agreement ratio",
-                "U": "uncertainty artifact burden",
+                "X": {
+                    "label": "decision-artifact completeness ratio",
+                    "value": completeness,
+                    "source": "validated SRR collections",
+                    "status": "calculated",
+                },
+                "Q": {
+                    "label": "source-tagged provenance ratio",
+                    "value": provenance_quality,
+                    "source": "SRR source_tag coverage",
+                    "status": "calculated",
+                },
+                "H": {
+                    "label": "current-run recency prior",
+                    "value": 1.0,
+                    "source": "current consensus session",
+                    "status": "prior",
+                },
+                "S": {
+                    "label": "mean pairwise DDR agreement ratio",
+                    "value": peer_alignment,
+                    "source": "pairwise DDR vectors",
+                    "status": "calculated",
+                },
+                "U": {
+                    "label": "uncertainty artifact burden",
+                    "value": uncertainty_burden,
+                    "source": "validated SRR uncertainty items",
+                    "status": "calculated",
+                },
             },
             "interaction_count": len(interactions),
+            "statutory_authority": False,
+            "interpretation": "Influence prioritization only; CAR remains authoritative for hard constraints.",
         }
     session.flush()
     return observations
@@ -803,14 +990,285 @@ def _collect_prediction_conflicts(
     return conflicts
 
 
-def _fiscal_alternative_payload(response: SRRResponse, ceiling: float) -> list[dict[str, Any]]:
+def _artifact_content(value: object) -> str:
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, dict):
+        for key in ("content", "name", "decision", "recommendation"):
+            candidate = value.get(key)
+            if isinstance(candidate, str):
+                return candidate.strip()
+    return str(value)
+
+
+def _normalised_text_set(value: object) -> set[str]:
+    values = value if isinstance(value, list) else [value] if value is not None else []
+    return {
+        " ".join(_artifact_content(item).casefold().split())
+        for item in values
+        if _artifact_content(item)
+    }
+
+
+def _jaccard_distance(left: object, right: object) -> float:
+    left_set = _normalised_text_set(left)
+    right_set = _normalised_text_set(right)
+    union = left_set | right_set
+    return round(1.0 - len(left_set & right_set) / len(union), 6) if union else 0.0
+
+
+def _source_tags(value: object) -> list[str]:
+    values = value if isinstance(value, list) else [value] if value is not None else []
+    return sorted(
+        {
+            str(item.get("source_tag"))
+            for item in values
+            if isinstance(item, dict) and item.get("source_tag")
+        }
+    )
+
+
+def _content_source_pairs(value: object) -> list[str]:
+    values = value if isinstance(value, list) else [value] if value is not None else []
+    return sorted(
+        f"{_artifact_content(item)}::{item.get('source_tag') or ''}"
+        for item in values
+        if isinstance(item, dict) and _artifact_content(item)
+    )
+
+
+def _alternative_deficit_profiles(artifacts: dict[str, Any]) -> list[str]:
+    alternatives = artifacts.get("alternatives", [])
+    return sorted(
+        f"{' '.join(str(item.get('name') or '').casefold().split())}::{float(item['deficit']):.8f}"
+        for item in alternatives
+        if isinstance(item, dict)
+        and isinstance(item.get("deficit"), (int, float))
+        and not isinstance(item.get("deficit"), bool)
+    )
+
+
+def _artifact_hash(value: object) -> str:
+    canonical = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _deficit_values(artifacts: dict[str, Any]) -> list[float]:
+    alternatives = artifacts.get("alternatives", [])
+    return [
+        float(item["deficit"])
+        for item in alternatives
+        if isinstance(item, dict)
+        and isinstance(item.get("deficit"), (int, float))
+        and not isinstance(item.get("deficit"), bool)
+    ]
+
+
+def _deficit_set_distance(left: list[float], right: list[float]) -> float | None:
+    if not left or not right:
+        return None
+    left_to_right = max(min(abs(item - peer) for peer in right) for item in left)
+    right_to_left = max(min(abs(item - peer) for peer in left) for item in right)
+    return round(max(left_to_right, right_to_left), 6)
+
+
+def _vector_metadata(
+    scenario: Scenario,
+    component: str,
+    active: bool,
+    field: str,
+    artifacts_i: dict[str, Any],
+    artifacts_j: dict[str, Any],
+    response_i: SRRResponse,
+    response_j: SRRResponse,
+) -> dict[str, Any]:
+    detail = DDR_COMPONENT_DETAILS[component]
+    left = artifacts_i.get(field)
+    right = artifacts_j.get(field)
+    jaccard = _jaccard_distance(left, right)
+    calculation: dict[str, Any] = {
+        "status": "calculated",
+        "method": "normalized-jaccard-distance",
+        "formula": detail["formula"],
+        "value": jaccard,
+        "unit": "ratio",
+        "inputs": {"agent_i_count": len(left) if isinstance(left, list) else int(left is not None), "agent_j_count": len(right) if isinstance(right, list) else int(right is not None)},
+    }
+    if component == "dE":
+        left_tags = _source_tags(left)
+        right_tags = _source_tags(right)
+        source_variance = _jaccard_distance(left_tags, right_tags)
+        pair_distance = _jaccard_distance(
+            _content_source_pairs(left),
+            _content_source_pairs(right),
+        )
+        calculation.update(
+            {
+                "method": "content-source-pair-jaccard-distance",
+                "value": pair_distance,
+                "content_distance": jaccard,
+                "source_variance": source_variance,
+                "agent_i_provenance_hash": _artifact_hash(left),
+                "agent_j_provenance_hash": _artifact_hash(right),
+                "official_baseline_verification": "not-calculated",
+                "not_calculated_reason": "No authoritative MoF/DJA retrieval ledger was supplied for hash verification.",
+            }
+        )
+    elif component == "dP":
+        deficits_i = _deficit_values(artifacts_i)
+        deficits_j = _deficit_values(artifacts_j)
+        prediction_text_distance = _jaccard_distance(
+            [item.content for item in response_i.predictions],
+            [item.content for item in response_j.predictions],
+        )
+        deficit_profile_distance = _jaccard_distance(
+            _alternative_deficit_profiles(artifacts_i),
+            _alternative_deficit_profiles(artifacts_j),
+        )
+        if deficits_i and deficits_j:
+            deficit_distance = _deficit_set_distance(deficits_i, deficits_j)
+            calculation.update(
+                {
+                    "method": "maximum-prediction-or-deficit-profile-distance",
+                    "value": max(prediction_text_distance, deficit_profile_distance),
+                    "prediction_text_distance": prediction_text_distance,
+                    "deficit_profile_distance": deficit_profile_distance,
+                    "deficit_range_gap_percent_gdp": deficit_distance,
+                    "agent_i_projected_deficits": deficits_i,
+                    "agent_j_projected_deficits": deficits_j,
+                    "statutory_ceiling_percent_gdp": STATUTORY_DEFICIT_CEILING_PERCENT_GDP,
+                    "scenario_policy_ceiling_percent_gdp": scenario.max_deficit_constraint,
+                }
+            )
+        else:
+            calculation.update(
+                {
+                    "deficit_range_gap_percent_gdp": None,
+                    "deficit_calculation_status": "not-calculated",
+                    "not_calculated_reason": "Both agents did not provide numeric deficit projections.",
+                }
+            )
+        calculation.update(
+            {
+                "inflation_coefficient": None,
+                "fiscal_multiplier": None,
+                "causal_model_status": "not-calculated",
+                "causal_model_reason": "No verified RL-FRB/US, ABM baseline, multiplier, or elasticity input was supplied.",
+            }
+        )
+    elif component == "dR":
+        calculation.update(
+            {
+                "impact_probability_score": None,
+                "threat_matrix_status": "not-calculated",
+                "not_calculated_reason": "Risk items do not include verified Impact and Probability scores.",
+            }
+        )
+    elif component == "dU":
+        confidence_i = response_i.confidence
+        confidence_j = response_j.confidence
+        confidence_gap = (
+            round(abs(confidence_i - confidence_j), 6)
+            if confidence_i is not None and confidence_j is not None
+            else None
+        )
+        calculation.update(
+            {
+                "method": "maximum-uncertainty-jaccard-or-confidence-gap",
+                "value": max(jaccard, confidence_gap or 0.0),
+                "uncertainty_text_distance": jaccard,
+                "confidence_i": confidence_i,
+                "confidence_j": confidence_j,
+                "confidence_gap": confidence_gap,
+                "confidence_gap_status": "calculated"
+                if confidence_i is not None and confidence_j is not None
+                else "not-calculated",
+            }
+        )
+    elif component == "dC":
+        deficits_i = _deficit_values(artifacts_i)
+        deficits_j = _deficit_values(artifacts_j)
+        all_deficits = [*deficits_i, *deficits_j]
+        violations_i = [item > STATUTORY_DEFICIT_CEILING_PERCENT_GDP for item in deficits_i]
+        violations_j = [item > STATUTORY_DEFICIT_CEILING_PERCENT_GDP for item in deficits_j]
+        statutory_violation = any([*violations_i, *violations_j])
+        scenario_policy_violation = any(
+            item > scenario.max_deficit_constraint for item in all_deficits
+        )
+        gate_difference = any(violations_i) != any(violations_j)
+        calculation.update(
+            {
+                "method": "maximum-constraint-jaccard-or-hard-gate-difference",
+                "value": max(jaccard, 1.0 if gate_difference else 0.0),
+                "constraint_text_distance": jaccard,
+                "hard_constraint": "DEFICIT_3PCT",
+                "statutory_ceiling_percent_gdp": STATUTORY_DEFICIT_CEILING_PERCENT_GDP,
+                "scenario_policy_ceiling_percent_gdp": scenario.max_deficit_constraint,
+                "maximum_projected_deficit_percent_gdp": max(all_deficits) if all_deficits else None,
+                "violation": statutory_violation,
+                "scenario_policy_violation": scenario_policy_violation,
+                "agent_i_statutory_violations": violations_i,
+                "agent_j_statutory_violations": violations_j,
+                "evaluation_method": "pre-CAR numeric screening",
+                "solver": None,
+                "education_floor_status": "not-calculated",
+                "education_floor_reason": "Verified post-policy education share was not supplied.",
+            }
+        )
+    elif component == "dREC":
+        calculation.update(
+            {
+                "alternative_rank_distance": None,
+                "rank_status": "not-calculated",
+                "not_calculated_reason": "Standardized ranked alternative IDs were not supplied by both agents.",
+            }
+        )
+    return {
+        "component": component,
+        "active": active,
+        "category_i18n": detail["category"],
+        "meaning_i18n": detail["meaning"],
+        "economic_impact_i18n": detail["impact"],
+        "formula": detail["formula"],
+        "agent_i": {
+            "value": left,
+            "normalized": sorted(_normalised_text_set(left)),
+            "source_tags": _source_tags(left),
+            "artifact_hash": _artifact_hash(left),
+        },
+        "agent_j": {
+            "value": right,
+            "normalized": sorted(_normalised_text_set(right)),
+            "source_tags": _source_tags(right),
+            "artifact_hash": _artifact_hash(right),
+        },
+        "calculation": calculation,
+        "resolution_path": detail["route"] if active else "No Resolution Required",
+        "status": "detected" if active else "no-divergence",
+    }
+
+
+def _fiscal_alternative_payload(
+    response: SRRResponse,
+    scenario_policy_ceiling: float,
+) -> list[dict[str, Any]]:
+    effective_ceiling = min(
+        scenario_policy_ceiling,
+        STATUTORY_DEFICIT_CEILING_PERCENT_GDP,
+    )
     return [
         {
             "name": alternative.name,
             "projected_deficit_percent": alternative.deficit,
             "utility": alternative.utility,
-            "headroom_percent": round(ceiling - alternative.deficit, 4),
-            "within_statutory_ceiling": alternative.deficit <= ceiling,
+            "headroom_percent": round(effective_ceiling - alternative.deficit, 4),
+            "within_statutory_ceiling": (
+                alternative.deficit <= STATUTORY_DEFICIT_CEILING_PERCENT_GDP
+            ),
+            "within_scenario_policy_ceiling": (
+                alternative.deficit <= scenario_policy_ceiling
+            ),
+            "within_effective_ceiling": alternative.deficit <= effective_ceiling,
             "source_tag": alternative.source_tag,
         }
         for alternative in response.alternatives
@@ -820,7 +1278,7 @@ def _fiscal_alternative_payload(response: SRRResponse, ceiling: float) -> list[d
 def _legal_basis_payload(
     response_i: SRRResponse,
     response_j: SRRResponse,
-) -> list[dict[str, str]]:
+) -> list[dict[str, Any]]:
     references = {
         "UU17_2003_P12": "UU Keuangan Negara (UU 17/2003) Pasal 12 — batas defisit terhadap PDB.",
         "UU17_2025_POSTURE": "UU APBN 2026 — postur dan baseline fiskal tahun anggaran 2026.",
@@ -863,15 +1321,34 @@ def _conflict_detail_payload(
         "dREC": "recommendation",
     }
     categories = []
-    for narrative in describe_divergence_vector(vector):
-        field = component_fields[narrative["component"]]
-        categories.append(
-            {
-                **narrative,
-                "agent_i_artifacts": artifacts_i.get(field),
-                "agent_j_artifacts": artifacts_j.get(field),
-            }
+    vector_metadata: dict[str, Any] = {}
+    for component, field in component_fields.items():
+        metadata = _vector_metadata(
+            scenario,
+            component,
+            bool(vector.get(component)),
+            field,
+            artifacts_i,
+            artifacts_j,
+            response_i,
+            response_j,
         )
+        vector_metadata[component] = metadata
+        if metadata["active"]:
+            categories.append(
+                {
+                    "component": component,
+                    "category": metadata["category_i18n"]["en"],
+                    "category_i18n": metadata["category_i18n"],
+                    "narrative": metadata["meaning_i18n"]["en"],
+                    "narrative_i18n": metadata["meaning_i18n"],
+                    "impact": metadata["economic_impact_i18n"]["en"],
+                    "impact_i18n": metadata["economic_impact_i18n"],
+                    "formula": metadata["formula"],
+                    "agent_i_artifacts": artifacts_i.get(field),
+                    "agent_j_artifacts": artifacts_j.get(field),
+                }
+            )
     observation_i = influence_by_agent.get(agent_i.id)
     observation_j = influence_by_agent.get(agent_j.id)
     alternatives_i = _fiscal_alternative_payload(
@@ -884,9 +1361,15 @@ def _conflict_detail_payload(
         {
             "active_components": [key for key, value in vector.items() if value],
             "categories": categories,
+            "vector_metadata": vector_metadata,
             "fiscal_calculation": {
-                "formula": "headroom_percent = statutory_deficit_ceiling_percent - agent_reported_projected_deficit_percent",
-                "statutory_deficit_ceiling_percent": scenario.max_deficit_constraint,
+                "formula": "headroom_percent = effective_deficit_ceiling_percent - agent_reported_projected_deficit_percent",
+                "statutory_deficit_ceiling_percent": STATUTORY_DEFICIT_CEILING_PERCENT_GDP,
+                "scenario_policy_ceiling_percent": scenario.max_deficit_constraint,
+                "effective_deficit_ceiling_percent": min(
+                    scenario.max_deficit_constraint,
+                    STATUTORY_DEFICIT_CEILING_PERCENT_GDP,
+                ),
                 "program_cost": scenario.program_cost,
                 "program_cost_to_gdp_ratio": None,
                 "calculation_note": "Rasio biaya program terhadap PDB tidak dihitung tanpa denominator PDB terverifikasi; angka defisit berasal dari alternatif terstruktur agen.",
@@ -931,7 +1414,7 @@ def _detect_ddr_conflicts(
     session_id: str,
     parsed_by_agent: list[tuple[Agent, SRRResponse]],
     influence_observations: list[AgentInfluenceObservation],
-    logs: list[dict[str, str]],
+    logs: list[dict[str, Any]],
     emit: ProgressReporter,
 ) -> list[dict[str, Any]]:
     conflicts: list[dict[str, Any]] = []
@@ -947,7 +1430,29 @@ def _detect_ddr_conflicts(
             components = [key for key, value in vector.items() if value]
             route = resolve_disagreement_route(vector) if components else None
             active_conflicts = ", ".join(components) or "none"
-            logs.append(_log("DDR", "WARNING" if components else "SUCCESS", f"{agent_i.name} vs {agent_j.name}: conflicts={active_conflicts}; route={route or 'none'}."))
+            logs.append(
+                _log(
+                    "DDR",
+                    "WARNING" if components else "SUCCESS",
+                    f"{agent_i.name} vs {agent_j.name}: conflicts={active_conflicts}; route={route or 'none'}.",
+                    code="DDR_PAIR_EVALUATED",
+                    metric={
+                        "name": "active_component_count",
+                        "value": len(components),
+                        "unit": "components",
+                        "status": "calculated",
+                    },
+                    metadata={
+                        "agent_i_id": agent_i.id,
+                        "agent_i_name": agent_i.name,
+                        "agent_j_id": agent_j.id,
+                        "agent_j_name": agent_j.name,
+                        "vector": vector,
+                        "active_components": components,
+                        "resolution_path": route,
+                    },
+                )
+            )
             emit(logs)
             detail_payload = _conflict_detail_payload(
                 scenario,
@@ -991,7 +1496,8 @@ def _run_consensus_round(
     consensus_call: Callable[..., tuple[str, int]] | None,
     peer_outputs: list[dict[str, Any]],
     simulation_output: dict[str, Any] | None,
-    logs: list[dict[str, str]],
+    round_number: int | None,
+    logs: list[dict[str, Any]],
     emit: ProgressReporter,
 ) -> tuple[list[tuple[Agent, SRRResponse]], int]:
     consensus_results: list[tuple[Agent, SRRResponse]] = []
@@ -1007,7 +1513,21 @@ def _run_consensus_round(
             }
         )
     if simulation_output is None:
-        logs.append(_log("CONSENSUS", "INFO", "Sending peer outputs to each agent for structured consensus review."))
+        logs.append(
+            _log(
+                "CONSENSUS",
+                "INFO",
+                "Sending peer outputs to each agent for structured consensus review.",
+                code="CONSENSUS_REVIEW_STARTED",
+                round_number=round_number,
+                metric={
+                    "name": "agent_count",
+                    "value": len(parsed_by_agent),
+                    "unit": "agents",
+                    "status": "calculated",
+                },
+            )
+        )
         emit(logs)
     for agent, initial_response in parsed_by_agent:
         try:
@@ -1038,12 +1558,42 @@ def _run_consensus_round(
                         log_stage,
                         "WARNING",
                         f"{agent.name}: review response did not pass schema validation; retained validated SRR artifacts.",
+                        code="CONSENSUS_SCHEMA_FALLBACK",
+                        id_message=f"{agent.name}: respons review tidak lolos validasi schema; artefak SRR valid sebelumnya dipertahankan.",
+                        agent_id=agent.id,
+                        agent_name=agent.name,
+                        round_number=round_number,
+                        fallback={
+                            "used": True,
+                            "kind": "retain-last-valid-srr",
+                            "reason": "Consensus response failed decision-complete schema validation.",
+                            "retained_artifact": "last validated SRR response",
+                            "consensus_impact": "The agent remains in the loop using its last auditable position.",
+                        },
+                        economic={"status": "not-calculated", "inputs": {}, "outputs": {}, "reason": "No new valid numeric artifacts were admitted."},
+                        metadata={"resolution_path": "Retain Validated SRR"},
                     )
                 )
                 emit(logs)
                 continue
             consensus_results.append((agent, reviewed))
-            logs.append(_log(log_stage, "SUCCESS", f"{agent.name}: peer review completed with {token_usage} tokens."))
+            logs.append(
+                _log(
+                    log_stage,
+                    "SUCCESS",
+                    f"{agent.name}: peer review completed with {token_usage} tokens.",
+                    code="CONSENSUS_REVIEW_COMPLETED",
+                    agent_id=agent.id,
+                    agent_name=agent.name,
+                    round_number=round_number,
+                    metric={
+                        "name": "token_usage",
+                        "value": token_usage,
+                        "unit": "tokens",
+                        "status": "calculated",
+                    },
+                )
+            )
             emit(logs)
         except Exception as error:
             if isinstance(
@@ -1053,12 +1603,25 @@ def _run_consensus_round(
                 logger.exception("Local LLM connection failed during consensus review for agent %s", agent.id)
             else:
                 logger.exception("Consensus review failed for agent %s", agent.id)
+            error_type = type(error).__name__
             consensus_results.append((agent, initial_response))
             logs.append(
                 _log(
                     log_stage,
                     "WARNING",
-                    f"{agent.name}: {type(error).__name__}; retained validated SRR artifacts.",
+                    f"{agent.name}: {error_type}; retained validated SRR artifacts.",
+                    code="CONSENSUS_PROVIDER_FALLBACK",
+                    agent_id=agent.id,
+                    agent_name=agent.name,
+                    round_number=round_number,
+                    fallback={
+                        "used": True,
+                        "kind": "retain-last-valid-srr",
+                        "reason": error_type,
+                        "retained_artifact": "last validated SRR response",
+                        "consensus_impact": "The agent remains in the loop using its last auditable position.",
+                    },
+                    metadata={"error_type": error_type},
                 )
             )
             emit(logs)
@@ -1085,7 +1648,7 @@ def execute_full_shcr_cycle(
     reviewer = consensus_call or (_default_consensus_call if llm_call is None else None)
     external_emit = progress or (lambda _logs: None)
 
-    def emit(current_logs: list[dict[str, str]]) -> None:
+    def emit(current_logs: list[dict[str, Any]]) -> None:
         persist_run_progress(scenario_id, session_id, current_logs)
         external_emit(current_logs)
 
@@ -1094,6 +1657,9 @@ def execute_full_shcr_cycle(
             "INITIALIZE",
             "INFO",
             f"Starting SHCR cycle for scenario {scenario_id}, session {session_id}.",
+            code="SHCR_CYCLE_STARTED",
+            id_message=f"Memulai siklus SHCR untuk skenario {scenario_id}, sesi {session_id}.",
+            metadata={"framework": "SRR + (RAR → DAI) + DDR + CAR"},
         )
     ]
     emit(logs)
@@ -1146,14 +1712,27 @@ def execute_full_shcr_cycle(
                     logger.exception("Local LLM connection failed for agent %s", agent.id)
                 else:
                     logger.exception("LLM call failed for agent %s", agent.id)
-                logs.append(_log("SRR", "ERROR", f"{agent.name}: {type(error).__name__}: {error}"))
+                error_type = type(error).__name__
+                logs.append(
+                    _log(
+                        "SRR",
+                        "ERROR",
+                        f"{agent.name}: provider call failed ({error_type}).",
+                        code="SRR_PROVIDER_FAILED",
+                        id_message=f"{agent.name}: panggilan provider gagal ({error_type}).",
+                        agent_id=agent.id,
+                        agent_name=agent.name,
+                        fallback={"used": False, "kind": None, "reason": error_type},
+                        metadata={"error_type": error_type, "model": agent.llm_model},
+                    )
+                )
                 emit(logs)
                 session.add(
                     ReasoningLog(
                         agent_id=agent.id,
                         scenario_id=scenario.id,
                         run_id=session_id,
-                        raw_json={"error": str(error), "error_type": type(error).__name__},
+                        raw_json={"error_code": "SRR_PROVIDER_FAILED", "error_type": error_type},
                         parsed_srr_objects={},
                         is_schema_valid=False,
                         provenance_count=0,
@@ -1240,6 +1819,7 @@ def execute_full_shcr_cycle(
                 parsed_by_agent,
                 consensus_call,
                 peer_outputs,
+                None,
                 None,
                 logs,
                 emit,
@@ -1390,6 +1970,7 @@ def execute_full_shcr_cycle(
                     "SIMULATION_CONSENSUS",
                     "INFO",
                     f"Feeding native simulation round {round_number} back to all sectoral agents.",
+                    round_number=round_number,
                 )
             )
             emit(logs)
@@ -1401,6 +1982,7 @@ def execute_full_shcr_cycle(
                 consensus_call,
                 peer_outputs,
                 simulation_output,
+                round_number,
                 logs,
                 emit,
             )
@@ -1427,6 +2009,7 @@ def execute_full_shcr_cycle(
                     "SIMULATION_CONSENSUS",
                     "SUCCESS" if not remaining_conflicts else "WARNING",
                     f"Follow-up round {round_number} completed with {len(remaining_conflicts)} remaining prediction conflict(s).",
+                    round_number=round_number,
                 )
             )
             emit(logs)
@@ -1436,6 +2019,7 @@ def execute_full_shcr_cycle(
                     "SIMULATION_CONSENSUS",
                     "WARNING",
                     f"Stopped after the bounded maximum of {MAX_SIMULATION_ROUNDS} simulation rounds; valid dissent remains explicit.",
+                    round_number=simulation_rounds,
                 )
             )
             emit(logs)
@@ -1451,7 +2035,32 @@ def execute_full_shcr_cycle(
         final_provenance = [_provenance_counts(response) for _, response in parsed_by_agent]
         tagged_items = sum(tagged for tagged, _ in final_provenance)
         total_items = sum(total for _, total in final_provenance)
-        logs.append(_log("CAR", "INFO", f"Applying hard deficit constraint <= {scenario.max_deficit_constraint}%."))
+        effective_ceiling = min(
+            scenario.max_deficit_constraint,
+            STATUTORY_DEFICIT_CEILING_PERCENT_GDP,
+        )
+        logs.append(
+            _log(
+                "CAR",
+                "INFO",
+                f"Applying Z3 hard deficit constraint <= {effective_ceiling}% GDP.",
+                code="CAR_CONSTRAINT_EVALUATION_STARTED",
+                id_message=f"Menerapkan hard constraint Z3: defisit <= {effective_ceiling}% PDB.",
+                statutory={
+                    "status": "pending",
+                    "constraint": "DEFICIT_3PCT",
+                    "ceiling_percent_gdp": STATUTORY_DEFICIT_CEILING_PERCENT_GDP,
+                    "source_tags": ["UU17_2003_P12"],
+                    "solver": "z3",
+                },
+                economic={
+                    "status": "not-calculated",
+                    "inputs": {"program_cost": scenario.program_cost, "gdp_denominator": None},
+                    "outputs": {"program_cost_to_gdp_ratio": None},
+                    "reason": "Verified GDP denominator was not supplied.",
+                },
+            )
+        )
         emit(logs)
         parsed_responses = [response for _, response in parsed_by_agent]
         alternatives = [
@@ -1459,10 +2068,11 @@ def execute_full_shcr_cycle(
             for response in parsed_responses
             for alternative in response.alternatives
         ]
-        feasible = neuro_symbolic_filter(
+        car_evaluation = evaluate_car_constraints(
             alternatives,
-            HardConstraints(max_deficit=scenario.max_deficit_constraint),
+            scenario.max_deficit_constraint,
         )
+        feasible = car_evaluation.feasible
         violation_rate = calculate_violation_rate(len(alternatives), len(feasible))
         provenance_completeness = (
             round((tagged_items / total_items) * 100.0, 2) if total_items else 0.0
@@ -1480,8 +2090,76 @@ def execute_full_shcr_cycle(
         )
         latency_ms = (perf_counter() - started_at) * 1000.0
 
-        logs.append(_log("CAR", "SUCCESS", f"{len(feasible)}/{len(alternatives)} alternatives feasible; violation rate={violation_rate}%."))
-        logs.append(_log("METRICS", "INFO", "Persisting convergence, provenance, latency, and token metrics."))
+        car_level = "WARNING" if convergence_status == ConvergenceStatus.INFEASIBLE else "SUCCESS"
+        deficit_constraint = next(
+            (
+                item
+                for item in car_evaluation.hard_constraints
+                if item.get("code") == "DEFICIT_3PCT"
+            ),
+            {},
+        )
+        logs.append(
+            _log(
+                "CAR",
+                car_level,
+                f"Z3 CAR result: {len(feasible)}/{len(alternatives)} alternatives feasible; violation rate={violation_rate}%; state={convergence_status.value}.",
+                code="CAR_CONSTRAINT_EVALUATED",
+                id_message=f"Hasil CAR Z3: {len(feasible)}/{len(alternatives)} alternatif feasible; tingkat pelanggaran={violation_rate}%; status={convergence_status.value}.",
+                metric={
+                    "name": "hard_constraint_violation_rate",
+                    "value": violation_rate,
+                    "unit": "percent",
+                    "status": "calculated",
+                },
+                statutory={
+                    "status": deficit_constraint.get("status", "not-calculated"),
+                    "calculation_status": deficit_constraint.get(
+                        "calculation_status", "not-calculated"
+                    ),
+                    "constraint": "DEFICIT_3PCT",
+                    "ceiling_percent_gdp": STATUTORY_DEFICIT_CEILING_PERCENT_GDP,
+                    "scenario_policy_constraint": next(
+                        (
+                            item
+                            for item in car_evaluation.hard_constraints
+                            if item.get("code") == "SCENARIO_DEFICIT_CEILING"
+                        ),
+                        None,
+                    ),
+                    "source_tags": ["UU17_2003_P12"],
+                    "solver": "z3",
+                    "solver_status": car_evaluation.solver_status,
+                },
+                economic={
+                    "status": "calculated",
+                    "inputs": {"alternative_count": len(alternatives)},
+                    "outputs": {
+                        "feasible_count": len(feasible),
+                        "rejected_count": len(car_evaluation.rejected),
+                        "selected_alternative": getattr(car_evaluation.selected, "name", None),
+                    },
+                    "impact": "No alternative can enter final synthesis when CAR returns INFEASIBLE."
+                    if convergence_status == ConvergenceStatus.INFEASIBLE
+                    else "Only CAR-feasible alternatives remain eligible for final synthesis.",
+                },
+                metadata={"rejected_alternatives": car_evaluation.rejected},
+            )
+        )
+        logs.append(
+            _log(
+                "METRICS",
+                "INFO",
+                "Persisting convergence, provenance, latency, and token metrics.",
+                code="METRICS_PERSISTING",
+                id_message="Menyimpan metrik konvergensi, provenance, latency, dan token.",
+                metric={
+                    "name": "convergence_status",
+                    "value": convergence_status.value,
+                    "status": "calculated",
+                },
+            )
+        )
         emit(logs)
         snapshot = MetricSnapshot(
             run_id=session_id,
@@ -1497,6 +2175,12 @@ def execute_full_shcr_cycle(
         session.add(snapshot)
         session.flush()
         logs.append(_log("COMPLETE", "SUCCESS", f"Cycle completed with state {convergence_status.value}, {total_tokens} tokens, and {latency_ms:.2f} ms latency."))
+        final_logs = [normalize_event(log) for log in logs]
+        for event in final_logs:
+            event["run_id"] = session_id
+            event["task_id"] = run.celery_task_id
+            event["scenario_id"] = scenario.id
+        logs[:] = final_logs
         result_payload = {
             "metric_snapshot_id": snapshot.id,
             "session_id": session_id,
@@ -1510,7 +2194,27 @@ def execute_full_shcr_cycle(
             "simulation_artifact_id": simulation_artifact_id,
             "simulation_rounds": simulation_rounds,
             "simulation_triggered": bool(conflicts),
-            "logs": logs,
+            "car": {
+                "solver": "z3",
+                "solver_status": car_evaluation.solver_status,
+                "hard_constraints": car_evaluation.hard_constraints,
+                "rejected_alternatives": car_evaluation.rejected,
+                "selected_alternative": (
+                    car_evaluation.selected.model_dump(mode="json")
+                    if car_evaluation.selected is not None
+                    and hasattr(car_evaluation.selected, "model_dump")
+                    else None
+                ),
+                "feasible_alternatives_count": len(feasible),
+                "rejected_alternatives_count": len(car_evaluation.rejected),
+                "status": (
+                    "FEASIBLE"
+                    if feasible
+                    else "INFEASIBLE"
+                    if alternatives
+                    else "NOT_EVALUATED"
+                ),
+            },
         }
         run.result_payload = result_payload
         run.logs = _merge_run_logs(run.logs, logs)
@@ -1518,9 +2222,9 @@ def execute_full_shcr_cycle(
         run.status = "SUCCEEDED"
         run.completed_at = datetime.now(timezone.utc)
         session.commit()
-        emit(logs)
+        external_emit(logs)
 
-        return result_payload
+        return {**result_payload, "logs": logs}
 
 
 def run_full_shcr_cycle(scenario_id: int, session_id: str) -> dict[str, Any]:

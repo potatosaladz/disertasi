@@ -1,5 +1,5 @@
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, cast
 from uuid import uuid4
 
 from celery.result import AsyncResult
@@ -9,14 +9,18 @@ from sqlalchemy import select
 from sqlalchemy.orm import aliased
 
 from .agent_templates import agent_revision, resolve_agent_system_prompt
+from .analytical_events import analytical_event
 from .celery_client import celery_client
 from .core_algorithms import (
+    STATUTORY_DEFICIT_CEILING_PERCENT_GDP,
     build_agent_system_prompt,
+    build_agent_user_prompt,
     describe_divergence_vector,
     resolve_disagreement_route,
     resolve_llm_runtime_config,
 )
 from .database import SessionLocal
+from .localization import DEFAULT_LANGUAGE, Language, localize_payload
 from .graph_network import run_graph_payload
 from .mandate_snapshots import refresh_mandate_snapshot
 from .models import (
@@ -30,6 +34,7 @@ from .models import (
     ScenarioMandateSnapshot,
     SimulationArtifact,
 )
+from .sanitization import sanitize_public_error, sanitize_public_value
 
 router = APIRouter(prefix="/api")
 
@@ -52,6 +57,7 @@ def _disagreement_payload(
     left_name: str,
     right_name: str,
     simulations: list[SimulationArtifact],
+    car_result: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     vector = _disagreement_vector(log)
     detail = (
@@ -64,6 +70,24 @@ def _disagreement_payload(
     categories = detail.get("categories")
     if not isinstance(categories, list):
         categories = describe_divergence_vector(vector)
+    vector_metadata = detail.get("vector_metadata")
+    if not isinstance(vector_metadata, dict):
+        vector_metadata = {
+            component: {
+                "component": component,
+                "active": bool(active),
+                "status": "detected" if active else "no-divergence",
+                "calculation": {
+                    "status": "not-calculated",
+                    "value": None,
+                    "reason": "Legacy disagreement record has no granular calculation metadata.",
+                },
+                "resolution_path": resolve_disagreement_route({component: active})
+                if active
+                else "No Resolution Required",
+            }
+            for component, active in vector.items()
+        }
     matching_simulations = [
         artifact
         for artifact in simulations
@@ -110,13 +134,15 @@ def _disagreement_payload(
         modelled_alternatives = output.get("alternatives", [])
         if isinstance(modelled_alternatives, list):
             fiscal_calculation["arbiter_alternatives"] = modelled_alternatives
-            selected = next(
-                (item for item in modelled_alternatives if isinstance(item, dict)),
-                None,
-            )
+            selected = output.get("selected_alternative")
+            if not isinstance(selected, dict):
+                selected = None
             if selected is not None:
                 projected_deficit = selected.get("deficit")
-                ceiling = fiscal_calculation.get("statutory_deficit_ceiling_percent")
+                ceiling = fiscal_calculation.get(
+                    "effective_deficit_ceiling_percent",
+                    fiscal_calculation.get("statutory_deficit_ceiling_percent"),
+                )
                 fiscal_calculation["selected_compromise"] = {
                     **selected,
                     "headroom_percent": (
@@ -137,6 +163,38 @@ def _disagreement_payload(
             ),
             "limitations": output.get("limitations", []),
         }
+    if isinstance(car_result, dict):
+        selected_car = car_result.get("selected_alternative")
+        fiscal_calculation["car_solver_status"] = car_result.get("solver_status")
+        fiscal_calculation["car_rejected_alternatives"] = car_result.get(
+            "rejected_alternatives", []
+        )
+        if isinstance(selected_car, dict):
+            projected_deficit = selected_car.get("deficit")
+            ceiling = fiscal_calculation.get(
+                "effective_deficit_ceiling_percent",
+                fiscal_calculation.get("statutory_deficit_ceiling_percent"),
+            )
+            fiscal_calculation["selected_compromise"] = {
+                **selected_car,
+                "headroom_percent": (
+                    round(float(ceiling) - float(projected_deficit), 4)
+                    if isinstance(ceiling, (int, float))
+                    and isinstance(projected_deficit, (int, float))
+                    else None
+                ),
+            }
+        elif car_result.get("status") == "INFEASIBLE":
+            fiscal_calculation["selected_compromise"] = None
+        resolution["proposed_resolution"] = resolution.get("arbiter_conclusion")
+        resolution["status"] = car_result.get("status")
+        resolution["arbiter_conclusion"] = (
+            selected_car.get("name") if isinstance(selected_car, dict) else None
+        )
+        resolution["selected_alternative"] = selected_car
+        resolution["rejected_alternatives"] = car_result.get(
+            "rejected_alternatives", []
+        )
     return {
         "id": log.id,
         "agent_i": left_name,
@@ -144,6 +202,7 @@ def _disagreement_payload(
         **vector,
         "active_components": [key for key, value in vector.items() if value],
         "conflict_categories": categories,
+        "vector_metadata": vector_metadata,
         "fiscal_calculation": fiscal_calculation,
         "influence_context": detail.get("influence_context", {}),
         "legal_basis": detail.get("legal_basis", []),
@@ -152,10 +211,18 @@ def _disagreement_payload(
     }
 
 
+def _car_result(run: ConsensusSession | None) -> dict[str, Any] | None:
+    if run is None or not isinstance(run.result_payload, dict):
+        return None
+    value = run.result_payload.get("car")
+    return value if isinstance(value, dict) else None
+
+
 def _disagreements_payload(
     database: Any,
     run_id: str,
     simulations: list[SimulationArtifact],
+    car_result: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     left = aliased(Agent)
     right = aliased(Agent)
@@ -167,7 +234,7 @@ def _disagreements_payload(
         .order_by(DisagreementLog.id)
     ).all()
     return [
-        _disagreement_payload(log, left_name, right_name, simulations)
+        _disagreement_payload(log, left_name, right_name, simulations, car_result)
         for log, left_name, right_name in rows
     ]
 
@@ -241,6 +308,15 @@ def _safe_agent_rules(raw_rules: object) -> list[dict[str, Any]]:
 
 
 def _simulation_payload(artifact: SimulationArtifact) -> dict[str, Any]:
+    sanitized = sanitize_public_value(artifact.output_payload)
+    output = dict(sanitized) if isinstance(sanitized, dict) else {}
+    output.setdefault(
+        "messages",
+        {
+            "id": str(output.get("message") or output.get("simulation_summary") or "Artefak simulasi tersedia."),
+            "en": str(output.get("message") or output.get("simulation_summary") or "Simulation artifact is available."),
+        },
+    )
     return {
         "id": artifact.id,
         "session_id": artifact.run_id,
@@ -249,34 +325,16 @@ def _simulation_payload(artifact: SimulationArtifact) -> dict[str, Any]:
         "round_number": artifact.round_number,
         "status": artifact.status,
         "simulation_version": artifact.simulation_version,
-        "input": artifact.input_payload,
-        "output": artifact.output_payload,
+        "input": sanitize_public_value(artifact.input_payload),
+        "output": output,
         "latency_ms": artifact.latency_ms,
         "token_usage": artifact.token_usage,
         "created_at": artifact.created_at.isoformat(),
     }
 
 
-_PRIVATE_DECISION_KEYS = {
-    "analysis",
-    "chain_of_thought",
-    "chainofthought",
-    "hidden_reasoning",
-    "reasoning_trace",
-    "thoughts",
-}
-
-
 def _safe_decision_value(value: object) -> object:
-    if isinstance(value, dict):
-        return {
-            key: _safe_decision_value(item)
-            for key, item in value.items()
-            if key.casefold() not in _PRIVATE_DECISION_KEYS
-        }
-    if isinstance(value, list):
-        return [_safe_decision_value(item) for item in value]
-    return value
+    return sanitize_public_value(value)
 
 
 def _artifact_text(value: object) -> str | None:
@@ -439,6 +497,321 @@ def _agent_breakdown_payload(database: Any, run: ConsensusSession) -> list[dict[
     return breakdown
 
 
+def _collective_reasoning_payload(
+    scenario: Scenario,
+    run: ConsensusSession,
+    agent_breakdown: list[dict[str, Any]],
+    disagreements: list[dict[str, Any]],
+    simulations: list[SimulationArtifact],
+) -> dict[str, Any]:
+    claims: list[dict[str, Any]] = []
+    for agent in agent_breakdown:
+        position = agent.get("pre_arbitration")
+        if not isinstance(position, dict):
+            position = agent.get("final_position")
+        if not isinstance(position, dict):
+            position = agent
+        claims.append(
+            {
+                "agent_id": agent.get("agent_id"),
+                "agent_name": agent.get("agent_name"),
+                "agent_role": agent.get("agent_role"),
+                "schema_valid": agent.get("schema_valid"),
+                "position_stage": position.get("stage"),
+                "main_claim": position.get("reasoning_summary")
+                or position.get("agent_opinion"),
+                "recommendation": position.get("recommendation"),
+                "confidence": position.get("confidence"),
+                "constraints": position.get("constraints_considered", []),
+                "evidence": position.get("evidence", []),
+                "predictions": position.get("predictions", []),
+            }
+        )
+
+    category_map: dict[str, dict[str, Any]] = {}
+    for disagreement in disagreements:
+        pair = f"{disagreement.get('agent_i')} × {disagreement.get('agent_j')}"
+        categories = disagreement.get("conflict_categories", [])
+        if not isinstance(categories, list):
+            continue
+        for category in categories:
+            if not isinstance(category, dict):
+                continue
+            component = str(category.get("component") or "unknown")
+            point = category_map.setdefault(
+                component,
+                {
+                    "component": component,
+                    "category": category.get("category"),
+                    "category_i18n": category.get("category_i18n"),
+                    "narrative": category.get("narrative"),
+                    "narrative_i18n": category.get("narrative_i18n"),
+                    "pair_count": 0,
+                    "agent_pairs": [],
+                },
+            )
+            point["pair_count"] += 1
+            point["agent_pairs"].append(pair)
+    divergence_points = list(category_map.values())
+
+    effective_ceiling = min(
+        scenario.max_deficit_constraint,
+        STATUTORY_DEFICIT_CEILING_PERCENT_GDP,
+    )
+    valid_claims = [claim for claim in claims if claim.get("schema_valid")]
+    feasible_agents = 0
+    for agent in agent_breakdown:
+        alternatives = agent.get("alternatives", [])
+        if isinstance(alternatives, list) and any(
+            isinstance(item, dict)
+            and isinstance(item.get("deficit"), (int, float))
+            and float(item["deficit"]) <= effective_ceiling
+            for item in alternatives
+        ):
+            feasible_agents += 1
+    post_arbitration_agents = sum(
+        any(
+            isinstance(stage, dict) and stage.get("stage") == "POST_SIMULATION"
+            for stage in agent.get("deliberation_stages", [])
+        )
+        for agent in agent_breakdown
+    )
+    convergence_signals = [
+        {
+            "signal": "Decision-complete sectoral positions",
+            "signal_i18n": {"id": "Posisi sektoral decision-complete", "en": "Decision-complete sectoral positions"},
+            "coverage": f"{len(valid_claims)}/{len(claims)} agents",
+            "narrative_i18n": {
+                "id": "Agen yang lolos schema menyediakan klaim, rekomendasi, confidence, dan artefak keputusan terstruktur.",
+                "en": "Schema-valid agents provide structured claims, recommendations, confidence, and decision artifacts.",
+            },
+        },
+        {
+            "signal": "Feasible sectoral alternatives",
+            "signal_i18n": {"id": "Alternatif sektoral feasible", "en": "Feasible sectoral alternatives"},
+            "coverage": f"{feasible_agents}/{len(claims)} agents",
+            "narrative_i18n": {
+                "id": f"Agen memiliki sedikitnya satu alternatif dengan proyeksi defisit tidak melebihi ceiling efektif {effective_ceiling}% PDB.",
+                "en": f"Agents have at least one alternative with a projected deficit no higher than the effective {effective_ceiling}% of GDP ceiling.",
+            },
+        },
+        {
+            "signal": "Post-arbitration review",
+            "signal_i18n": {"id": "Review pasca-arbitrase", "en": "Post-arbitration review"},
+            "coverage": f"{post_arbitration_agents}/{len(claims)} agents",
+            "narrative_i18n": {
+                "id": "Agen memperbarui posisi setelah menerima hasil Simulation Agent.",
+                "en": "Agents update their positions after receiving the Simulation Agent result.",
+            },
+        },
+    ]
+
+    latest_simulation = simulations[-1] if simulations else None
+    simulation_output = (
+        latest_simulation.output_payload
+        if latest_simulation is not None
+        and isinstance(latest_simulation.output_payload, dict)
+        else {}
+    )
+    modelled_alternatives = simulation_output.get("alternatives", [])
+    if not isinstance(modelled_alternatives, list):
+        modelled_alternatives = []
+    quantified_deficits = [
+        float(item["deficit"])
+        for item in modelled_alternatives
+        if isinstance(item, dict)
+        and isinstance(item.get("deficit"), (int, float))
+    ]
+    persisted_car = (
+        run.result_payload.get("car")
+        if isinstance(run.result_payload, dict)
+        else None
+    )
+    if isinstance(persisted_car, dict):
+        selected_car = persisted_car.get("selected_alternative")
+        hard_constraints = persisted_car.get("hard_constraints", [])
+        statutory_constraint = next(
+            (
+                item
+                for item in hard_constraints
+                if isinstance(item, dict) and item.get("code") == "DEFICIT_3PCT"
+            ),
+            None,
+        )
+        scenario_policy_constraint = next(
+            (
+                item
+                for item in hard_constraints
+                if isinstance(item, dict)
+                and item.get("code") == "SCENARIO_DEFICIT_CEILING"
+            ),
+            None,
+        )
+        rejected = persisted_car.get("rejected_alternatives", [])
+        legacy_rejected_deficits = [
+            float(item["projected_deficit_percent_gdp"])
+            for item in rejected
+            if isinstance(item, dict)
+            and isinstance(item.get("projected_deficit_percent_gdp"), (int, float))
+        ]
+        statutory_status = (
+            "BREACH"
+            if isinstance(statutory_constraint, dict)
+            and statutory_constraint.get("status") == "violated"
+            or any(
+                value > STATUTORY_DEFICIT_CEILING_PERCENT_GDP
+                for value in legacy_rejected_deficits
+            )
+            else "COMPLIANT"
+            if isinstance(statutory_constraint, dict)
+            and statutory_constraint.get("status") == "satisfied"
+            else "NOT_EVALUATED"
+        )
+    else:
+        selected_car = None
+        scenario_policy_constraint = None
+        statutory_status = (
+            "COMPLIANT"
+            if quantified_deficits
+            and all(
+                value <= STATUTORY_DEFICIT_CEILING_PERCENT_GDP
+                for value in quantified_deficits
+            )
+            else "BREACH"
+            if quantified_deficits
+            else "NOT_EVALUATED"
+        )
+    legal_references = sorted(
+        {
+            str(basis.get("source_tag"))
+            for disagreement in disagreements
+            for basis in (
+                disagreement.get("legal_basis", [])
+                if isinstance(disagreement.get("legal_basis"), list)
+                else []
+            )
+            if isinstance(basis, dict) and basis.get("source_tag")
+        }
+    )
+    remaining_conflicts = simulation_output.get("remaining_prediction_conflicts")
+    normative_principles = [
+        {
+            "principle": "Statutory deficit ceiling",
+            "principle_i18n": {"id": "Batas defisit statutory", "en": "Statutory deficit ceiling"},
+            "status": statutory_status,
+            "evaluation_i18n": {
+                "id": f"Alternatif modelled diuji terhadap batas statutory {STATUTORY_DEFICIT_CEILING_PERCENT_GDP}% PDB; kebijakan skenario yang lebih ketat dicatat terpisah.",
+                "en": f"Modelled alternatives are tested against the statutory {STATUTORY_DEFICIT_CEILING_PERCENT_GDP}% of GDP ceiling; stricter scenario policy is recorded separately.",
+            },
+            "legal_sources": ["UU17_2003_P12", "UU17_2025_POSTURE"],
+        },
+        {
+            "principle": "Scenario deficit policy ceiling",
+            "principle_i18n": {"id": "Batas defisit kebijakan skenario", "en": "Scenario deficit policy ceiling"},
+            "status": (
+                "BREACH"
+                if isinstance(scenario_policy_constraint, dict)
+                and scenario_policy_constraint.get("status") == "violated"
+                else "COMPLIANT"
+                if isinstance(scenario_policy_constraint, dict)
+                and scenario_policy_constraint.get("status") == "satisfied"
+                else "NOT_EVALUATED"
+            ),
+            "evaluation_i18n": {
+                "id": f"Batas kebijakan skenario efektif adalah {effective_ceiling}% PDB; nilai di bawah 3.0% merupakan pembatas kebijakan tambahan.",
+                "en": f"The effective scenario policy ceiling is {effective_ceiling}% of GDP; values below 3.0% are an additional policy constraint.",
+            },
+            "legal_sources": [],
+        },
+        {
+            "principle": "Legal and provenance traceability",
+            "principle_i18n": {"id": "Ketertelusuran hukum dan provenance", "en": "Legal and provenance traceability"},
+            "status": "DOCUMENTED" if legal_references else "NOT_DOCUMENTED",
+            "evaluation_i18n": {
+                "id": "Persetujuan atau penolakan harus dapat ditelusuri ke sumber hukum dan evidence tag, bukan pada hidden reasoning.",
+                "en": "Approval or rejection must be traceable to legal sources and evidence tags, not hidden reasoning.",
+            },
+            "legal_sources": legal_references,
+        },
+        {
+            "principle": "Unverified revenue offsets",
+            "principle_i18n": {"id": "Offset penerimaan belum terverifikasi", "en": "Unverified revenue offsets"},
+            "status": "SAFEGUARD_REQUIRED",
+            "evaluation_i18n": {
+                "id": "Proyeksi penerimaan yang belum terverifikasi tidak boleh diperlakukan sebagai kas, fiscal space, atau pengurang defisit yang telah terealisasi.",
+                "en": "Unverified revenue projections must not be treated as cash, fiscal space, or realized deficit offsets.",
+            },
+            "legal_sources": ["UU17_2025_POSTURE", "UU9_2018_PNBP"],
+        },
+        {
+            "principle": "Residual dissent",
+            "principle_i18n": {"id": "Dissent residual", "en": "Residual dissent"},
+            "status": (
+                "OPEN"
+                if isinstance(remaining_conflicts, int) and remaining_conflicts > 0
+                else "RESOLVED"
+                if remaining_conflicts == 0
+                else "NOT_EVALUATED"
+            ),
+            "evaluation_i18n": {
+                "id": "Dissent yang masih tersisa harus dipertahankan secara eksplisit dan tidak diubah menjadi konsensus semu.",
+                "en": "Residual dissent must remain explicit and must not be converted into false consensus.",
+            },
+            "legal_sources": [],
+        },
+    ]
+
+    payload = {
+        "methodology": "SHCR = SRR + (RAR → DAI) + DDR + Simulation Arbitration + CAR",
+        "run_status": run.status,
+        "claims_and_positions": claims,
+        "why_and_how": {
+            "summary_i18n": {
+                "id": f"DDR mencatat {len(disagreements)} pasangan agen dengan {sum(len(item.get('active_components', [])) for item in disagreements)} komponen divergensi. Perbedaan prediksi dP dieskalasikan ke Simulation Agent; constraint, evidence, risk, dan rekomendasi tetap menjadi artefak audit.",
+                "en": f"DDR records {len(disagreements)} agent pairs with {sum(len(item.get('active_components', [])) for item in disagreements)} divergence components. dP prediction differences escalate to the Simulation Agent; constraints, evidence, risks, and recommendations remain audit artifacts.",
+            },
+            "divergence_points": divergence_points,
+            "convergence_signals": convergence_signals,
+        },
+        "recommendation_and_follow_up": {
+            "arbiter": "CAR / Z3" if isinstance(persisted_car, dict) else simulation_output.get("agent_name"),
+            "status": persisted_car.get("status")
+            if isinstance(persisted_car, dict)
+            else latest_simulation.status
+            if latest_simulation
+            else "NOT_TRIGGERED",
+            "round_number": latest_simulation.round_number if latest_simulation else 0,
+            "simulation_summary": simulation_output.get("simulation_summary"),
+            "proposed_resolution": simulation_output.get("resolution"),
+            "final_resolution": (
+                selected_car.get("name")
+                if isinstance(selected_car, dict)
+                else None
+            )
+            if isinstance(persisted_car, dict)
+            else simulation_output.get("resolution"),
+            "selected_alternative": selected_car,
+            "rejected_alternatives": persisted_car.get("rejected_alternatives", [])
+            if isinstance(persisted_car, dict)
+            else [],
+            "modelled_alternatives": modelled_alternatives,
+            "limitations": simulation_output.get("limitations", []),
+            "remaining_prediction_conflicts": remaining_conflicts,
+            "follow_up_consensus_status": simulation_output.get(
+                "follow_up_consensus_status"
+            ),
+        },
+        "normative_evaluation": {
+            "summary_i18n": {
+                "id": "Kebijakan seharusnya dipilih hanya setelah lolos batas defisit, otoritas APBN, provenance evidence, dan larangan penggunaan offset penerimaan yang belum terverifikasi.",
+                "en": "Policy should be selected only after satisfying the deficit ceiling, APBN authority, evidence provenance, and the prohibition on unverified revenue offsets.",
+            },
+            "principles": normative_principles,
+        },
+    }
+    return cast(dict[str, Any], _safe_decision_value(payload))
+
+
 def _metric_payload(snapshot: MetricSnapshot) -> dict[str, Any]:
     return {
         "id": snapshot.id,
@@ -455,20 +828,37 @@ def _metric_payload(snapshot: MetricSnapshot) -> dict[str, Any]:
     }
 
 
-def _dashboard_payload(scenario_id: int, session_id: str | None = None) -> dict[str, Any]:
+def _localized_payload(payload: dict[str, Any], lang: Language) -> dict[str, Any]:
+    safe_payload = sanitize_public_value(payload)
+    localized = cast(dict[str, Any], localize_payload(safe_payload, lang))
+    localized["language"] = lang
+    return localized
+
+
+def _dashboard_payload(
+    scenario_id: int,
+    session_id: str | None = None,
+    lang: Language = DEFAULT_LANGUAGE,
+) -> dict[str, Any]:
     with SessionLocal() as session:
         scenario = session.get(Scenario, scenario_id)
         if scenario is None:
             raise HTTPException(status_code=404, detail="Scenario not found")
-        active_session = (
-            session.get(ConsensusSession, session_id)
-            if session_id is not None
-            else session.scalar(
+        if session_id is not None:
+            active_session = session.get(ConsensusSession, session_id)
+        else:
+            active_session = session.scalar(
+                select(ConsensusSession)
+                .where(
+                    ConsensusSession.scenario_id == scenario_id,
+                    ConsensusSession.status == "SUCCEEDED",
+                )
+                .order_by(ConsensusSession.created_at.desc())
+            ) or session.scalar(
                 select(ConsensusSession)
                 .where(ConsensusSession.scenario_id == scenario_id)
                 .order_by(ConsensusSession.created_at.desc())
             )
-        )
         if session_id is not None and active_session is None:
             raise HTTPException(status_code=404, detail="Consensus session not found for scenario")
         if active_session is not None and active_session.scenario_id != scenario_id:
@@ -566,6 +956,7 @@ def _dashboard_payload(scenario_id: int, session_id: str | None = None) -> dict[
             session,
             artifact_session_id,
             simulations,
+            _car_result(active_session),
         )
         influences = session.execute(
             select(AgentInfluenceObservation, Agent.name)
@@ -586,8 +977,24 @@ def _dashboard_payload(scenario_id: int, session_id: str | None = None) -> dict[
             if reasoning_logs
             else 0.0
         )
+        agent_breakdown = (
+            _agent_breakdown_payload(session, active_session)
+            if active_session is not None
+            else []
+        )
+        collective_reasoning = (
+            _collective_reasoning_payload(
+                scenario,
+                active_session,
+                agent_breakdown,
+                disagreements,
+                simulations,
+            )
+            if active_session is not None
+            else None
+        )
 
-        return {
+        payload = {
             "session_id": active_session_id,
             "session_status": active_session.status if active_session else None,
             "scenario": {
@@ -601,11 +1008,8 @@ def _dashboard_payload(scenario_id: int, session_id: str | None = None) -> dict[
             "metric_history": [_metric_payload(snapshot) for snapshot in snapshots],
             "schema_validity_percent": schema_validity,
             "reasoning_log_count": len(reasoning_logs),
-            "agent_breakdown": (
-                _agent_breakdown_payload(session, active_session)
-                if active_session is not None
-                else []
-            ),
+            "agent_breakdown": agent_breakdown,
+            "collective_reasoning": collective_reasoning,
             "disagreements": disagreements,
             "simulation_artifacts": [
                 _simulation_payload(artifact) for artifact in simulations
@@ -628,17 +1032,27 @@ def _dashboard_payload(scenario_id: int, session_id: str | None = None) -> dict[
                 for observation, agent_name in influences
             ],
         }
+        return _localized_payload(payload, lang)
 
 
 @router.post("/scenarios/{scenario_id}/runs", status_code=status.HTTP_202_ACCEPTED)
-def start_run(scenario_id: int) -> dict[str, Any]:
+def start_run(
+    scenario_id: int,
+    lang: Language = Query(default=DEFAULT_LANGUAGE),
+) -> dict[str, Any]:
     session_id = str(uuid4())
+    task_id = str(uuid4())
     queue_logs = [
-        {
-            "stage": "QUEUE",
-            "level": "INFO",
-            "message": "Cycle queued for worker execution.",
-        }
+        analytical_event(
+            "QUEUE",
+            "INFO",
+            "RUN_QUEUED",
+            "Siklus dimasukkan ke antrean worker.",
+            "Cycle queued for worker execution.",
+            run_id=session_id,
+            task_id=task_id,
+            scenario_id=scenario_id,
+        )
     ]
     with SessionLocal() as session:
         scenario = session.get(Scenario, scenario_id)
@@ -728,6 +1142,7 @@ def start_run(scenario_id: int) -> dict[str, Any]:
                 "agent_rules": mandate_snapshot.agent_rules,
             },
             status="QUEUED",
+            celery_task_id=task_id,
             logs=queue_logs,
             progress_stage="QUEUE",
         )
@@ -737,13 +1152,31 @@ def start_run(scenario_id: int) -> dict[str, Any]:
         task = celery_client.send_task(
             "shcr.run_full_shcr_cycle",
             args=[scenario_id, session_id],
+            task_id=task_id,
         )
     except Exception as error:
         with SessionLocal() as session:
             run_record = session.get(ConsensusSession, session_id)
             if run_record is not None:
+                failure_event = analytical_event(
+                    "QUEUE",
+                    "ERROR",
+                    "RUN_DISPATCH_FAILED",
+                    "Siklus konsensus gagal dikirim ke worker.",
+                    "Consensus cycle could not be dispatched to the worker.",
+                    run_id=session_id,
+                    task_id=task_id,
+                    scenario_id=scenario_id,
+                    fallback={
+                        "used": False,
+                        "kind": None,
+                        "reason": type(error).__name__,
+                    },
+                    metadata={"error_type": type(error).__name__},
+                )
                 run_record.status = "FAILED"
-                run_record.error = f"Task dispatch failed: {type(error).__name__}: {error}"
+                run_record.error = f"Task dispatch failed: {type(error).__name__}"
+                run_record.logs = [*list(run_record.logs or []), failure_event]
                 run_record.progress_stage = "DISPATCH_FAILED"
                 run_record.completed_at = datetime.now(timezone.utc)
                 session.commit()
@@ -751,21 +1184,24 @@ def start_run(scenario_id: int) -> dict[str, Any]:
             status_code=503,
             detail="Consensus cycle could not be dispatched to the worker",
         ) from error
-    with SessionLocal() as session:
-        run_record = session.get(ConsensusSession, session_id)
-        if run_record is not None:
-            run_record.celery_task_id = task.id
-            session.commit()
-    return {
-        "task_id": task.id,
-        "session_id": session_id,
-        "scenario_id": scenario_id,
-        "status": "QUEUED",
-        "logs": queue_logs,
-    }
+    response_logs = [dict(event) for event in queue_logs]
+    response_logs[0]["task_id"] = task.id
+    return _localized_payload(
+        {
+            "task_id": task.id,
+            "session_id": session_id,
+            "scenario_id": scenario_id,
+            "status": "QUEUED",
+            "logs": response_logs,
+        },
+        lang,
+    )
 
 
-def _run_payload(session: ConsensusSession) -> dict[str, Any]:
+def _run_payload(
+    session: ConsensusSession,
+    lang: Language = DEFAULT_LANGUAGE,
+) -> dict[str, Any]:
     with SessionLocal() as database:
         simulations = list(
             database.scalars(
@@ -775,14 +1211,31 @@ def _run_payload(session: ConsensusSession) -> dict[str, Any]:
             )
         )
         agent_breakdown = _agent_breakdown_payload(database, session)
-        disagreements = _disagreements_payload(database, session.id, simulations)
+        disagreements = _disagreements_payload(
+            database,
+            session.id,
+            simulations,
+            _car_result(session),
+        )
         influences = database.execute(
             select(AgentInfluenceObservation, Agent.name)
             .join(Agent, AgentInfluenceObservation.agent_id == Agent.id)
             .where(AgentInfluenceObservation.run_id == session.id)
             .order_by(AgentInfluenceObservation.id)
         ).all()
-    return {
+        scenario = database.get(Scenario, session.scenario_id)
+        collective_reasoning = (
+            _collective_reasoning_payload(
+                scenario,
+                session,
+                agent_breakdown,
+                disagreements,
+                simulations,
+            )
+            if scenario is not None
+            else None
+        )
+    payload = {
         "task_id": session.celery_task_id,
         "session_id": session.id,
         "scenario_id": session.scenario_id,
@@ -793,6 +1246,7 @@ def _run_payload(session: ConsensusSession) -> dict[str, Any]:
         ],
         "agent_breakdown": agent_breakdown,
         "disagreements": disagreements,
+        "collective_reasoning": collective_reasoning,
         "influence_observations": [
             {
                 "agent": agent_name,
@@ -817,10 +1271,14 @@ def _run_payload(session: ConsensusSession) -> dict[str, Any]:
         "started_at": session.started_at.isoformat() if session.started_at else None,
         "completed_at": session.completed_at.isoformat() if session.completed_at else None,
     }
+    return _localized_payload(payload, lang)
 
 
 @router.get("/scenarios/{scenario_id}/runs")
-def scenario_runs(scenario_id: int) -> list[dict[str, Any]]:
+def scenario_runs(
+    scenario_id: int,
+    lang: Language = Query(default=DEFAULT_LANGUAGE),
+) -> list[dict[str, Any]]:
     with SessionLocal() as session:
         if session.get(Scenario, scenario_id) is None:
             raise HTTPException(status_code=404, detail="Scenario not found")
@@ -831,11 +1289,14 @@ def scenario_runs(scenario_id: int) -> list[dict[str, Any]]:
                 .order_by(ConsensusSession.created_at.desc(), ConsensusSession.id.desc())
             )
         )
-        return [_run_payload(run) for run in runs]
+        return [_run_payload(run, lang) for run in runs]
 
 
 @router.get("/scenarios/{scenario_id}/runs/latest")
-def latest_scenario_run(scenario_id: int) -> dict[str, Any]:
+def latest_scenario_run(
+    scenario_id: int,
+    lang: Language = Query(default=DEFAULT_LANGUAGE),
+) -> dict[str, Any]:
     with SessionLocal() as session:
         if session.get(Scenario, scenario_id) is None:
             raise HTTPException(status_code=404, detail="Scenario not found")
@@ -846,17 +1307,20 @@ def latest_scenario_run(scenario_id: int) -> dict[str, Any]:
         )
         if run is None:
             raise HTTPException(status_code=404, detail="No consensus runs found")
-        return _run_payload(run)
+        return _run_payload(run, lang)
 
 
 @router.get("/runs/{task_id}")
-def run_status(task_id: str) -> dict[str, Any]:
+def run_status(
+    task_id: str,
+    lang: Language = Query(default=DEFAULT_LANGUAGE),
+) -> dict[str, Any]:
     with SessionLocal() as session:
         run = session.scalar(
             select(ConsensusSession).where(ConsensusSession.celery_task_id == task_id)
         )
         if run is not None:
-            return _run_payload(run)
+            return _run_payload(run, lang)
     result = AsyncResult(task_id, app=celery_client)
     state_map = {
         "PENDING": "QUEUED",
@@ -877,94 +1341,189 @@ def run_status(task_id: str) -> dict[str, Any]:
         "scenario_id": None,
     }
     if isinstance(result.info, dict):
-        payload["logs"] = result.info.get("logs", [])
+        safe_info = sanitize_public_value(result.info)
+        if isinstance(safe_info, dict):
+            payload["logs"] = safe_info.get("logs", [])
+            payload["session_id"] = safe_info.get("session_id")
+            payload["scenario_id"] = safe_info.get("scenario_id")
     if result.successful():
-        payload["result"] = result.result
-        if isinstance(result.result, dict):
-            payload["logs"] = result.result.get("logs", payload["logs"])
+        safe_result = sanitize_public_value(result.result)
+        payload["result"] = safe_result
+        if isinstance(safe_result, dict):
+            payload["logs"] = safe_result.get("logs", payload["logs"])
+            payload["session_id"] = safe_result.get("session_id", payload["session_id"])
+            payload["scenario_id"] = safe_result.get("scenario_id", payload["scenario_id"])
     elif result.failed():
-        payload["error"] = str(result.result)
-    return payload
+        payload["error"] = sanitize_public_error(result.result)
+    return _localized_payload(payload, lang)
+
+
+def _analytics_payload(
+    database: Any,
+    run: ConsensusSession,
+    scenario: Scenario,
+    lang: Language,
+) -> dict[str, Any]:
+    simulations = list(
+        database.scalars(
+            select(SimulationArtifact)
+            .where(SimulationArtifact.run_id == run.id)
+            .order_by(SimulationArtifact.round_number, SimulationArtifact.id)
+        )
+    )
+    agent_breakdown = _agent_breakdown_payload(database, run)
+    disagreements = _disagreements_payload(
+        database,
+        run.id,
+        simulations,
+        _car_result(run),
+    )
+    return _localized_payload(
+        {
+            "session_id": run.id,
+            "scenario_id": run.scenario_id,
+            "run_status": run.status,
+            "collective_reasoning": _collective_reasoning_payload(
+                scenario,
+                run,
+                agent_breakdown,
+                disagreements,
+                simulations,
+            ),
+        },
+        lang,
+    )
+
+
+def _ddr_payload(
+    database: Any,
+    run: ConsensusSession,
+    lang: Language,
+) -> dict[str, Any]:
+    simulations = list(
+        database.scalars(
+            select(SimulationArtifact)
+            .where(SimulationArtifact.run_id == run.id)
+            .order_by(SimulationArtifact.round_number, SimulationArtifact.id)
+        )
+    )
+    return _localized_payload(
+        {
+            "session_id": run.id,
+            "scenario_id": run.scenario_id,
+            "run_status": run.status,
+            "disagreements": _disagreements_payload(
+                database,
+                run.id,
+                simulations,
+                _car_result(run),
+            ),
+        },
+        lang,
+    )
+
+
+@router.get("/runs/{task_id}/analytics")
+def run_analytics(
+    task_id: str,
+    lang: Language = Query(default=DEFAULT_LANGUAGE),
+) -> dict[str, Any]:
+    with SessionLocal() as session:
+        run = session.scalar(
+            select(ConsensusSession).where(ConsensusSession.celery_task_id == task_id)
+        )
+        if run is None:
+            raise HTTPException(status_code=404, detail="Consensus run not found")
+        scenario = session.get(Scenario, run.scenario_id)
+        if scenario is None:
+            raise HTTPException(status_code=404, detail="Scenario not found")
+        return _analytics_payload(session, run, scenario, lang)
+
+
+@router.get("/scenarios/{scenario_id}/runs/{session_id}/analytics")
+def scenario_run_analytics(
+    scenario_id: int,
+    session_id: str,
+    lang: Language = Query(default=DEFAULT_LANGUAGE),
+) -> dict[str, Any]:
+    with SessionLocal() as session:
+        run = session.get(ConsensusSession, session_id)
+        scenario = session.get(Scenario, scenario_id)
+        if run is None or run.scenario_id != scenario_id or scenario is None:
+            raise HTTPException(status_code=404, detail="Consensus run not found")
+        return _analytics_payload(session, run, scenario, lang)
 
 
 @router.get("/runs/{task_id}/ddr")
-def run_ddr(task_id: str) -> dict[str, Any]:
+def run_ddr(
+    task_id: str,
+    lang: Language = Query(default=DEFAULT_LANGUAGE),
+) -> dict[str, Any]:
     with SessionLocal() as session:
         run = session.scalar(
             select(ConsensusSession).where(ConsensusSession.celery_task_id == task_id)
         )
         if run is None:
             raise HTTPException(status_code=404, detail="Consensus run not found")
-        simulations = list(
-            session.scalars(
-                select(SimulationArtifact)
-                .where(SimulationArtifact.run_id == run.id)
-                .order_by(SimulationArtifact.round_number, SimulationArtifact.id)
-            )
-        )
-        return {
-            "session_id": run.id,
-            "scenario_id": run.scenario_id,
-            "run_status": run.status,
-            "disagreements": _disagreements_payload(session, run.id, simulations),
-        }
+        return _ddr_payload(session, run, lang)
 
 
 @router.get("/scenarios/{scenario_id}/runs/{session_id}/ddr")
-def scenario_run_ddr(scenario_id: int, session_id: str) -> dict[str, Any]:
+def scenario_run_ddr(
+    scenario_id: int,
+    session_id: str,
+    lang: Language = Query(default=DEFAULT_LANGUAGE),
+) -> dict[str, Any]:
     with SessionLocal() as session:
         run = session.get(ConsensusSession, session_id)
         if run is None or run.scenario_id != scenario_id:
             raise HTTPException(status_code=404, detail="Consensus run not found")
-        simulations = list(
-            session.scalars(
-                select(SimulationArtifact)
-                .where(SimulationArtifact.run_id == run.id)
-                .order_by(SimulationArtifact.round_number, SimulationArtifact.id)
-            )
-        )
-        return {
-            "session_id": run.id,
-            "scenario_id": run.scenario_id,
-            "run_status": run.status,
-            "disagreements": _disagreements_payload(session, run.id, simulations),
-        }
+        return _ddr_payload(session, run, lang)
 
 
 @router.get("/runs/{task_id}/graph")
-def run_graph(task_id: str) -> dict[str, Any]:
+def run_graph(
+    task_id: str,
+    lang: Language = Query(default=DEFAULT_LANGUAGE),
+) -> dict[str, Any]:
     with SessionLocal() as session:
         run = session.scalar(
             select(ConsensusSession).where(ConsensusSession.celery_task_id == task_id)
         )
         if run is None:
             raise HTTPException(status_code=404, detail="Consensus run not found")
-        return run_graph_payload(session, run)
+        return run_graph_payload(session, run, lang)
 
 
 @router.get("/scenarios/{scenario_id}/runs/{session_id}/graph")
-def scenario_run_graph(scenario_id: int, session_id: str) -> dict[str, Any]:
+def scenario_run_graph(
+    scenario_id: int,
+    session_id: str,
+    lang: Language = Query(default=DEFAULT_LANGUAGE),
+) -> dict[str, Any]:
     with SessionLocal() as session:
         run = session.get(ConsensusSession, session_id)
         if run is None or run.scenario_id != scenario_id:
             raise HTTPException(status_code=404, detail="Consensus run not found")
-        return run_graph_payload(session, run)
+        return run_graph_payload(session, run, lang)
 
 
 @router.get("/scenarios/{scenario_id}/dashboard")
 def scenario_dashboard(
     scenario_id: int,
     session_id: str | None = Query(default=None),
+    lang: Language = Query(default=DEFAULT_LANGUAGE),
 ) -> dict[str, Any]:
-    return _dashboard_payload(scenario_id, session_id)
+    return _dashboard_payload(scenario_id, session_id, lang)
 
 
 @router.get("/scenarios/{scenario_id}/manifest")
 def reproducibility_manifest(
     scenario_id: int,
     session_id: str | None = Query(default=None),
+    lang: Language = Query(default=DEFAULT_LANGUAGE),
 ) -> JSONResponse:
-    dashboard = _dashboard_payload(scenario_id, session_id)
+    dashboard = _dashboard_payload(scenario_id, session_id, lang)
     with SessionLocal() as session:
         agents = list(session.scalars(select(Agent).order_by(Agent.id)))
         reasoning = session.execute(
@@ -1014,12 +1573,11 @@ def reproducibility_manifest(
                          resolve_agent_system_prompt(agent),
                          mandate_by_agent.get(agent.id),
                      ),
-                    "user": (
-                        f"Agent role: {agent.role}\n"
-                        f"Policy goal: {dashboard['scenario']['description']}\n"
-                        f"Program cost: {dashboard['scenario']['program_cost']}\n"
-                        f"Automatic legal deficit ceiling: "
-                        f"{dashboard['scenario']['max_deficit_constraint']}%"
+                    "user": build_agent_user_prompt(
+                        agent.role,
+                        str(dashboard["scenario"]["description"]),
+                        cast(float | None, dashboard["scenario"]["program_cost"]),
+                        float(dashboard["scenario"]["max_deficit_constraint"]),
                     ),
                 }
                 for agent in agents
@@ -1039,6 +1597,7 @@ def reproducibility_manifest(
             "influence_observations": dashboard["influence_observations"],
             "disagreements": dashboard["disagreements"],
             "agent_breakdown": dashboard["agent_breakdown"],
+            "collective_reasoning": dashboard["collective_reasoning"],
             "simulation_artifacts": dashboard["simulation_artifacts"],
             "metrics": dashboard["metric_history"],
             "schema_validity_percent": dashboard["schema_validity_percent"],

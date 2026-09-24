@@ -4,7 +4,7 @@ export const dynamic = "force-dynamic";
 export const maxDuration = 900;
 
 const backendUrl = (process.env.BACKEND_INTERNAL_URL ?? "http://localhost:8000").replace(/\/$/, "");
-const forwardedHeaders = ["accept", "content-type", "authorization"];
+const forwardedHeaders = ["accept", "accept-language", "content-type", "authorization", "x-locale"];
 
 async function proxy(request: NextRequest, context: { params: Promise<{ path: string[] }> }) {
   const { path } = await context.params;

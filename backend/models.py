@@ -152,7 +152,7 @@ class ConsensusSession(Base):
         String(20), nullable=False, default="QUEUED", server_default="QUEUED"
     )
     error: Mapped[str | None] = mapped_column(Text)
-    logs: Mapped[list[dict[str, str]]] = mapped_column(
+    logs: Mapped[list[dict[str, Any]]] = mapped_column(
         JSONB, nullable=False, default=list, server_default=text("'[]'::jsonb")
     )
     result_payload: Mapped[dict[str, Any] | None] = mapped_column(JSONB)

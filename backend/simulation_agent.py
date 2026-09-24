@@ -1,9 +1,14 @@
 from dataclasses import dataclass
 import json
+import math
 import os
 from typing import Any, Mapping, Sequence
 
-from .core_algorithms import SRR_OUTPUT_INSTRUCTIONS
+from .core_algorithms import (
+    SRR_OUTPUT_INSTRUCTIONS,
+    STATUTORY_DEFICIT_CEILING_PERCENT_GDP,
+)
+from .sanitization import sanitize_public_dict
 
 SIMULATION_AGENT_KEY = "native_simulation_agent"
 SIMULATION_AGENT_NAME = "Simulation Agent / Arbiter Simulasi Makro-Fiskal"
@@ -12,14 +17,6 @@ SIMULATION_AGENT_VERSION = "native-simulation-v1"
 SIMULATION_TRIGGER = "Simulation Agent Requested"
 SIMULATION_SOURCE_TAG = "SIMULATION_MODELLED"
 MAX_SIMULATION_ROUNDS = 3
-_PRIVATE_REASONING_KEYS = {
-    "analysis",
-    "chain_of_thought",
-    "chainofthought",
-    "hidden_reasoning",
-    "reasoning_trace",
-    "thoughts",
-}
 
 SIMULATION_AGENT_MANDATE = """MANDATE:
 - Act as the neutral macro-fiscal simulation arbiter when sectoral agents reach a decision deadlock.
@@ -122,10 +119,16 @@ def build_simulation_prompt(
     conflicts: Sequence[Mapping[str, Any]],
     peer_outputs: Sequence[Mapping[str, Any]],
 ) -> str:
+    effective_ceiling = min(
+        max_deficit_constraint,
+        STATUTORY_DEFICIT_CEILING_PERCENT_GDP,
+    )
     sandbox_inputs = {
         "policy_goal": scenario_description,
         "program_cost": program_cost if program_cost is not None else "UNKNOWN",
-        "statutory_deficit_ceiling_percent": max_deficit_constraint,
+        "statutory_deficit_ceiling_percent": STATUTORY_DEFICIT_CEILING_PERCENT_GDP,
+        "scenario_policy_ceiling_percent": max_deficit_constraint,
+        "effective_deficit_ceiling_percent": effective_ceiling,
         "ddr_conflicts": [
             {
                 "agent_i": conflict.get("agent_i"),
@@ -162,18 +165,7 @@ def build_simulation_consensus_prompt(
 
 
 def sanitize_simulation_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    def clean(value: object) -> object:
-        if isinstance(value, dict):
-            return {
-                key: clean(item)
-                for key, item in value.items()
-                if key.casefold() not in _PRIVATE_REASONING_KEYS
-            }
-        if isinstance(value, list):
-            return [clean(item) for item in value]
-        return value
-
-    return {key: clean(value) for key, value in payload.items() if key.casefold() not in _PRIVATE_REASONING_KEYS}
+    return sanitize_public_dict(payload)
 
 
 def build_deterministic_simulation(
@@ -194,9 +186,19 @@ def build_deterministic_simulation(
                 continue
             deficit = raw_alternative.get("deficit")
             utility = raw_alternative.get("utility")
-            if not isinstance(deficit, (int, float)) or isinstance(deficit, bool):
+            if (
+                not isinstance(deficit, (int, float))
+                or isinstance(deficit, bool)
+                or not math.isfinite(float(deficit))
+                or float(deficit) < 0
+            ):
                 continue
-            if not isinstance(utility, (int, float)) or isinstance(utility, bool):
+            if (
+                not isinstance(utility, (int, float))
+                or isinstance(utility, bool)
+                or not math.isfinite(float(utility))
+                or not 0 <= float(utility) <= 1
+            ):
                 continue
             alternatives.append(
                 {
@@ -213,17 +215,17 @@ def build_deterministic_simulation(
                     content = item["content"].strip()
                     if content and content not in target:
                         target.append(content)
-    feasible = [item for item in alternatives if item["deficit"] <= max_deficit_constraint]
-    candidates = feasible or sorted(alternatives, key=lambda item: item["deficit"])
-    ranked = sorted(candidates, key=lambda item: (-item["utility"], item["deficit"], item["name"]))
-    selected = ranked[0] if ranked else {
-        "name": "No feasible modelled alternative",
-        "deficit": max_deficit_constraint,
-        "utility": 0.0,
-        "source_tag": SIMULATION_SOURCE_TAG,
-        "evidence_status": "modelled",
-    }
-    selected_alternatives = ranked[:5] or [selected]
+    effective_ceiling = min(
+        max_deficit_constraint,
+        STATUTORY_DEFICIT_CEILING_PERCENT_GDP,
+    )
+    feasible = [item for item in alternatives if item["deficit"] <= effective_ceiling]
+    ranked = sorted(
+        feasible,
+        key=lambda item: (-item["utility"], item["deficit"], item["name"]),
+    )
+    selected = ranked[0] if ranked else None
+    selected_alternatives = ranked[:5]
     conflict_summary = [
         f"{item.get('agent_i')} vs {item.get('agent_j')}: {', '.join(item.get('components') or [])}"
         for item in conflicts
@@ -231,6 +233,8 @@ def build_deterministic_simulation(
     resolution = (
         f"Use {selected['name']} as the bounded compromise candidate with modelled deficit "
         f"{selected['deficit']} and utility {selected['utility']}; sectoral agents must revalidate it."
+        if selected is not None
+        else "No modelled alternative satisfies the statutory deficit ceiling; CAR must return INFEASIBLE with no selected alternative."
     )
     return {
         "evidence": [
@@ -241,7 +245,11 @@ def build_deterministic_simulation(
         ],
         "predictions": [
             {
-                "content": f"The selected modelled candidate remains at or below the {max_deficit_constraint}% deficit ceiling.",
+                "content": (
+                    f"The selected modelled candidate remains at or below the {effective_ceiling}% deficit ceiling."
+                    if selected is not None
+                    else f"All supplied alternatives exceed the {effective_ceiling}% deficit ceiling."
+                ),
                 "source_tag": SIMULATION_SOURCE_TAG,
             }
         ],
@@ -255,7 +263,7 @@ def build_deterministic_simulation(
         ] or [{"content": "Unverified model parameters remain uncertain.", "source_tag": SIMULATION_SOURCE_TAG}],
         "constraints": [
             {
-                "content": f"Projected deficit must remain at or below {max_deficit_constraint}%.",
+                "content": f"Projected deficit must remain at or below {effective_ceiling}%.",
                 "source_tag": "UU17_2003_P12",
             }
         ],
@@ -266,6 +274,9 @@ def build_deterministic_simulation(
         "simulation_summary": f"Native arbitration evaluated {len(alternatives)} sectoral alternatives for {scenario_description}",
         "conflict_summary": conflict_summary,
         "resolution": resolution,
+        "resolution_status": "RESOLVED" if selected is not None else "INFEASIBLE",
+        "selected_alternative": selected,
+        "calculation_status": "modelled" if selected is not None else "infeasible",
         "modelled_variables": ["deficit", "utility"],
         "limitations": [
             "The native simulation does not establish legal authority or empirical causality.",

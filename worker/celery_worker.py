@@ -4,6 +4,7 @@ from typing import Any
 
 from celery import Celery
 
+from backend.analytical_events import analytical_event
 from backend.database import SessionLocal
 from backend.models import ConsensusSession
 from worker.celery_tasks import execute_full_shcr_cycle
@@ -27,9 +28,9 @@ def run_full_shcr_cycle_task(
     scenario_id: int,
     session_id: str,
 ) -> dict[str, object]:
-    latest_logs: list[dict[str, str]] = []
+    latest_logs: list[dict[str, Any]] = []
 
-    def report(logs: list[dict[str, str]]) -> None:
+    def report(logs: list[dict[str, Any]]) -> None:
         nonlocal latest_logs
         latest_logs = [dict(log) for log in logs]
         self.update_state(
@@ -51,16 +52,23 @@ def run_full_shcr_cycle_task(
                 failure_stage = run.progress_stage or (
                     latest_logs[-1]["stage"] if latest_logs else "FAILED"
                 )
-                failure_log = {
-                    "stage": failure_stage,
-                    "level": "ERROR",
-                    "message": f"{type(error).__name__}: {error}",
-                }
+                failure_log = analytical_event(
+                    failure_stage,
+                    "ERROR",
+                    "SHCR_CYCLE_FAILED",
+                    f"Siklus SHCR gagal: {type(error).__name__}.",
+                    f"SHCR cycle failed: {type(error).__name__}.",
+                    run_id=session_id,
+                    task_id=self.request.id,
+                    scenario_id=scenario_id,
+                    fallback={"used": False, "kind": None, "reason": type(error).__name__},
+                    metadata={"error_type": type(error).__name__},
+                )
                 persisted_logs = list(run.logs or [])
                 if not persisted_logs or persisted_logs[-1] != failure_log:
                     persisted_logs.append(failure_log)
                 run.status = "FAILED"
-                run.error = failure_log["message"]
+                run.error = f"{type(error).__name__}: cycle execution failed"
                 run.logs = persisted_logs
                 run.progress_stage = failure_stage
                 run.completed_at = datetime.now(timezone.utc)

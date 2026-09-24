@@ -1,5 +1,6 @@
 import json
 from collections.abc import Iterator
+from uuid import uuid4
 
 import pytest
 from sqlalchemy import delete, select
@@ -9,6 +10,7 @@ from backend.models import (
     Agent,
     AgentInfluenceObservation,
     ConsensusSession,
+    ConvergenceStatus,
     DisagreementLog,
     MetricSnapshot,
     ReasoningLog,
@@ -21,6 +23,7 @@ from worker.celery_tasks import (
     _default_llm_call,
     _extract_llm_response,
     _load_session_context,
+    _determine_convergence,
     _validated_response,
     execute_full_shcr_cycle,
     persist_run_progress,
@@ -37,9 +40,10 @@ def scenario_id() -> Iterator[int]:
             description="Phase 3 mocked fiscal scenario",
             max_deficit_constraint=3.0,
         )
+        suffix = uuid4().hex
         agents = [
-            Agent(name="phase3_fiscal", role="Fiscal Analyst"),
-            Agent(name="phase3_risk", role="Risk Analyst"),
+            Agent(name=f"phase3_fiscal_{suffix}", role="Fiscal Analyst"),
+            Agent(name=f"phase3_risk_{suffix}", role="Risk Analyst"),
         ]
         session.add(scenario)
         session.add_all(agents)
@@ -72,15 +76,11 @@ def scenario_id() -> Iterator[int]:
         )
         session.commit()
         identifier = scenario.id
+        agent_ids = [agent.id for agent in agents]
 
     yield identifier
 
     with SessionLocal() as session:
-        agent_ids = list(
-            session.scalars(
-                select(Agent.id).where(Agent.name.in_(["phase3_fiscal", "phase3_risk"]))
-            )
-        )
         session.execute(delete(MetricSnapshot).where(MetricSnapshot.scenario_id == identifier))
         session.execute(delete(SimulationArtifact).where(SimulationArtifact.scenario_id == identifier))
         session.execute(delete(DisagreementLog).where(DisagreementLog.scenario_id == identifier))
@@ -182,7 +182,7 @@ def test_flexible_srr_response_normalises_required_artifacts() -> None:
                 "options": [
                     {
                         "title": "Targeted option",
-                        "deficit_impact": 2.5,
+                        "projected_deficit": 2.5,
                         "utility_score": 0.8,
                     }
                 ],
@@ -232,15 +232,42 @@ def test_flexible_srr_response_sanitises_formatted_numbers_and_optional_recommen
         }
     )
 
+    assert [item.name for item in parsed.alternatives] == ["Cohort rollout", "Zero budget"]
     assert parsed.alternatives[0].deficit == pytest.approx(2.68)
     assert parsed.alternatives[0].utility == pytest.approx(0.9)
-    assert parsed.alternatives[1].deficit == pytest.approx(0.05)
-    assert parsed.alternatives[1].utility == pytest.approx(0.4)
-    assert parsed.alternatives[2].deficit == 0.0
-    assert parsed.alternatives[2].utility == pytest.approx(0.85)
+    assert parsed.alternatives[1].deficit == 0.0
+    assert parsed.alternatives[1].utility == pytest.approx(0.85)
+    assert parsed.model_extra is not None
+    assert parsed.model_extra["discarded_alternatives"][0]["name"] == "Mass rollout"
     assert parsed.recommendation is not None
     assert parsed.recommendation.content == "Approve cohort rollout"
     assert parsed.confidence == pytest.approx(0.94)
+
+
+def test_incremental_deficit_phrases_are_not_admitted_as_total_deficits() -> None:
+    parsed = SRRResponse.model_validate(
+        {
+            "alternatives": [
+                {"name": "Impact", "deficit": "Deficit impact: +0.04% of GDP", "utility": 0.8},
+                {"name": "Increase", "deficit": "increase of 0.04% of GDP", "utility": 0.7},
+                {"name": "Raised", "deficit": "raises the deficit by 0.04% of GDP", "utility": 0.6},
+                {"name": "Rises", "deficit": "deficit rises by 0.04% of GDP", "utility": 0.5},
+                {"name": "Total", "deficit": "total projected deficit including additional spending: 2.8% of GDP", "utility": 0.9},
+                {"name": "Mixed", "deficit": "Additional deficit impact: 0.04% of GDP; total projected deficit after policy is 2.8% of GDP", "utility": 0.85},
+            ]
+        }
+    )
+
+    assert [item.name for item in parsed.alternatives] == ["Total", "Mixed"]
+    assert parsed.alternatives[0].deficit == pytest.approx(2.8)
+    assert parsed.alternatives[1].deficit == pytest.approx(2.8)
+    assert parsed.model_extra is not None
+    assert [item["name"] for item in parsed.model_extra["discarded_alternatives"]] == [
+        "Impact",
+        "Increase",
+        "Raised",
+        "Rises",
+    ]
 
 
 def test_optional_empty_recommendation_is_accepted() -> None:
@@ -276,6 +303,26 @@ def test_unverifiable_alternative_is_discarded_without_fabricating_deficit() -> 
     assert parsed.model_extra["discarded_alternatives"][0]["deficit_raw"] == (
         "Material increase without verified GDP ratio"
     )
+
+
+def test_simulation_response_uses_conflict_fallback_for_empty_llm_value() -> None:
+    parsed = SimulationResponse.model_validate(
+        {
+            "simulation_summary": "Arbitration complete",
+            "conflict_summary": [],
+            "resolution": "Use a phased compromise",
+            "evidence": ["Structured sectoral outputs"],
+            "predictions": ["Deficit remains bounded"],
+            "risks": ["Implementation delay"],
+            "uncertainties": ["Demand response"],
+            "alternatives": [{"name": "Phased", "deficit": 2.4, "utility": 0.8}],
+            "recommendation": {"content": "Use phased compromise"},
+            "confidence": 0.8,
+        }
+    )
+    assert parsed.conflict_summary == [
+        "Tidak ada konflik tambahan yang belum diselesaikan pada ronde arbiter akhir."
+    ]
 
 
 def test_simulation_response_uses_summary_fallback_for_empty_llm_value() -> None:
@@ -478,8 +525,19 @@ def test_worker_refreshes_snapshot_that_became_stale_after_queue(
     session_id = _create_isolated_session(scenario_id)
     with SessionLocal() as session:
         scenario = session.get(Scenario, scenario_id)
-        agents = list(session.scalars(select(Agent).order_by(Agent.id)))
+        run = session.get(ConsensusSession, session_id)
         assert scenario is not None
+        assert run is not None
+        mandate_ids = [
+            item["agent_id"]
+            for item in run.mandate_payload["agent_rules"]
+            if isinstance(item, dict) and isinstance(item.get("agent_id"), int)
+        ]
+        agents = list(
+            session.scalars(
+                select(Agent).where(Agent.id.in_(mandate_ids)).order_by(Agent.id)
+            )
+        )
         old_revision = agent_revision(agents, scenario)
         agents[0].role = "Updated after queue"
         session.commit()
@@ -546,7 +604,8 @@ def test_consensus_round_reviews_peer_outputs(scenario_id: int) -> None:
     )
 
     assert len(peer_batches) == 2
-    assert {item["agent"] for item in peer_batches[0]} == {"phase3_fiscal", "phase3_risk"}
+    assert len({item["agent"] for item in peer_batches[0]}) == 2
+    assert all(str(item["agent"]).startswith("phase3_") for item in peer_batches[0])
     assert result["token_usage"] == 540
     assert any(log["stage"] == "CONSENSUS" for log in result["logs"])
 
@@ -594,7 +653,14 @@ def test_run_creates_rar_dai_observations_when_no_seed_exists(
         assert len(observations) == 2
         assert sum(item.normalized_weight or 0.0 for item in observations) == pytest.approx(1.0)
         assert all(len(item.interaction_payload) == 1 for item in observations)
-        assert all(item.calculation_payload["version"] == "rar-dai-v1" for item in observations)
+        assert all(item.calculation_payload["version"] == "rar-dai-v2" for item in observations)
+        for item in observations:
+            dimensions = item.calculation_payload["dimensions"]
+            assert dimensions["X"]["value"] == pytest.approx(item.X)
+            assert dimensions["Q"]["value"] == pytest.approx(item.Q)
+            assert dimensions["H"]["value"] == pytest.approx(item.H)
+            assert dimensions["S"]["value"] == pytest.approx(item.S)
+            assert dimensions["U"]["value"] == pytest.approx(item.U)
         assert all(item.proposition == "Phase 3 mocked fiscal scenario" for item in observations)
 
 
@@ -689,6 +755,10 @@ def test_ddr_invokes_native_simulation_and_feeds_follow_up_round(
     assert any(item["agent"] == SIMULATION_AGENT_NAME for item in peer_batches[2])
     assert any(log["stage"] == "SIMULATION" for log in result["logs"])
     assert any(log["stage"] == "SIMULATION_CONSENSUS" for log in result["logs"])
+    simulation_consensus_logs = [
+        log for log in result["logs"] if log["stage"] == "SIMULATION_CONSENSUS"
+    ]
+    assert {log["round_number"] for log in simulation_consensus_logs} == {1, 2}
     with SessionLocal() as session:
         artifacts = list(
             session.scalars(
@@ -754,7 +824,7 @@ def test_native_simulation_falls_back_when_provider_fails(
         )
         assert artifact is not None
         assert artifact.status == "SUCCEEDED"
-        assert artifact.output_payload["fallback_reason"].startswith("ConnectionError")
+        assert artifact.output_payload["fallback_reason"] == "ConnectionError"
         assert artifact.output_payload["evidence_status"] == "modelled"
 
 
@@ -779,6 +849,167 @@ def test_invalid_consensus_review_retains_validated_initial_artifacts(
     assert any(log["level"] == "WARNING" for log in consensus_logs)
     assert not any(log["level"] == "ERROR" for log in consensus_logs)
     assert result["metric_snapshot_id"] > 0
+
+
+def test_convergence_compares_agent_profiles_not_alternatives_within_one_profile() -> None:
+    first = SRRResponse.model_validate(
+        {
+            "alternatives": [
+                {"name": "A", "deficit": 2.0, "utility": 0.9},
+                {"name": "B", "deficit": 2.5, "utility": 0.7},
+            ],
+            "recommendation": {"content": "Adopt A"},
+        }
+    )
+    second = SRRResponse.model_validate(first.model_dump(mode="json"))
+    alternatives = [*first.alternatives, *second.alternatives]
+
+    assert (
+        _determine_convergence([first, second], alternatives, alternatives)
+        == ConvergenceStatus.FULL_CONSENSUS
+    )
+
+    second.alternatives[0].deficit = 2.2
+    alternatives = [*first.alternatives, *second.alternatives]
+    assert (
+        _determine_convergence([first, second], alternatives, alternatives)
+        == ConvergenceStatus.PARETO_SET
+    )
+
+
+def test_all_eight_ddr_components_persist_granular_metadata(
+    scenario_id: int,
+) -> None:
+    left = json.dumps(
+        {
+            "evidence": [{"content": "Baseline A", "source_tag": "source-a"}],
+            "assumptions": [{"content": "Inflation stable"}],
+            "predictions": [{"content": "Growth rises"}],
+            "risks": [{"content": "Execution delay"}],
+            "uncertainties": [{"content": "Demand response"}],
+            "objectives": [{"content": "Growth"}],
+            "constraints": [{"content": "Deficit ceiling"}],
+            "alternatives": [{"name": "Option A", "deficit": 2.5, "utility": 0.8}],
+            "recommendation": {"content": "Adopt A"},
+            "confidence": 0.9,
+        }
+    )
+    right = json.dumps(
+        {
+            "evidence": [{"content": "Baseline B", "source_tag": "source-b"}],
+            "assumptions": [{"content": "Inflation rises"}],
+            "predictions": [{"content": "Growth falls"}],
+            "risks": [{"content": "Debt pressure"}],
+            "uncertainties": [{"content": "Exchange-rate shock"}],
+            "objectives": [{"content": "Stability"}],
+            "constraints": [{"content": "Education floor"}],
+            "alternatives": [{"name": "Option B", "deficit": 3.5, "utility": 0.6}],
+            "recommendation": {"content": "Reject A"},
+            "confidence": 0.4,
+        }
+    )
+    responses = iter([(left, 10), (right, 11)])
+
+    result = execute_full_shcr_cycle(
+        scenario_id,
+        lambda _agent, _scenario: next(responses),
+        enable_simulation=False,
+    )
+
+    with SessionLocal() as session:
+        disagreement = session.scalar(
+            select(DisagreementLog).where(
+                DisagreementLog.run_id == result["session_id"]
+            )
+        )
+        assert disagreement is not None
+        metadata = disagreement.detail_payload["vector_metadata"]
+        assert set(metadata) == {"dE", "dA", "dP", "dR", "dU", "dO", "dC", "dREC"}
+        assert set(disagreement.detail_payload["active_components"]) == set(metadata)
+        for component, detail in metadata.items():
+            assert detail["component"] == component
+            assert detail["active"] is True
+            assert detail["status"] == "detected"
+            assert detail["formula"]
+            assert detail["category_i18n"]["id"]
+            assert detail["category_i18n"]["en"]
+            assert detail["meaning_i18n"]["id"]
+            assert detail["economic_impact_i18n"]["en"]
+            assert detail["agent_i"]["artifact_hash"]
+            assert detail["agent_j"]["artifact_hash"]
+            assert detail["calculation"]["status"] == "calculated"
+            assert detail["resolution_path"] != "No Resolution Required"
+        assert metadata["dE"]["calculation"]["source_variance"] == 1.0
+        assert metadata["dP"]["calculation"]["deficit_range_gap_percent_gdp"] == 1.0
+        assert metadata["dU"]["calculation"]["confidence_gap"] == 0.5
+        assert metadata["dC"]["calculation"]["violation"] is True
+        assert metadata["dC"]["calculation"]["solver"] is None
+
+
+def test_all_infeasible_cycle_cannot_resurrect_fallback_alternative(
+    scenario_id: int,
+) -> None:
+    def payload(name: str, prediction: str, deficit: float) -> str:
+        return json.dumps(
+            {
+                "evidence": [{"content": "Budget baseline", "source_tag": "budget-2026"}],
+                "predictions": [{"content": prediction, "source_tag": "forecast"}],
+                "risks": [{"content": "Fiscal breach"}],
+                "uncertainties": [{"content": "Demand response"}],
+                "alternatives": [{"name": name, "deficit": deficit, "utility": 0.8}],
+                "recommendation": {"content": "Do not approve"},
+                "confidence": 0.9,
+            }
+        )
+
+    first_round = iter(
+        [
+            (payload("Over ceiling A", "Growth 2%", 3.2), 10),
+            (payload("Over ceiling B", "Growth 1%", 4.0), 11),
+        ]
+    )
+    reviewed = iter(
+        [
+            (payload("Over ceiling A", "Growth 1.8%", 3.2), 12),
+            (payload("Over ceiling B", "Growth 1.2%", 4.0), 13),
+            (payload("Over ceiling A", "Growth 1.5%", 3.2), 14),
+            (payload("Over ceiling A", "Growth 1.5%", 3.2), 15),
+        ]
+    )
+
+    def failing_simulation(
+        _scenario: Scenario,
+        _conflicts: list[dict[str, object]],
+        _peers: list[dict[str, object]],
+    ) -> tuple[str, int]:
+        raise ConnectionError("simulation provider unavailable")
+
+    result = execute_full_shcr_cycle(
+        scenario_id,
+        lambda _agent, _scenario: next(first_round),
+        lambda _agent, _scenario, _peers: next(reviewed),
+        simulation_call=failing_simulation,
+    )
+
+    assert result["convergence_status"] == "INFEASIBLE"
+    assert result["feasible_alternatives_count"] == 0
+    assert result["hard_constraint_violation_rate"] == 100.0
+    assert result["car"]["solver_status"] == "unsat"
+    assert result["car"]["selected_alternative"] is None
+    assert len(result["car"]["rejected_alternatives"]) == 2
+    with SessionLocal() as session:
+        artifacts = list(
+            session.scalars(
+                select(SimulationArtifact).where(
+                    SimulationArtifact.run_id == result["session_id"]
+                )
+            )
+        )
+        assert len(artifacts) == 1
+        assert artifacts[0].output_payload["fallback"]["used"] is True
+        assert artifacts[0].output_payload["alternatives"] == []
+        assert artifacts[0].output_payload["selected_alternative"] is None
+        assert artifacts[0].output_payload["resolution_status"] == "INFEASIBLE"
 
 
 def test_run_full_shcr_cycle_populates_postgres(scenario_id: int) -> None:
@@ -841,7 +1072,7 @@ def test_run_full_shcr_cycle_populates_postgres(scenario_id: int) -> None:
         assert len(observations) == 2
         assert sum(item.normalized_weight or 0.0 for item in observations) == pytest.approx(1.0)
         assert all(item.interaction_payload for item in observations)
-        assert all(item.calculation_payload["version"] == "rar-dai-v1" for item in observations)
+        assert all(item.calculation_payload["version"] == "rar-dai-v2" for item in observations)
         assert all("normalized_weight" in item.calculation_payload for item in observations)
 
         run = session.get(ConsensusSession, result["session_id"])

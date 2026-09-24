@@ -1,7 +1,9 @@
 import re
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from backend.core_algorithms import STATUTORY_DEFICIT_CEILING_PERCENT_GDP
 
 
 _NUMBER_TOKEN = r"[-+]?(?:\d{1,3}(?:[.,]\d{3})+|\d+)(?:[.,]\d+)?"
@@ -10,6 +12,44 @@ _PERCENT_PATTERN = re.compile(rf"(?<![\d.,])({_NUMBER_TOKEN})\s*%")
 _ZERO_PATTERN = re.compile(
     r"^\s*(?:zero|nol|none|no impact|tanpa dampak|tidak ada dampak)\b"
 )
+_INCREMENTAL_PERCENT_AMOUNT = rf"{_NUMBER_TOKEN}(?:\s*[-–—]\s*{_NUMBER_TOKEN})?\s*%"
+_INCREMENTAL_DEFICIT_PATTERNS = (
+    re.compile(
+        rf"\b(?:deficit\s+impact|impact\s+on\s+(?:the\s+)?deficit)\s*[:=]?\s*{_INCREMENTAL_PERCENT_AMOUNT}",
+        flags=re.IGNORECASE,
+    ),
+    re.compile(
+        rf"\b(?:increase|incremental|additional)(?:\s+deficit)?(?:\s+impact)?\s*(?:of|by|:)?\s*{_INCREMENTAL_PERCENT_AMOUNT}",
+        flags=re.IGNORECASE,
+    ),
+    re.compile(
+        rf"\b(?:raises?|raised|increases?|increased)\s+(?:the\s+)?deficit\s+(?:by|of)\s+{_INCREMENTAL_PERCENT_AMOUNT}",
+        flags=re.IGNORECASE,
+    ),
+    re.compile(
+        rf"\bdeficit\s+(?:rises?|rose|increases?|increased)\s+by\s+{_INCREMENTAL_PERCENT_AMOUNT}",
+        flags=re.IGNORECASE,
+    ),
+    re.compile(
+        rf"\b(?:meningkatkan\s+defisit|defisit\s+meningkat|meningkat(?:kan)?\s+sebesar|bertambah\s+sebesar|tambahan\s+dampak\s+defisit)\D{{0,20}}{_INCREMENTAL_PERCENT_AMOUNT}",
+        flags=re.IGNORECASE,
+    ),
+)
+_TOTAL_DEFICIT_PERCENT_PATTERN = re.compile(
+    rf"\b(?:total\s+(?:projected\s+)?deficit|projected\s+total\s+deficit|"
+    rf"defisit\s+total|proyeksi\s+defisit\s+total)\b[^%;]{{0,80}}?({_NUMBER_TOKEN})\s*%",
+    flags=re.IGNORECASE,
+)
+_TOTAL_DEFICIT_PATTERN = re.compile(
+    r"\b(?:total\s+(?:projected\s+)?deficit|projected\s+total\s+deficit|defisit\s+total|proyeksi\s+defisit\s+total)\b",
+    flags=re.IGNORECASE,
+)
+
+
+def _is_incremental_deficit(value: str) -> bool:
+    if _TOTAL_DEFICIT_PATTERN.search(value):
+        return False
+    return any(pattern.search(value) for pattern in _INCREMENTAL_DEFICIT_PATTERNS)
 _QUALITATIVE_SCORES: tuple[tuple[tuple[str, ...], float], ...] = (
     (("very high", "sangat tinggi", "fully preserves", "optimal"), 0.9),
     (("high", "tinggi"), 0.75),
@@ -56,7 +96,13 @@ def _clean_number(
             return 0.0
         if prefer_percent and re.search(r"\b(?:netral|neutral|unchanged|no change|tetap)\b", lowered):
             return 0.0
-        percent_match = _PERCENT_PATTERN.search(text) if prefer_percent or normalise_ratio else None
+        total_deficit_match = (
+            _TOTAL_DEFICIT_PERCENT_PATTERN.search(text) if prefer_percent else None
+        )
+        percent_match = (
+            total_deficit_match
+            or (_PERCENT_PATTERN.search(text) if prefer_percent or normalise_ratio else None)
+        )
         if qualitative:
             for labels, score in _QUALITATIVE_SCORES:
                 if any(label in lowered for label in labels):
@@ -68,9 +114,13 @@ def _clean_number(
             ) or re.match(rf"^\s*({_NUMBER_TOKEN})(?:\s|$)", text)
             number_match = percent_match or explicit_match
             if number_match is None:
-                return 0.5
+                return value
         else:
-            number_match = percent_match or _NUMBER_PATTERN.search(text)
+            number_match = percent_match
+            if number_match is None and prefer_percent:
+                number_match = re.fullmatch(rf"\s*({_NUMBER_TOKEN})\s*", text)
+            if number_match is None and not prefer_percent:
+                number_match = _NUMBER_PATTERN.search(text)
         if number_match is None:
             return value
         number = _parse_number_token(number_match.group(1) if percent_match else number_match.group(0))
@@ -139,7 +189,7 @@ def _coerce_text_list(value: object) -> list[str]:
 
 
 class SRRItem(BaseModel):
-    model_config = ConfigDict(extra="allow")
+    model_config = ConfigDict(extra="allow", str_strip_whitespace=True)
 
     content: str = Field(min_length=1)
     source_tag: str | None = None
@@ -209,16 +259,23 @@ class Constraint(SRRItem):
 
 
 class Recommendation(SRRItem):
-    content: str = ""
+    pass
 
 
 class Alternative(BaseModel):
-    model_config = ConfigDict(extra="allow")
+    model_config = ConfigDict(extra="allow", str_strip_whitespace=True)
 
     name: str = Field(min_length=1)
-    deficit: float
-    utility: float
+    deficit: float = Field(ge=0.0, allow_inf_nan=False)
+    utility: float = Field(ge=0.0, le=1.0, allow_inf_nan=False)
     source_tag: str | None = None
+
+    @field_validator("deficit", "utility", mode="before")
+    @classmethod
+    def reject_boolean_numbers(cls, value: object) -> object:
+        if isinstance(value, bool):
+            raise ValueError("Boolean values are not valid numeric inputs")
+        return value
 
     @model_validator(mode="before")
     @classmethod
@@ -231,7 +288,7 @@ class Alternative(BaseModel):
                         payload["name"] = payload[key].strip()
                         break
             for target, aliases in {
-                "deficit": ("deficit_impact", "projected_deficit", "deficitImpact"),
+                "deficit": ("projected_deficit", "projected_deficit_percent_gdp"),
                 "utility": ("score", "benefit", "utility_score", "utilityScore"),
             }.items():
                 if target not in payload or payload[target] in (None, ""):
@@ -239,6 +296,11 @@ class Alternative(BaseModel):
                         if alias in payload and payload[alias] not in (None, ""):
                             payload[target] = payload[alias]
                             break
+            raw_deficit = payload.get("deficit")
+            if isinstance(raw_deficit, str) and _is_incremental_deficit(raw_deficit):
+                raise ValueError(
+                    "Incremental deficit impact cannot be treated as a total projected deficit"
+                )
             _normalise_numeric_fields(payload, ("deficit",), prefer_percent=True)
             _normalise_numeric_fields(
                 payload,
@@ -375,19 +437,43 @@ class SRRResponse(BaseModel):
 
     def divergence_object(self) -> dict[str, object]:
         return {
-            "E": [item.content for item in self.evidence],
+            "E": [
+                {"content": item.content, "source_tag": item.source_tag}
+                for item in self.evidence
+            ],
             "A": [item.content for item in self.assumptions],
-            "P": [item.content for item in self.predictions],
+            "P": {
+                "predictions": [item.content for item in self.predictions],
+                "projected_deficits": [
+                    {"name": item.name, "deficit": item.deficit}
+                    for item in self.alternatives
+                ],
+            },
             "R": [item.content for item in self.risks],
-            "U": [item.content for item in self.uncertainties],
+            "U": {
+                "uncertainties": [item.content for item in self.uncertainties],
+                "confidence": self.confidence,
+            },
             "O": [item.content for item in self.objectives],
-            "C": [item.content for item in self.constraints],
-            "REC": self.recommendation.content if self.recommendation is not None else None,
+            "C": {
+                "constraints": [item.content for item in self.constraints],
+                "statutory_deficit_violation": any(
+                    item.deficit > STATUTORY_DEFICIT_CEILING_PERCENT_GDP
+                    for item in self.alternatives
+                ),
+            },
+            "REC": self.recommendation.content
+            if self.recommendation is not None
+            else None,
         }
 
 
 _SIMULATION_SUMMARY_FALLBACK = (
     "Simulasi makro-fiskal otomatis diselesaikan oleh arbiter native."
+)
+
+_SIMULATION_CONFLICT_FALLBACK = (
+    "Tidak ada konflik tambahan yang belum diselesaikan pada ronde arbiter akhir."
 )
 
 
@@ -425,7 +511,11 @@ class SimulationResponse(SRRResponse):
             simulation_summary or _SIMULATION_SUMMARY_FALLBACK
         )
         payload["resolution"] = _coerce_text(payload.get("resolution"))
-        for field in ("conflict_summary", "modelled_variables", "limitations"):
+        conflict_summary = _coerce_text_list(payload.get("conflict_summary"))
+        payload["conflict_summary"] = conflict_summary or [
+            _SIMULATION_CONFLICT_FALLBACK
+        ]
+        for field in ("modelled_variables", "limitations"):
             payload[field] = _coerce_text_list(payload.get(field))
         payload.setdefault("evidence_status", "modelled")
         alternatives = payload.get("alternatives")

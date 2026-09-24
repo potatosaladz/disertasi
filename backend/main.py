@@ -24,6 +24,7 @@ from .agent_templates import (
     template_catalog,
 )
 from .core_algorithms import (
+    STATUTORY_DEFICIT_CEILING_PERCENT_GDP,
     build_mandate_synthesis_prompt,
     build_mandate_synthesis_system_prompt,
     extract_json_object,
@@ -181,11 +182,14 @@ class ScenarioCreate(BaseModel):
 
     description: str = Field(min_length=1)
     program_cost: float | None = Field(default=None, ge=0.0, allow_inf_nan=False)
-    max_deficit_constraint: float = Field(default=3.0, ge=0.0, allow_inf_nan=False)
+    max_deficit_constraint: float = Field(default=3.0, ge=0.0, le=3.0, allow_inf_nan=False)
 
 
-class ScenarioResponse(ScenarioCreate):
+class ScenarioResponse(BaseModel):
     id: int
+    description: str
+    program_cost: float | None = None
+    max_deficit_constraint: float
 
 
 def agent_response(agent: Agent) -> AgentResponse:
@@ -405,7 +409,10 @@ def _combined_domain_rules(agents: list[Agent], scenario: Scenario) -> dict[str,
         "owned_checks": sorted({item for spec in specs for item in spec.owned_checks}),
         "principles": sorted({item for spec in specs for item in spec.decision_principles}),
         "primary_sources": sorted({item for spec in specs for item in spec.primary_sources}),
-        "automatic_deficit_ceiling": scenario.max_deficit_constraint,
+        "automatic_deficit_ceiling": min(
+            scenario.max_deficit_constraint,
+            STATUTORY_DEFICIT_CEILING_PERCENT_GDP,
+        ),
     }
 
 
@@ -634,7 +641,7 @@ def _synthesis_fallbacks(agent: Agent, scenario: Scenario) -> MandateSynthesisFa
             "Classify disagreements, preserve valid dissent, and escalate unresolved conflicts through DDR and CAR"
         ],
         regulatory_compliance_alignment=[
-            f"Enforce the {scenario.max_deficit_constraint}% GDP deficit ceiling and reject unverified fiscal offsets"
+            f"Enforce the {min(scenario.max_deficit_constraint, STATUTORY_DEFICIT_CEILING_PERCENT_GDP)}% GDP deficit ceiling and reject unverified fiscal offsets"
         ],
     )
 

@@ -9,6 +9,7 @@ from sqlalchemy import delete, select
 
 from backend.celery_client import celery_client
 from backend.agent_templates import STANDARD_APBN_AGENT_TEMPLATES, agent_revision
+from backend.dashboard import _disagreement_payload
 from backend.database import SessionLocal
 from backend.main import app
 from backend.models import (
@@ -37,6 +38,114 @@ def test_agent_theta_u_zero_persists(client: TestClient) -> None:
         saved = session.scalar(select(Agent).where(Agent.name == name))
         assert saved is not None and saved.theta_u == 0.0
         session.execute(delete(Agent).where(Agent.id == saved.id))
+        session.commit()
+
+
+def test_car_dashboard_headroom_uses_effective_scenario_ceiling() -> None:
+    disagreement = DisagreementLog(
+        scenario_id=1,
+        agent_i=1,
+        agent_j=2,
+        dP=True,
+        detail_payload={
+            "fiscal_calculation": {
+                "statutory_deficit_ceiling_percent": 3.0,
+                "scenario_policy_ceiling_percent": 2.5,
+                "effective_deficit_ceiling_percent": 2.5,
+            }
+        },
+    )
+
+    payload = _disagreement_payload(
+        disagreement,
+        "Fiscal",
+        "Risk",
+        [],
+        {
+            "solver_status": "sat",
+            "status": "FEASIBLE",
+            "selected_alternative": {
+                "name": "Bounded",
+                "deficit": 2.4,
+                "utility": 0.9,
+            },
+        },
+    )
+
+    assert payload["fiscal_calculation"]["selected_compromise"][
+        "headroom_percent"
+    ] == pytest.approx(0.1)
+
+
+def test_legacy_scenario_ceiling_remains_serializable(client: TestClient) -> None:
+    with SessionLocal() as session:
+        scenario = Scenario(
+            description=f"Legacy ceiling {uuid.uuid4()}",
+            max_deficit_constraint=4.0,
+        )
+        session.add(scenario)
+        session.flush()
+        agent = Agent(name=f"legacy-agent-{uuid.uuid4()}", role="Fiscal")
+        session.add(agent)
+        session.flush()
+        revision = agent_revision([agent], scenario)
+        snapshot = ScenarioMandateSnapshot(
+            scenario_id=scenario.id,
+            revision=revision,
+            generated=True,
+            agent_count=1,
+            rules={"automatic_deficit_ceiling": 3.0},
+            agent_rules=[
+                {
+                    "agent_id": agent.id,
+                    "name": agent.name,
+                    "role": agent.role,
+                    "scenario_mandate": "Apply the effective legal ceiling.",
+                }
+            ],
+            status="success",
+            generated_count=1,
+            failure_count=0,
+        )
+        session.add(snapshot)
+        session.flush()
+        run_id = str(uuid.uuid4())
+        session.add(
+            ConsensusSession(
+                id=run_id,
+                scenario_id=scenario.id,
+                mandate_snapshot_id=snapshot.id,
+                mandate_revision=revision,
+                mandate_payload={
+                    "rules": snapshot.rules,
+                    "agent_rules": snapshot.agent_rules,
+                },
+                status="SUCCEEDED",
+                result_payload={},
+            )
+        )
+        session.commit()
+        scenario_id = scenario.id
+        agent_id = agent.id
+
+    response = client.get("/api/scenarios")
+
+    assert response.status_code == 200
+    assert next(item for item in response.json() if item["id"] == scenario_id)[
+        "max_deficit_constraint"
+    ] == 4.0
+    manifest = client.get(f"/api/scenarios/{scenario_id}/manifest?session_id={run_id}")
+    assert manifest.status_code == 200
+    prompt = next(
+        item["user"]
+        for item in manifest.json()["prompts"]
+        if item["agent_id"] == agent_id
+    )
+    assert "Automatic legal deficit ceiling: 3.0%" in prompt
+    assert "Automatic legal deficit ceiling: 4.0%" not in prompt
+    with SessionLocal() as session:
+        session.delete(session.get(Scenario, scenario_id))
+        session.delete(session.get(Agent, agent_id))
         session.commit()
 
 
@@ -762,6 +871,14 @@ def test_scenario_rejects_negative_program_cost(client: TestClient) -> None:
     assert response.status_code == 422
 
 
+def test_scenario_cannot_raise_statutory_deficit_ceiling(client: TestClient) -> None:
+    response = client.post(
+        "/api/scenarios",
+        json={"description": "Invalid ceiling", "max_deficit_constraint": 3.1},
+    )
+    assert response.status_code == 422
+
+
 def test_run_submission_and_status(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
     with SessionLocal() as session:
         scenario = Scenario(description=f"Run test {uuid.uuid4()}", max_deficit_constraint=3.0)
@@ -805,19 +922,21 @@ def test_run_submission_and_status(client: TestClient, monkeypatch: pytest.Monke
         scenario_id = scenario.id
         agent_ids = [agent.id for agent in agents]
 
-    class FakeTask:
-        id = "task-phase5"
-
-    monkeypatch.setattr(celery_client, "send_task", lambda *_args, **_kwargs: FakeTask())
+    monkeypatch.setattr(
+        celery_client,
+        "send_task",
+        lambda *_args, **kwargs: type("Task", (), {"id": kwargs["task_id"]})(),
+    )
     response = client.post(f"/api/scenarios/{scenario_id}/runs")
     assert response.status_code == 202
-    assert response.json()["task_id"] == "task-phase5"
+    assert response.json()["task_id"]
+    task_id = response.json()["task_id"]
     session_id = response.json()["session_id"]
 
     latest = client.get(f"/api/scenarios/{scenario_id}/runs/latest")
     history = client.get(f"/api/scenarios/{scenario_id}/runs")
-    status_response = client.get("/api/runs/task-phase5")
-    graph_response = client.get("/api/runs/task-phase5/graph")
+    status_response = client.get(f"/api/runs/{task_id}")
+    graph_response = client.get(f"/api/runs/{task_id}/graph")
 
     assert latest.status_code == 200
     assert latest.json()["session_id"] == session_id
@@ -848,8 +967,11 @@ def test_run_submission_and_status(client: TestClient, monkeypatch: pytest.Monke
         run = session.get(ConsensusSession, session_id)
         assert run is not None
         assert run.scenario_id == scenario_id
-        assert run.celery_task_id == "task-phase5"
-        assert run.logs == response.json()["logs"]
+        assert run.celery_task_id == task_id
+        assert run.logs[0]["event_id"] == response.json()["logs"][0]["event_id"]
+        assert run.logs[0]["messages"] == response.json()["logs"][0]["messages"]
+        assert run.logs[0]["message"] == run.logs[0]["messages"]["en"]
+        assert response.json()["logs"][0]["message"] == response.json()["logs"][0]["messages"]["id"]
         assert run.progress_stage == "QUEUE"
         session.delete(session.get(Scenario, scenario_id))
         session.execute(delete(Agent).where(Agent.id.in_(agent_ids)))
@@ -911,10 +1033,11 @@ def test_run_submission_refreshes_stale_mandate_snapshot(
         scenario_id = scenario.id
         agent_ids = [agent.id for agent in agents]
 
-    class FakeTask:
-        id = "task-stale-refresh"
-
-    monkeypatch.setattr(celery_client, "send_task", lambda *_args, **_kwargs: FakeTask())
+    monkeypatch.setattr(
+        celery_client,
+        "send_task",
+        lambda *_args, **kwargs: type("Task", (), {"id": kwargs["task_id"]})(),
+    )
     response = client.post(f"/api/scenarios/{scenario_id}/runs")
 
     assert response.status_code == 202
@@ -976,9 +1099,45 @@ def test_dashboard_matrix_and_manifest(client: TestClient) -> None:
                 mandate_payload={"rules": {}, "agent_rules": mandate.agent_rules},
                 celery_task_id=f"simulation-dashboard-{run_id}",
                 status="SUCCEEDED",
+                logs=[
+                    {
+                        "event_id": "round-1-event",
+                        "stage": "SIMULATION_CONSENSUS",
+                        "level": "SUCCESS",
+                        "message": "Round 1 complete with Authorization: Bearer abcdefghijklmnop",
+                        "messages": {
+                            "id": "Ronde 1 selesai dengan Authorization: Bearer abcdefghijklmnop",
+                            "en": "Round 1 complete with Authorization: Bearer abcdefghijklmnop",
+                        },
+                        "round_number": 1,
+                        "metadata": {"secret_key": "secret", "safe": "visible"},
+                    },
+                    {
+                        "stage": "SIMULATION_CONSENSUS",
+                        "level": "SUCCESS",
+                        "message": "Round 2 complete",
+                        "round_number": 2,
+                    },
+                ],
+                result_payload={
+                    "convergence_status": "INFEASIBLE",
+                    "feasible_alternatives_count": 0,
+                    "car": {
+                        "solver": "z3",
+                        "solver_status": "unsat",
+                        "selected_alternative": None,
+                        "rejected_alternatives": [
+                            {
+                                "name": "Over ceiling",
+                                "projected_deficit_percent_gdp": 3.2,
+                            }
+                        ],
+                        "status": "INFEASIBLE",
+                    },
+                },
             )
         )
-        session.add(MetricSnapshot(run_id=run_id, scenario_id=scenario.id, provenance_completeness_percent=75.0, material_information_retention_macro_f1=0.8, hard_constraint_violation_rate=20.0, feasible_alternatives_count=4, convergence_status="INFEASIBLE", latency_ms=120.0, token_usage=500))
+        session.add(MetricSnapshot(run_id=run_id, scenario_id=scenario.id, provenance_completeness_percent=75.0, material_information_retention_macro_f1=0.8, hard_constraint_violation_rate=100.0, feasible_alternatives_count=0, convergence_status="INFEASIBLE", latency_ms=120.0, token_usage=500))
         session.add(MetricSnapshot(scenario_id=scenario.id, provenance_completeness_percent=10.0, material_information_retention_macro_f1=0.1, hard_constraint_violation_rate=90.0, feasible_alternatives_count=1, convergence_status="NO_CONSENSUS", latency_ms=50.0, token_usage=100))
         session.add_all([
             ReasoningLog(run_id=run_id, agent_id=agent_i.id, scenario_id=scenario.id, raw_json={"prompt": "i"}, parsed_srr_objects={"evidence": [{"content": "Fiscal baseline"}]}, deliberation_history=[{"stage": "INITIAL", "round_number": 0, "artifacts": {"reasoning_summary": "Prioritize fiscal space", "constraints": [{"content": "Deficit cap"}], "recommendation": {"content": "Use phased financing"}, "confidence": 0.8, "evidence": [{"content": "Fiscal baseline"}], "predictions": [{"content": "Stable deficit"}], "risks": [{"content": "Revenue shortfall"}], "uncertainties": [{"content": "Growth"}], "alternatives": [{"name": "Phased financing", "deficit": 2.5, "utility": 0.8}]}}, {"stage": "PRE_ARBITRATION", "round_number": 0, "artifacts": {"reasoning_summary": "Adopt phased financing before arbitration", "constraints": [{"content": "Deficit cap"}], "recommendation": {"content": "Use phased financing"}, "confidence": 0.82, "evidence": [{"content": "Fiscal baseline"}], "predictions": [{"content": "Stable deficit"}], "risks": [{"content": "Revenue shortfall"}], "uncertainties": [{"content": "Growth"}], "alternatives": [{"name": "Phased financing", "deficit": 2.5, "utility": 0.8}]}}], is_schema_valid=True, provenance_count=2),
@@ -1007,9 +1166,12 @@ def test_dashboard_matrix_and_manifest(client: TestClient) -> None:
         scenario_id = scenario.id
 
     dashboard = client.get(
-        f"/api/scenarios/{scenario_id}/dashboard?session_id={run_id}"
+        f"/api/scenarios/{scenario_id}/dashboard?session_id={run_id}&lang=id"
     )
-    run_status_response = client.get(f"/api/runs/simulation-dashboard-{run_id}")
+    dashboard_en = client.get(
+        f"/api/scenarios/{scenario_id}/dashboard?session_id={run_id}&lang=en"
+    )
+    run_status_response = client.get(f"/api/runs/simulation-dashboard-{run_id}?lang=id")
     assert run_status_response.status_code == 200
     assert run_status_response.json()["simulation_artifacts"][0]["input"]["conflicts"][0]["components"] == ["dP"]
     assert run_status_response.json()["simulation_artifacts"][0]["output"]["evidence_status"] == "modelled"
@@ -1019,14 +1181,46 @@ def test_dashboard_matrix_and_manifest(client: TestClient) -> None:
     assert run_agents[0]["confidence"] == 0.82
     assert run_agents[0]["constraints_considered"][0]["content"] == "Deficit cap"
     assert len(run_agents[0]["deliberation_stages"]) == 2
+    run_analysis = run_status_response.json()["collective_reasoning"]
+    assert run_analysis["methodology"].startswith("SHCR")
+    assert len(run_analysis["claims_and_positions"]) == 2
+    assert run_analysis["claims_and_positions"][0]["main_claim"] == (
+        "Adopt phased financing before arbitration"
+    )
+    assert run_analysis["why_and_how"]["divergence_points"]
+    recommendation = run_analysis["recommendation_and_follow_up"]
+    assert recommendation["final_resolution"] is None
+    assert recommendation["proposed_resolution"] == "Use a phased compromise"
+    assert recommendation["selected_alternative"] is None
+    assert recommendation["status"] == "INFEASIBLE"
+    assert recommendation["arbiter"] == "CAR / Z3"
+    assert run_analysis["normative_evaluation"]["principles"][0]["principle"] == (
+        "Batas defisit statutory"
+    )
 
-    ddr_response = client.get(f"/api/runs/simulation-dashboard-{run_id}/ddr")
+    analytics_response = client.get(
+        f"/api/runs/simulation-dashboard-{run_id}/analytics?lang=en"
+    )
+    assert analytics_response.status_code == 200
+    analytics_payload = analytics_response.json()["collective_reasoning"]
+    assert analytics_payload["recommendation_and_follow_up"]["round_number"] == 1
+    assert any(
+        principle["principle"] == "Unverified revenue offsets"
+        for principle in analytics_payload["normative_evaluation"]["principles"]
+    )
+
+    ddr_response = client.get(f"/api/runs/simulation-dashboard-{run_id}/ddr?lang=en")
     assert ddr_response.status_code == 200
     ddr_payload = ddr_response.json()["disagreements"][0]
     assert ddr_payload["active_components"] == ["dE", "dP"]
-    assert ddr_payload["conflict_categories"][0]["category"] == "Evidence & provenance"
+    assert ddr_payload["conflict_categories"][0]["category"] == (
+        "Evidence and provenance divergence"
+    )
     assert "compromise_formula" in ddr_payload["fiscal_calculation"]
-    assert ddr_payload["resolution_detail"]["arbiter_conclusion"] == "Use a phased compromise"
+    assert ddr_payload["resolution_detail"]["arbiter_conclusion"] is None
+    assert ddr_payload["resolution_detail"]["proposed_resolution"] == (
+        "Use a phased compromise"
+    )
 
     graph_response = client.get(f"/api/scenarios/{scenario_id}/runs/{run_id}/graph")
     assert graph_response.status_code == 200
@@ -1036,6 +1230,12 @@ def test_dashboard_matrix_and_manifest(client: TestClient) -> None:
     assert nodes["simulation:1"]["status"] == "SUCCEEDED"
     assert nodes["simulation:1"]["details"]["artifact_id"] > 0
     assert nodes["simulation:1"]["details"]["output"]["evidence_status"] == "modelled"
+    consensus_node = nodes["stage:simulation-consensus:1"]
+    assert consensus_node["label"].endswith("Ronde 1")
+    assert [log["message"] for log in consensus_node["details"]["logs"]] == [
+        "Ronde 1 selesai dengan [REDACTED]"
+    ]
+    assert consensus_node["details"]["logs"][0]["metadata"] == {"safe": "visible"}
     assert nodes["stage:ddr"]["details"]["disagreement_count"] == 1
     assert nodes["stage:ddr"]["details"]["simulation_trigger_count"] == 1
     assert edges["edge:ddr-simulation:1"]["kind"] == "escalation"
@@ -1045,13 +1245,29 @@ def test_dashboard_matrix_and_manifest(client: TestClient) -> None:
     assert "chain_of_thought" not in json.dumps(graph)
     assert "raw_json" not in json.dumps(graph)
     assert dashboard.status_code == 200
+    assert dashboard_en.status_code == 200
+    assert dashboard.json()["language"] == "id"
+    assert dashboard_en.json()["language"] == "en"
+    assert dashboard.json()["latest_metric"] == dashboard_en.json()["latest_metric"]
+    invalid_language = client.get(
+        f"/api/runs/simulation-dashboard-{run_id}/analytics?lang=fr"
+    )
+    assert invalid_language.status_code == 422
     payload: dict[str, Any] = dashboard.json()
     assert payload["latest_metric"]["convergence_status"] == "INFEASIBLE"
+    assert payload["collective_reasoning"]["normative_evaluation"]["principles"][0]["status"] == "BREACH"
     assert payload["schema_validity_percent"] == 50.0
     assert payload["disagreements"][0]["dE"] is True
     assert payload["disagreements"][0]["resolution_mechanism"] == "Simulation Agent Requested"
     assert payload["agent_breakdown"][0]["pre_arbitration"]["agent_opinion"] == "Adopt phased financing before arbitration"
     assert payload["agent_breakdown"][0]["alternatives"][0]["name"] == "Phased financing"
+    assert payload["collective_reasoning"]["claims_and_positions"][0]["agent_name"] in {
+        agent_i.name,
+        agent_j.name,
+    }
+    assert payload["collective_reasoning"]["why_and_how"]["summary"].startswith(
+        "DDR mencatat"
+    )
     assert payload["simulation_artifacts"][0]["output"]["evidence_status"] == "modelled"
 
     manifest = client.get(f"/api/scenarios/{scenario_id}/manifest")
@@ -1062,6 +1278,7 @@ def test_dashboard_matrix_and_manifest(client: TestClient) -> None:
     assert manifest_payload["llm_outputs"][0]["raw_json"]["prompt"] in {"i", "j"}
     assert manifest_payload["metrics"][0]["convergence_status"] == "INFEASIBLE"
     assert manifest_payload["agent_breakdown"][0]["evidence"][0]["content"] == "Fiscal baseline"
+    assert manifest_payload["collective_reasoning"]["normative_evaluation"]["summary"]
     assert manifest_payload["simulation_artifacts"][0]["output"]["resolution"] == "Use a phased compromise"
 
     with SessionLocal() as session:
@@ -1079,6 +1296,13 @@ def test_run_status_success(client: TestClient, monkeypatch: pytest.MonkeyPatch)
         state = "SUCCESS"
         result = {
             "metric_snapshot_id": 9,
+            "token_usage": 42,
+            "nested": {
+                "apiKey": "secret",
+                "client_secret": "secret",
+                "x-api-key": "secret",
+                "safe": "visible",
+            },
             "logs": [
                 {
                     "stage": "CONSENSUS",
@@ -1105,13 +1329,15 @@ def test_run_status_success(client: TestClient, monkeypatch: pytest.MonkeyPatch)
     assert response.status_code == 200
     assert response.json()["status"] == "SUCCEEDED"
     assert response.json()["result"]["metric_snapshot_id"] == 9
+    assert response.json()["result"]["token_usage"] == 42
+    assert response.json()["result"]["nested"] == {"safe": "visible"}
     assert response.json()["logs"][0]["stage"] == "CONSENSUS"
 
 
 def test_run_status_failure(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
     class FakeResult:
         state = "FAILURE"
-        result = ValueError("cycle failed")
+        result = ValueError("cycle failed: api_key=secret")
         info = None
 
         def successful(self) -> bool:

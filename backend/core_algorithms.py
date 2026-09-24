@@ -16,6 +16,7 @@ LLM_HEADERS = {
     "Accept": "application/json",
 }
 logger = logging.getLogger(__name__)
+STATUTORY_DEFICIT_CEILING_PERCENT_GDP = 3.0
 
 DDR_COMPONENT_FIELDS = {
     "dE": "E",
@@ -27,15 +28,63 @@ DDR_COMPONENT_FIELDS = {
     "dC": "C",
     "dREC": "REC",
 }
-DDR_COMPONENT_DETAILS = {
-    "dE": ("Evidence & provenance", "Bukti atau rujukan sumber yang dipakai kedua agen berbeda."),
-    "dA": ("Assumptions", "Asumsi dasar yang menopang argumen kedua agen tidak sama."),
-    "dP": ("Fiscal projection", "Proyeksi dampak, termasuk arah atau besaran defisit, berbeda dan memerlukan simulasi."),
-    "dR": ("Risk assessment", "Profil risiko kebijakan dinilai berbeda oleh kedua agen."),
-    "dU": ("Uncertainty", "Sumber ketidakpastian atau batas pengetahuan yang dicatat kedua agen berbeda."),
-    "dO": ("Policy objective", "Tujuan atau prioritas kebijakan yang digunakan kedua agen tidak identik."),
-    "dC": ("Statutory constraint", "Constraint atau statutory gate yang diterapkan kedua agen berbeda."),
-    "dREC": ("Recommendation", "Rekomendasi kebijakan parsial kedua agen berbeda."),
+DDR_COMPONENT_DETAILS: dict[str, dict[str, Any]] = {
+    "dE": {
+        "category": {"id": "Divergensi bukti dan provenance", "en": "Evidence and provenance divergence"},
+        "formula": "1 - |sources_i ∩ sources_j| / |sources_i ∪ sources_j|",
+        "meaning": {"id": "Perbedaan sumber atau hash artefak mencegah penerimaan data yang belum terverifikasi.", "en": "Source or artifact-hash differences prevent acceptance of unverified data."},
+        "impact": {"id": "Memicu verifikasi provenance dan retrieval tambahan sebelum klaim dipakai.", "en": "Triggers provenance verification and additional retrieval before a claim is admitted."},
+        "route": "Provenance Retrieval Triggered",
+    },
+    "dA": {
+        "category": {"id": "Divergensi asumsi", "en": "Assumption divergence"},
+        "formula": "1 - |assumptions_i ∩ assumptions_j| / |assumptions_i ∪ assumptions_j|",
+        "meaning": {"id": "Premis masa depan yang tidak teramati berbeda antaragen.", "en": "Unobserved future premises differ between agents."},
+        "impact": {"id": "Memerlukan analisis sensitivitas dan deklarasi reliabilitas eksplisit.", "en": "Requires sensitivity analysis and explicit reliability declarations."},
+        "route": "Evidence Review Required",
+    },
+    "dP": {
+        "category": {"id": "Divergensi prediksi", "en": "Prediction divergence"},
+        "formula": "prediction_set_distance; deficit_range_gap = max(|deficit_i - deficit_j|)",
+        "meaning": {"id": "Proyeksi dampak kausal atau pergeseran defisit berbeda.", "en": "Causal-impact projections or deficit shifts differ."},
+        "impact": {"id": "Diteruskan ke Simulation Agent untuk stress-test kuantitatif berbatas.", "en": "Escalates to the Simulation Agent for bounded quantitative stress testing."},
+        "route": "Simulation Agent Requested",
+    },
+    "dR": {
+        "category": {"id": "Divergensi risiko", "en": "Risk divergence"},
+        "formula": "risk_set_distance; impact_probability_gap when verified scores exist",
+        "meaning": {"id": "Profil ancaman fiskal atau operasional dinilai berbeda.", "en": "Fiscal or operational threat profiles are assessed differently."},
+        "impact": {"id": "Memicu stress-test historis; matriks Impact × Probability tidak dihitung tanpa skor terverifikasi.", "en": "Triggers historical stress testing; Impact × Probability is not calculated without verified scores."},
+        "route": "Evidence Review Required",
+    },
+    "dU": {
+        "category": {"id": "Divergensi ketidakpastian", "en": "Uncertainty divergence"},
+        "formula": "uncertainty_set_distance; confidence_gap = |confidence_i - confidence_j|",
+        "meaning": {"id": "Confidence atau batas epistemik antaragen berbeda.", "en": "Agent confidence or epistemic bounds differ."},
+        "impact": {"id": "Memerlukan rekonsiliasi ketidakpastian dan memengaruhi penalti RAR-DAI.", "en": "Requires uncertainty reconciliation and affects the RAR-DAI penalty."},
+        "route": "Evidence Review Required",
+    },
+    "dO": {
+        "category": {"id": "Divergensi tujuan", "en": "Objective divergence"},
+        "formula": "1 - |objectives_i ∩ objectives_j| / |objectives_i ∪ objectives_j|",
+        "meaning": {"id": "Prioritas stabilitas fiskal dan manfaat sosial bertabrakan.", "en": "Fiscal-stability and social-benefit priorities conflict."},
+        "impact": {"id": "Diadili melalui trade-off Pareto/MCDM tanpa menghapus posisi minoritas.", "en": "Adjudicated through Pareto/MCDM trade-offs without suppressing minority positions."},
+        "route": "Pareto Reconciliation",
+    },
+    "dC": {
+        "category": {"id": "Divergensi constraint", "en": "Constraint divergence"},
+        "formula": "hard_gate = projected_deficit <= 3.0%; education_share >= 20% when verified",
+        "meaning": {"id": "Batas hukum keras diterapkan atau dilanggar secara berbeda.", "en": "Hard statutory boundaries are applied or violated differently."},
+        "impact": {"id": "CAR/Z3 memberi verdict INFEASIBLE saat hard constraint terverifikasi dilanggar; LLM tidak dapat mengesampingkannya.", "en": "CAR/Z3 returns INFEASIBLE when a verified hard constraint is violated; an LLM cannot override it."},
+        "route": "Constraint Arbitration Required",
+    },
+    "dREC": {
+        "category": {"id": "Divergensi rekomendasi", "en": "Recommendation divergence"},
+        "formula": "recommendation_text_mismatch and alternative_rank_distance",
+        "meaning": {"id": "Peringkat strategi akhir berbeda meskipun artefak telah distrukturkan.", "en": "Final strategic rankings differ despite structured artifacts."},
+        "impact": {"id": "Memaksa resolusi ulang penyebab hulu dE–dC sebelum sintesis final.", "en": "Forces upstream re-resolution of dE–dC before final synthesis."},
+        "route": "Upstream Re-resolution Required",
+    },
 }
 T = TypeVar("T")
 
@@ -238,11 +287,12 @@ def build_agent_user_prompt(
     program_cost: float | None,
     max_deficit: float,
 ) -> str:
+    effective_ceiling = min(max_deficit, STATUTORY_DEFICIT_CEILING_PERCENT_GDP)
     return (
         f"Agent role: {role}\n"
         f"Policy goal: {policy_goal}\n"
         f"Program cost: {program_cost if program_cost is not None else 'UNKNOWN'}\n"
-        f"Automatic legal deficit ceiling: {max_deficit}%\n\n"
+        f"Automatic legal deficit ceiling: {effective_ceiling}%\n\n"
         "Produce a decision-complete SRR JSON response with all mandatory decision artifacts: "
         "non-empty evidence, predictions, risks, uncertainties, and alternatives arrays, plus "
         "a recommendation object and numeric confidence between 0 and 1. State evidence-backed impact "
@@ -277,7 +327,10 @@ def build_mandate_synthesis_prompt(
         "primary_sources": list(primary_sources),
         "constraints": list(constraints),
         "owned_checks": list(owned_checks),
-        "automatic_deficit_ceiling_percent_gdp": max_deficit_constraint,
+        "automatic_deficit_ceiling_percent_gdp": min(
+            max_deficit_constraint,
+            STATUTORY_DEFICIT_CEILING_PERCENT_GDP,
+        ),
     }
     return (
         f"Act autonomously as the expert {role} named {agent_name}. Generate a practical, "
@@ -316,8 +369,13 @@ def build_consensus_prompt(
 def validate_decision_artifacts(response: object) -> list[str]:
     required_collections = ("evidence", "predictions", "risks", "uncertainties", "alternatives")
     missing = [field for field in required_collections if not _value(response, field)]
-    if _value(response, "recommendation") is None:
+    recommendation = _value(response, "recommendation")
+    if recommendation is None:
         missing.append("recommendation")
+    else:
+        content = _value(recommendation, "content")
+        if not isinstance(content, str) or not content.strip():
+            missing.append("recommendation")
     if _value(response, "confidence") is None:
         missing.append("confidence")
     return missing
@@ -395,7 +453,10 @@ def neuro_symbolic_filter(
     alternatives: Sequence[T],
     C_H: object,
 ) -> list[T]:
-    max_deficit = float(_value(C_H, "max_deficit"))
+    max_deficit = min(
+        float(_value(C_H, "max_deficit")),
+        STATUTORY_DEFICIT_CEILING_PERCENT_GDP,
+    )
     return [
         alternative
         for alternative in alternatives
@@ -418,12 +479,18 @@ def _component_value(item: object, component: str, semantic_field: str) -> Any:
         raise ValueError(f"Missing required field: {component}") from error
 
 
-def describe_divergence_vector(vector: Mapping[str, object]) -> list[dict[str, str]]:
+def describe_divergence_vector(vector: Mapping[str, object]) -> list[dict[str, Any]]:
     return [
         {
             "component": component,
-            "category": DDR_COMPONENT_DETAILS[component][0],
-            "narrative": DDR_COMPONENT_DETAILS[component][1],
+            "category": DDR_COMPONENT_DETAILS[component]["category"]["en"],
+            "category_i18n": DDR_COMPONENT_DETAILS[component]["category"],
+            "narrative": DDR_COMPONENT_DETAILS[component]["meaning"]["en"],
+            "narrative_i18n": DDR_COMPONENT_DETAILS[component]["meaning"],
+            "impact": DDR_COMPONENT_DETAILS[component]["impact"]["en"],
+            "impact_i18n": DDR_COMPONENT_DETAILS[component]["impact"],
+            "formula": DDR_COMPONENT_DETAILS[component]["formula"],
+            "default_route": DDR_COMPONENT_DETAILS[component]["route"],
         }
         for component in DDR_COMPONENT_FIELDS
         if bool(vector.get(component))
@@ -437,11 +504,29 @@ def resolve_disagreement_route(vector: Mapping[str, object]) -> str:
         return "Constraint Arbitration Required"
     if bool(vector.get("dE")):
         return "Provenance Retrieval Triggered"
-    if bool(vector.get("dREC")) or bool(vector.get("dO")):
+    if bool(vector.get("dREC")):
+        return "Upstream Re-resolution Required"
+    if bool(vector.get("dO")):
         return "Pareto Reconciliation"
     if any(bool(vector.get(component)) for component in ("dA", "dR", "dU")):
         return "Evidence Review Required"
     return "No Resolution Required"
+
+
+def _canonical_divergence_value(value: object) -> object:
+    if isinstance(value, Mapping):
+        return tuple(
+            sorted(
+                (str(key), _canonical_divergence_value(item))
+                for key, item in value.items()
+            )
+        )
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        items = [_canonical_divergence_value(item) for item in value]
+        return tuple(sorted(items, key=repr))
+    if isinstance(value, str):
+        return " ".join(value.casefold().split())
+    return value
 
 
 def detect_divergence_vector(
@@ -449,8 +534,10 @@ def detect_divergence_vector(
     obj_j: object,
 ) -> dict[str, bool]:
     return {
-        component: _component_value(obj_i, component, field)
-        != _component_value(obj_j, component, field)
+        component: _canonical_divergence_value(
+            _component_value(obj_i, component, field)
+        )
+        != _canonical_divergence_value(_component_value(obj_j, component, field))
         for component, field in DDR_COMPONENT_FIELDS.items()
     }
 

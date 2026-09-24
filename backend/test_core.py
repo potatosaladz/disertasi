@@ -18,6 +18,7 @@ from backend.core_algorithms import (
     llm_request_headers,
     neuro_symbolic_filter,
 )
+from backend.sanitization import sanitize_public_value
 from backend.simulation_agent import (
     SIMULATION_AGENT_NAME,
     SIMULATION_SOURCE_TAG,
@@ -27,6 +28,7 @@ from backend.simulation_agent import (
     build_simulation_system_prompt,
     sanitize_simulation_payload,
 )
+from worker.car_solver import evaluate_car_constraints
 
 
 def make_agent(*, uncertainty: float = 0.0, gate: int = 1) -> dict[str, float | int]:
@@ -199,11 +201,37 @@ def test_deterministic_simulation_filters_hard_constraint_and_tags_outputs() -> 
     assert all(item["deficit"] <= 3.0 for item in simulation["alternatives"])
 
 
+def test_deterministic_simulation_marks_all_infeasible_without_placeholder() -> None:
+    simulation = build_deterministic_simulation(
+        "Evaluate an infeasible fiscal programme",
+        3.0,
+        [{"agent_i": "Fiscal", "agent_j": "Risk", "components": ["dP"]}],
+        [
+            {
+                "agent": "Fiscal",
+                "srr": {
+                    "alternatives": [
+                        {"name": "Over ceiling", "deficit": 3.2, "utility": 0.9}
+                    ]
+                },
+            }
+        ],
+    )
+
+    assert simulation["alternatives"] == []
+    assert simulation["selected_alternative"] is None
+    assert simulation["resolution_status"] == "INFEASIBLE"
+    assert simulation["calculation_status"] == "infeasible"
+    assert "All supplied alternatives exceed" in simulation["predictions"][0]["content"]
+
+
 def test_simulation_payload_removes_private_reasoning_recursively() -> None:
     payload = sanitize_simulation_payload(
         {
             "resolution": "Use phased implementation",
             "analysis": "private",
+            "api_key": "secret-key",
+            "authorization": "Bearer secret",
             "alternatives": [
                 {
                     "name": "Phased",
@@ -215,10 +243,64 @@ def test_simulation_payload_removes_private_reasoning_recursively() -> None:
     )
 
     assert "analysis" not in payload
+    assert "api_key" not in payload
+    assert "authorization" not in payload
     alternative = payload["alternatives"][0]
     assert "chain_of_thought" not in alternative
     assert "hidden_reasoning" not in alternative["metadata"]
     assert alternative["metadata"]["status"] == "modelled"
+
+
+def test_public_sanitizer_removes_nested_secret_key_variants() -> None:
+    payload = sanitize_public_value(
+        {
+            "token_usage": 42,
+                "message": (
+                    "Authorization: Bearer abcdefghijklmnop and sk-abcdefghijklmnop "
+                    "and hf_abcdefghijklmnop and AKIAABCDEFGHIJKLMNOP "
+                    "and rk_live_abcdefghijklmnop"
+                ),
+
+            "reasoning": "private",
+            "reasoning_steps": ["private"],
+            "hidden_reasoning_steps": ["private"],
+            "internal_reasoning_content": "private",
+            "reasoning_summary": "public summary",
+            "rationale": "public rationale",
+            "scratchpad": "private",
+            "scratchpad_content": "private",
+            "nested": {
+                "apiKey": "secret",
+                "api_keys": ["secret"],
+                "aws_access_key_id": "secret",
+                "client_secret": "secret",
+                "client_secret_value": "secret",
+                "credentials_json": "secret",
+                "openai_api_key": "secret",
+                "x-api-key": "secret",
+                "secret_key": "secret",
+                "secret_keys": ["secret"],
+                "private_key": "secret",
+                "private_key_data": "secret",
+                "private_key_format": "secret",
+                "private_key_pem": "secret",
+                "password_hash": "secret",
+                "access_token_value": "secret",
+                "access_tokens": ["secret"],
+                "cookies": "secret",
+                "token": "secret",
+                "safe": "visible",
+            },
+        }
+    )
+
+    assert payload == {
+        "token_usage": 42,
+        "message": "[REDACTED] and [REDACTED] and [REDACTED] and [REDACTED] and [REDACTED]",
+        "reasoning_summary": "public summary",
+        "rationale": "public rationale",
+        "nested": {"safe": "visible"},
+    }
 
 
 def test_rar_dai_zero_gate() -> None:
@@ -310,6 +392,134 @@ def test_car_filtering() -> None:
     assert len(feasible) == 1
     assert feasible[0].deficit == 2.0
     assert violation_rate == 66.67
+
+
+def test_car_all_infeasible_has_no_selected_or_placeholder() -> None:
+    result = evaluate_car_constraints(
+        [
+            {"name": "Over ceiling A", "deficit": 3.1, "utility": 0.9},
+            {"name": "Over ceiling B", "deficit": 4.0, "utility": 0.8},
+        ],
+        5.0,
+    )
+
+    assert result.feasible == []
+    assert result.selected is None
+    assert result.solver_status == "unsat"
+    assert len(result.rejected) == 2
+    assert all(item["ceiling_percent_gdp"] == 3.0 for item in result.rejected)
+    assert all(item["violated_constraints"] == ["DEFICIT_3PCT"] for item in result.rejected)
+
+
+def test_car_distinguishes_stricter_scenario_policy_from_statutory_ceiling() -> None:
+    result = evaluate_car_constraints(
+        [{"name": "Policy breach only", "deficit": 2.7, "utility": 0.8}],
+        2.5,
+    )
+
+    assert result.solver_status == "unsat"
+    assert result.rejected[0]["violated_constraints"] == [
+        "SCENARIO_DEFICIT_CEILING"
+    ]
+    constraints = {item["code"]: item for item in result.hard_constraints}
+    assert constraints["DEFICIT_3PCT"]["status"] == "satisfied"
+    assert constraints["DEFICIT_3PCT"]["ceiling_percent_gdp"] == 3.0
+    assert constraints["SCENARIO_DEFICIT_CEILING"]["status"] == "violated"
+    assert constraints["SCENARIO_DEFICIT_CEILING"]["ceiling_percent_gdp"] == 2.5
+
+
+def test_car_selects_highest_utility_feasible_alternative() -> None:
+    result = evaluate_car_constraints(
+        [
+            {"name": "Lower utility", "deficit": 2.0, "utility": 0.7},
+            {"name": "Higher utility", "deficit": 2.8, "utility": 0.9},
+        ],
+        3.0,
+    )
+
+    assert result.solver_status == "sat"
+    assert result.selected == {
+        "name": "Higher utility",
+        "deficit": 2.8,
+        "utility": 0.9,
+    }
+
+
+def test_car_rejects_nonfinite_and_boolean_fiscal_inputs() -> None:
+    result = evaluate_car_constraints(
+        [
+            {"name": "NaN", "deficit": float("nan"), "utility": 0.5},
+            {"name": "Boolean", "deficit": True, "utility": 0.5},
+        ],
+        3.0,
+    )
+
+    assert result.feasible == []
+    assert result.selected is None
+    assert result.solver_status == "invalid-input"
+    assert result.hard_constraints[0]["status"] == "not-calculated"
+    assert result.hard_constraints[0]["calculation_status"] == "not-calculated"
+    assert all(
+        item["violated_constraints"] == ["VERIFIED_FISCAL_INPUT"]
+        for item in result.rejected
+    )
+    assert any("finite" in item["reason"] for item in result.rejected)
+    assert any("boolean" in item["reason"] for item in result.rejected)
+
+
+def test_ddr_detects_provenance_confidence_and_deficit_only_changes() -> None:
+    left = {
+        "E": [{"content": "baseline", "source_tag": "source-a"}],
+        "A": [],
+        "P": {"predictions": [], "projected_deficits": [{"name": "A", "deficit": 2.0}]},
+        "R": [],
+        "U": {"uncertainties": [], "confidence": 0.9},
+        "O": [],
+        "C": {"constraints": [], "projected_deficits": [{"name": "A", "deficit": 2.0}]},
+        "REC": {"recommendation": None, "alternatives": []},
+    }
+    right = {
+        **left,
+        "E": [{"content": "baseline", "source_tag": "source-b"}],
+        "P": {"predictions": [], "projected_deficits": [{"name": "A", "deficit": 4.0}]},
+        "U": {"uncertainties": [], "confidence": 0.5},
+        "C": {"constraints": [], "projected_deficits": [{"name": "A", "deficit": 4.0}]},
+    }
+
+    vector = detect_divergence_vector(left, right)
+
+    assert vector["dE"] is True
+    assert vector["dP"] is True
+    assert vector["dU"] is True
+    assert vector["dC"] is True
+
+
+def test_analytical_event_contains_structured_bilingual_envelope() -> None:
+    from backend.analytical_events import analytical_event, normalize_event
+
+    event = analytical_event(
+        "CAR",
+        "ERROR",
+        "CAR_CONSTRAINT_EVALUATED",
+        "Hasil CAR",
+        "CAR result",
+        run_id="run-1",
+        metric={"name": "violation_rate", "value": 100.0},
+        statutory={"status": "violated"},
+        economic={"status": "calculated"},
+    )
+
+    assert event["messages"] == {"id": "Hasil CAR", "en": "CAR result"}
+    assert event["metric"]["value"] == 100.0
+    assert event["statutory"]["status"] == "violated"
+    assert event["economic"]["status"] == "calculated"
+    legacy = {"stage": "SRR", "level": "INFO", "message": "legacy"}
+    first = normalize_event(legacy)
+    second = normalize_event(legacy)
+    assert first["code"] == "LEGACY_LOG"
+    assert first["event_id"] == second["event_id"]
+    assert first["occurred_at"] is None
+    assert first["metadata"]["translation_status"] == "source-language-only"
 
 
 def test_ddr_divergence_vector() -> None:
