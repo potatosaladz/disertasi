@@ -4,8 +4,8 @@ import "./globals.css";
 import { I18nProvider } from "./i18n";
 
 export const metadata: Metadata = {
-  title: "SHCR / Research Analytics",
-  description: "Live consensus, divergence, and reproducibility dashboard",
+  title: "SHCR / Sequential Deliberation Framework",
+  description: "Sequential setup, individual argument, DDR conflict detection, simulation arbitration, and final convergence analytics",
 };
 
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {

@@ -132,6 +132,34 @@ def response_payload(
     )
 
 
+def fiscal_payload(
+    *,
+    name: str,
+    prediction: str,
+    deficit: float,
+    constraint: str,
+) -> str:
+    return json.dumps(
+        {
+            "evidence": [{"content": "Budget baseline", "source_tag": "budget-2026"}],
+            "predictions": [{"content": prediction, "source_tag": "forecast"}],
+            "risks": [{"content": "Fiscal pressure"}],
+            "uncertainties": [{"content": "Demand response"}],
+            "constraints": [{"content": constraint, "source_tag": "law-17"}],
+            "alternatives": [
+                {
+                    "name": name,
+                    "deficit": deficit,
+                    "utility": 0.8,
+                    "source_tag": "forecast",
+                }
+            ],
+            "recommendation": {"content": f"Assess {name}"},
+            "confidence": 0.8,
+        }
+    )
+
+
 def test_extract_llm_response_accepts_missing_usage_metadata() -> None:
     assert _extract_llm_response('{"evidence": []}') == ('{"evidence": []}', 0)
     content, tokens = _extract_llm_response({"choices": [{"message": {"content": "{}"}}]})
@@ -634,12 +662,16 @@ def test_run_creates_rar_dai_observations_when_no_seed_exists(
         ]
     )
 
-    execute_full_shcr_cycle(
+    result = execute_full_shcr_cycle(
         scenario_id,
         session_id,
         llm_call=lambda _agent, _scenario: next(first_round),
         consensus_call=lambda _agent, _scenario, _peers: next(reviewed),
         enable_simulation=False,
+    )
+    codes = [log["code"] for log in result["logs"]]
+    assert codes.index("RAR_DAI_CALCULATION_COMPLETED") < codes.index(
+        "DDR_PAIR_EVALUATED"
     )
 
     with SessionLocal() as session:
@@ -875,6 +907,203 @@ def test_convergence_compares_agent_profiles_not_alternatives_within_one_profile
         _determine_convergence([first, second], alternatives, alternatives)
         == ConvergenceStatus.PARETO_SET
     )
+
+
+def test_verified_dc_bypasses_simulation_and_forces_car_hard_stop(
+    scenario_id: int,
+) -> None:
+    responses = iter(
+        [
+            (
+                fiscal_payload(
+                    name="Feasible",
+                    prediction="Growth rises",
+                    deficit=2.4,
+                    constraint="Deficit must remain within the legal ceiling",
+                ),
+                10,
+            ),
+            (
+                fiscal_payload(
+                    name="Illegal",
+                    prediction="Growth falls",
+                    deficit=3.4,
+                    constraint="Deficit may exceed the legal ceiling",
+                ),
+                11,
+            ),
+        ]
+    )
+    simulation_calls: list[list[dict[str, object]]] = []
+
+    def simulation_call(
+        _scenario: Scenario,
+        conflicts: list[dict[str, object]],
+        _peers: list[dict[str, object]],
+    ) -> tuple[str, int]:
+        simulation_calls.append(conflicts)
+        raise AssertionError("simulation must be bypassed for verified dC")
+
+    result = execute_full_shcr_cycle(
+        scenario_id,
+        lambda _agent, _scenario: next(responses),
+        simulation_call=simulation_call,
+    )
+
+    assert simulation_calls == []
+    assert result["simulation_triggered"] is False
+    assert result["simulation_rounds"] == 0
+    assert result["convergence_status"] == "INFEASIBLE"
+    assert result["car"]["hard_stop"]["triggered"] is True
+    assert result["car"]["hard_stop"]["simulation_bypassed"] is True
+    assert result["car"]["solver_status"] == "unsat"
+    assert result["car"]["selected_alternative"] is None
+    with SessionLocal() as session:
+        disagreement = session.scalar(
+            select(DisagreementLog).where(
+                DisagreementLog.run_id == result["session_id"]
+            )
+        )
+        assert disagreement is not None
+        assert disagreement.dP is True
+        assert disagreement.dC is True
+        assert disagreement.resolution_route == "Constraint Arbitration Required"
+        narrative = disagreement.detail_payload["vector_metadata"]["dC"][
+            "narrative_i18n"
+        ]
+        assert "Dynamic_Fiscal_Analyst" in narrative["id"]
+        assert "Dynamic_Risk_Analyst" in narrative["en"]
+        assert "Jalur: Constraint Arbitration Required" in narrative["id"]
+
+
+def test_stricter_scenario_ceiling_triggers_dc_hard_stop(
+    scenario_id: int,
+) -> None:
+    with SessionLocal() as session:
+        scenario = session.get(Scenario, scenario_id)
+        assert scenario is not None
+        scenario.max_deficit_constraint = 2.5
+        session.commit()
+    responses = iter(
+        [
+            (
+                fiscal_payload(
+                    name="Within policy ceiling",
+                    prediction="Growth rises",
+                    deficit=2.4,
+                    constraint="Scenario ceiling is binding",
+                ),
+                10,
+            ),
+            (
+                fiscal_payload(
+                    name="Policy breach",
+                    prediction="Growth falls",
+                    deficit=2.7,
+                    constraint="Scenario ceiling may be relaxed",
+                ),
+                11,
+            ),
+        ]
+    )
+
+    result = execute_full_shcr_cycle(
+        scenario_id,
+        lambda _agent, _scenario: next(responses),
+    )
+
+    assert result["simulation_rounds"] == 0
+    assert result["car"]["hard_stop"]["triggered"] is True
+    assert result["car"]["solver_status"] == "unsat"
+    with SessionLocal() as session:
+        disagreement = session.scalar(
+            select(DisagreementLog).where(
+                DisagreementLog.run_id == result["session_id"]
+            )
+        )
+        assert disagreement is not None
+        calculation = disagreement.detail_payload["vector_metadata"]["dC"][
+            "calculation"
+        ]
+        assert calculation["statutory_violation"] is False
+        assert calculation["scenario_policy_violation"] is True
+        assert calculation["violation"] is True
+
+
+def test_post_simulation_dc_stops_additional_rounds(
+    scenario_id: int,
+) -> None:
+    first_round = iter(
+        [
+            (response_payload(prediction="Growth 2%", utility=0.8, recommendation="Adopt A"), 10),
+            (response_payload(prediction="Growth 1%", utility=0.6, recommendation="Adopt B"), 11),
+        ]
+    )
+    reviewed = iter(
+        [
+            (response_payload(prediction="Growth 1.8%", utility=0.75, recommendation="Adopt A"), 12),
+            (response_payload(prediction="Growth 1.2%", utility=0.65, recommendation="Adopt B"), 13),
+            (
+                fiscal_payload(
+                    name="Post-simulation feasible",
+                    prediction="Growth 1.7%",
+                    deficit=2.4,
+                    constraint="Legal ceiling is binding",
+                ),
+                14,
+            ),
+            (
+                fiscal_payload(
+                    name="Post-simulation illegal",
+                    prediction="Growth 1.1%",
+                    deficit=3.4,
+                    constraint="Legal ceiling may be exceeded",
+                ),
+                15,
+            ),
+        ]
+    )
+    simulation_calls: list[list[dict[str, object]]] = []
+
+    def simulation_call(
+        _scenario: Scenario,
+        conflicts: list[dict[str, object]],
+        _peers: list[dict[str, object]],
+    ) -> tuple[str, int]:
+        simulation_calls.append(conflicts)
+        return (
+            json.dumps(
+                {
+                    "evidence": ["Structured sectoral outputs"],
+                    "predictions": ["Modelled compromise"],
+                    "risks": ["Implementation delay"],
+                    "uncertainties": ["Demand response"],
+                    "alternatives": [
+                        {"name": "Modelled compromise", "deficit": 2.4, "utility": 0.8}
+                    ],
+                    "recommendation": {"content": "Assess compromise"},
+                    "confidence": 0.75,
+                    "simulation_summary": "Bounded fiscal simulation.",
+                    "conflict_summary": ["Prediction divergence"],
+                    "resolution": "Assess compromise",
+                    "evidence_status": "modelled",
+                }
+            ),
+            7,
+        )
+
+    result = execute_full_shcr_cycle(
+        scenario_id,
+        lambda _agent, _scenario: next(first_round),
+        lambda _agent, _scenario, _peers: next(reviewed),
+        simulation_call=simulation_call,
+    )
+
+    assert len(simulation_calls) == 1
+    assert result["simulation_rounds"] == 1
+    assert result["car"]["hard_stop"]["triggered"] is True
+    assert result["car"]["solver_status"] == "unsat"
+    assert result["car"]["selected_alternative"] is None
 
 
 def test_all_eight_ddr_components_persist_granular_metadata(

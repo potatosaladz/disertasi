@@ -6,6 +6,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import aliased
 
+from .agent_templates import semantic_agent_name
 from .analytical_events import normalize_event
 from .localization import DEFAULT_LANGUAGE, Language, localize_payload
 from .models import (
@@ -27,12 +28,13 @@ _STAGE_ORDER = {
     "INITIALIZE": 1,
     "SRR": 2,
     "CONSENSUS": 3,
-    "DDR": 4,
-    "SIMULATION": 5,
-    "SIMULATION_CONSENSUS": 6,
-    "CAR": 7,
-    "METRICS": 8,
-    "COMPLETE": 9,
+    "RAR-DAI": 4,
+    "DDR": 5,
+    "SIMULATION": 6,
+    "SIMULATION_CONSENSUS": 7,
+    "CAR": 8,
+    "METRICS": 9,
+    "COMPLETE": 10,
 }
 
 
@@ -136,11 +138,12 @@ def run_graph_payload(
     scenario = database.get(Scenario, run.scenario_id)
     if scenario is None:
         raise ValueError("Scenario for consensus run does not exist")
-    mandate_agent_ids = [
-        item.get("agent_id")
+    mandate_rules = {
+        item.get("agent_id"): item
         for item in run.mandate_payload.get("agent_rules", [])
         if isinstance(item, dict) and isinstance(item.get("agent_id"), int)
-    ]
+    }
+    mandate_agent_ids = list(mandate_rules)
     agents = list(
         database.scalars(
             select(Agent)
@@ -157,7 +160,7 @@ def run_graph_payload(
     left = aliased(Agent)
     right = aliased(Agent)
     disagreement_rows = database.execute(
-        select(DisagreementLog, left.name, right.name)
+        select(DisagreementLog, left, right)
         .join(left, DisagreementLog.agent_i == left.id)
         .join(right, DisagreementLog.agent_j == right.id)
         .where(DisagreementLog.run_id == run.id)
@@ -242,6 +245,10 @@ def run_graph_payload(
     agent_rows = [0, 1, 2, 3, 4]
     for index, agent in enumerate(agents):
         reasoning_log = reasoning.get(agent.id)
+        mandate_rule = mandate_rules.get(agent.id, {})
+        display_name = str(
+            mandate_rule.get("display_name") or semantic_agent_name(agent)
+        )
         matching_logs = [
             item for item in log_refs["SRR"] if agent.name in str(item.get("message"))
         ]
@@ -265,13 +272,16 @@ def run_graph_payload(
             _node(
                 f"agent:{agent.id}",
                 "agent",
-                agent.name.split(" / ", maxsplit=1)[0],
+                display_name,
                 status_value,
                 2,
                 agent_rows[index] if index < len(agent_rows) else index,
                 subtitle=agent.role,
                 details={
                     "agent_id": agent.id,
+                    "stable_name": agent.name,
+                    "display_name": display_name,
+                    "utility_metadata": mandate_rule.get("utility_metadata", {}),
                     "template_key": agent.template_key,
                     "role": agent.role,
                     "llm_model": agent.llm_model,
@@ -335,7 +345,7 @@ def run_graph_payload(
         "SUCCEEDED"
         if any(item.normalized_weight is not None for item in influence_observations)
         else "RUNNING"
-        if run.status == "RUNNING" and run.progress_stage == "DDR"
+        if run.status == "RUNNING" and run.progress_stage == "RAR-DAI"
         else "PENDING"
     )
     add_node(
@@ -382,8 +392,18 @@ def run_graph_payload(
     conflict_details = [
         {
             "id": item.id,
-            "agent_i": left_name,
-            "agent_j": right_name,
+            "agent_i_id": left_agent.id,
+            "agent_i": left_agent.name,
+            "agent_i_display_name": str(
+                mandate_rules.get(left_agent.id, {}).get("display_name")
+                or semantic_agent_name(left_agent)
+            ),
+            "agent_j_id": right_agent.id,
+            "agent_j": right_agent.name,
+            "agent_j_display_name": str(
+                mandate_rules.get(right_agent.id, {}).get("display_name")
+                or semantic_agent_name(right_agent)
+            ),
             "components": [
                 component
                 for component in ("dE", "dA", "dP", "dR", "dU", "dO", "dC", "dREC")
@@ -392,7 +412,7 @@ def run_graph_payload(
             "route": item.resolution_route,
             "detail": item.detail_payload,
         }
-        for item, left_name, right_name in disagreement_rows
+        for item, left_agent, right_agent in disagreement_rows
     ]
     add_node(
         _node(

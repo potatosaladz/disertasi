@@ -17,6 +17,7 @@ from backend.core_algorithms import (
     extract_llm_completion,
     llm_request_headers,
     neuro_symbolic_filter,
+    resolve_disagreement_route,
 )
 from backend.sanitization import sanitize_public_value
 from backend.simulation_agent import (
@@ -554,6 +555,31 @@ def test_ddr_divergence_vector() -> None:
         "dC": True,
         "dREC": True,
     }
+
+
+def test_dC_route_outranks_dP() -> None:
+    assert (
+        resolve_disagreement_route({"dP": True, "dC": True})
+        == "Constraint Arbitration Required"
+    )
+    assert (
+        resolve_disagreement_route({"dP": True, "dC": False})
+        == "Simulation Agent Requested"
+    )
+
+
+def test_car_hard_stop_forces_unsat_without_selection() -> None:
+    result = evaluate_car_constraints(
+        [{"name": "Otherwise feasible", "deficit": 2.0, "utility": 0.9}],
+        3.0,
+        hard_stop_reason="Verified dC violation",
+    )
+
+    assert result.feasible == []
+    assert result.selected is None
+    assert result.solver_status == "unsat"
+    assert result.rejected[0]["violated_constraints"] == ["DDR_DC_HARD_STOP"]
+    assert result.hard_constraints[0]["code"] == "DDR_DC_HARD_STOP"
 
 
 def test_violation_rate_rejects_invalid_counts() -> None:

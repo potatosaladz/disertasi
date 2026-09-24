@@ -21,6 +21,7 @@ _CONSENSUS_SESSION_COLUMNS: dict[str, str] = {
     "logs": "JSONB NOT NULL DEFAULT '[]'::jsonb",
     "result_payload": "JSONB",
     "progress_stage": "VARCHAR(50)",
+    "runtime_config_payload": "JSONB NOT NULL DEFAULT '{}'::jsonb",
 }
 
 _REASONING_LOG_COLUMNS: dict[str, str] = {
@@ -210,8 +211,24 @@ def _upgrade_scenarios_table() -> None:
         )
 
 
+def _initialize_global_llm_config() -> None:
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                INSERT INTO global_llm_config (
+                    id, temperature, max_tokens, apply_to_all, revision
+                )
+                VALUES (1, 0.2, 4000, FALSE, 1)
+                ON CONFLICT (id) DO NOTHING
+                """
+            )
+        )
+
+
 def initialize_database() -> None:
     Agent.metadata.create_all(bind=engine)
+    _initialize_global_llm_config()
     _upgrade_agents_table()
     _upgrade_scenarios_table()
     _upgrade_consensus_sessions_table()

@@ -13,7 +13,12 @@ from openai.types.chat import ChatCompletionMessageParam
 from pydantic import ValidationError
 from sqlalchemy import select
 
-from backend.agent_templates import agent_revision, mandate_seed, resolve_agent_system_prompt
+from backend.agent_templates import (
+    agent_revision,
+    mandate_seed,
+    resolve_agent_system_prompt,
+    semantic_agent_name,
+)
 from backend.analytical_events import analytical_event, normalize_event
 from backend.core_algorithms import (
     build_agent_system_prompt,
@@ -33,6 +38,7 @@ from backend.core_algorithms import (
     validate_decision_artifacts,
 )
 from backend.database import SessionLocal
+from backend.global_config import apply_global_llm_config, get_global_llm_config
 from backend.mandate_snapshots import refresh_mandate_snapshot
 from backend.models import (
     Agent,
@@ -145,6 +151,9 @@ def _log(
     statutory: dict[str, Any] | None = None,
     economic: dict[str, Any] | None = None,
     fallback: dict[str, Any] | None = None,
+    task: dict[str, Any] | None = None,
+    result: dict[str, Any] | None = None,
+    why: dict[str, Any] | None = None,
     metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return analytical_event(
@@ -160,6 +169,9 @@ def _log(
         statutory=statutory,
         economic=economic,
         fallback=fallback,
+        task=task,
+        result=result,
+        why=why,
         metadata=metadata,
     )
 
@@ -248,6 +260,20 @@ def _mandate_for_agent(mandate_payload: dict[str, Any], agent_id: int) -> str | 
             value = rule.get("scenario_mandate")
             return value if isinstance(value, str) else None
     return None
+
+
+def _display_name_for_agent(
+    mandate_payload: dict[str, Any],
+    agent: Agent,
+) -> str:
+    rules = mandate_payload.get("agent_rules")
+    if isinstance(rules, list):
+        for rule in rules:
+            if isinstance(rule, dict) and rule.get("agent_id") == agent.id:
+                value = rule.get("display_name")
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+    return semantic_agent_name(agent)
 
 
 def _create_isolated_session(scenario_id: int) -> str:
@@ -344,6 +370,10 @@ def _load_session_context(
     )
     if not agents:
         raise ValueError("At least one agent is required")
+    global_config = get_global_llm_config(session)
+    if global_config.apply_to_all:
+        for agent in agents:
+            apply_global_llm_config(agent, global_config)
     snapshot = session.get(ScenarioMandateSnapshot, run.mandate_snapshot_id)
     if snapshot is None or snapshot.scenario_id != scenario_id:
         raise ValueError("Mandate snapshot is missing or does not belong to the scenario")
@@ -961,6 +991,9 @@ def _ensure_influence_observations(
                 },
             },
             "interaction_count": len(interactions),
+            "task": "Menghitung pengaruh relatif agen sebelum DDR.",
+            "result": "Dimensi RAR siap dinormalisasi menjadi bobot DAI.",
+            "why": "Bobot memprioritaskan artefak lengkap, bersumber, relevan, dan rendah ketidakpastian.",
             "statutory_authority": False,
             "interpretation": "Influence prioritization only; CAR remains authoritative for hard constraints.",
         }
@@ -968,25 +1001,73 @@ def _ensure_influence_observations(
     return observations
 
 
+def _has_effective_deficit_violation(
+    scenario: Scenario,
+    response: SRRResponse,
+) -> bool:
+    effective_ceiling = min(
+        scenario.max_deficit_constraint,
+        STATUTORY_DEFICIT_CEILING_PERCENT_GDP,
+    )
+    return any(
+        alternative.deficit > effective_ceiling
+        for alternative in response.alternatives
+    )
+
+
+def _classify_conflict(
+    scenario: Scenario,
+    agent_i: Agent,
+    response_i: SRRResponse,
+    agent_j: Agent,
+    response_j: SRRResponse,
+    display_names: dict[int, str],
+) -> tuple[dict[str, bool], dict[str, Any]]:
+    vector = detect_divergence_vector(
+        response_i.divergence_object(),
+        response_j.divergence_object(),
+    )
+    violation_i = _has_effective_deficit_violation(scenario, response_i)
+    violation_j = _has_effective_deficit_violation(scenario, response_j)
+    vector["dC"] = bool(vector["dC"] or violation_i != violation_j)
+    components = [key for key, value in vector.items() if value]
+    route = resolve_disagreement_route(vector) if components else None
+    hard_stop = bool(vector["dC"] and (violation_i or violation_j))
+    return vector, {
+        "agent_i": agent_i.name,
+        "agent_i_display_name": display_names.get(
+            agent_i.id, semantic_agent_name(agent_i)
+        ),
+        "agent_j": agent_j.name,
+        "agent_j_display_name": display_names.get(
+            agent_j.id, semantic_agent_name(agent_j)
+        ),
+        "components": components,
+        "route": route,
+        "narrative": [],
+        "hard_stop": hard_stop,
+        "simulation_allowed": bool(vector["dP"] and not hard_stop),
+    }
+
+
 def _collect_prediction_conflicts(
+    scenario: Scenario,
     parsed_by_agent: list[tuple[Agent, SRRResponse]],
+    display_names: dict[int, str],
 ) -> list[dict[str, Any]]:
     conflicts: list[dict[str, Any]] = []
     for index, (agent_i, response_i) in enumerate(parsed_by_agent):
         for agent_j, response_j in parsed_by_agent[index + 1 :]:
-            vector = detect_divergence_vector(
-                response_i.divergence_object(),
-                response_j.divergence_object(),
+            _, conflict = _classify_conflict(
+                scenario,
+                agent_i,
+                response_i,
+                agent_j,
+                response_j,
+                display_names,
             )
-            if vector["dP"]:
-                conflicts.append(
-                    {
-                        "agent_i": agent_i.name,
-                        "agent_j": agent_j.name,
-                        "components": [key for key, value in vector.items() if value],
-                        "route": SIMULATION_TRIGGER,
-                    }
-                )
+            if conflict["simulation_allowed"] or conflict["hard_stop"]:
+                conflicts.append(conflict)
     return conflicts
 
 
@@ -1189,26 +1270,45 @@ def _vector_metadata(
         deficits_i = _deficit_values(artifacts_i)
         deficits_j = _deficit_values(artifacts_j)
         all_deficits = [*deficits_i, *deficits_j]
-        violations_i = [item > STATUTORY_DEFICIT_CEILING_PERCENT_GDP for item in deficits_i]
-        violations_j = [item > STATUTORY_DEFICIT_CEILING_PERCENT_GDP for item in deficits_j]
-        statutory_violation = any([*violations_i, *violations_j])
+        effective_ceiling = min(
+            scenario.max_deficit_constraint,
+            STATUTORY_DEFICIT_CEILING_PERCENT_GDP,
+        )
+        statutory_violations_i = [
+            item > STATUTORY_DEFICIT_CEILING_PERCENT_GDP for item in deficits_i
+        ]
+        statutory_violations_j = [
+            item > STATUTORY_DEFICIT_CEILING_PERCENT_GDP for item in deficits_j
+        ]
+        effective_violations_i = [item > effective_ceiling for item in deficits_i]
+        effective_violations_j = [item > effective_ceiling for item in deficits_j]
+        statutory_violation = any(
+            [*statutory_violations_i, *statutory_violations_j]
+        )
         scenario_policy_violation = any(
             item > scenario.max_deficit_constraint for item in all_deficits
         )
-        gate_difference = any(violations_i) != any(violations_j)
+        effective_violation = any(
+            [*effective_violations_i, *effective_violations_j]
+        )
+        gate_difference = any(effective_violations_i) != any(effective_violations_j)
         calculation.update(
             {
                 "method": "maximum-constraint-jaccard-or-hard-gate-difference",
                 "value": max(jaccard, 1.0 if gate_difference else 0.0),
                 "constraint_text_distance": jaccard,
-                "hard_constraint": "DEFICIT_3PCT",
+                "hard_constraint": "EFFECTIVE_DEFICIT_CEILING",
                 "statutory_ceiling_percent_gdp": STATUTORY_DEFICIT_CEILING_PERCENT_GDP,
                 "scenario_policy_ceiling_percent_gdp": scenario.max_deficit_constraint,
+                "effective_ceiling_percent_gdp": effective_ceiling,
                 "maximum_projected_deficit_percent_gdp": max(all_deficits) if all_deficits else None,
-                "violation": statutory_violation,
+                "violation": effective_violation,
+                "statutory_violation": statutory_violation,
                 "scenario_policy_violation": scenario_policy_violation,
-                "agent_i_statutory_violations": violations_i,
-                "agent_j_statutory_violations": violations_j,
+                "agent_i_effective_violations": effective_violations_i,
+                "agent_j_effective_violations": effective_violations_j,
+                "agent_i_statutory_violations": statutory_violations_i,
+                "agent_j_statutory_violations": statutory_violations_j,
                 "evaluation_method": "pre-CAR numeric screening",
                 "solver": None,
                 "education_floor_status": "not-calculated",
@@ -1307,6 +1407,7 @@ def _conflict_detail_payload(
     vector: dict[str, bool],
     route: str | None,
     influence_by_agent: dict[int, AgentInfluenceObservation],
+    display_names: dict[int, str],
 ) -> dict[str, Any]:
     artifacts_i = response_i.model_dump(mode="json")
     artifacts_j = response_j.model_dump(mode="json")
@@ -1333,6 +1434,20 @@ def _conflict_detail_payload(
             response_i,
             response_j,
         )
+        metadata["narrative_i18n"] = _conflict_narrative(
+            component,
+            display_names.get(agent_i.id, semantic_agent_name(agent_i)),
+            display_names.get(agent_j.id, semantic_agent_name(agent_j)),
+            artifacts_i,
+            artifacts_j,
+            metadata["calculation"],
+            route,
+        )
+        metadata["utility_metadata"] = {
+            "task": f"Detect {component} between {display_names.get(agent_i.id, semantic_agent_name(agent_i))} and {display_names.get(agent_j.id, semantic_agent_name(agent_j))}.",
+            "result": "Conflict detected." if metadata["active"] else "No material conflict detected.",
+            "why": metadata["economic_impact_i18n"]["id"],
+        }
         vector_metadata[component] = metadata
         if metadata["active"]:
             categories.append(
@@ -1340,8 +1455,8 @@ def _conflict_detail_payload(
                     "component": component,
                     "category": metadata["category_i18n"]["en"],
                     "category_i18n": metadata["category_i18n"],
-                    "narrative": metadata["meaning_i18n"]["en"],
-                    "narrative_i18n": metadata["meaning_i18n"],
+                    "narrative": metadata["narrative_i18n"]["en"],
+                    "narrative_i18n": metadata["narrative_i18n"],
                     "impact": metadata["economic_impact_i18n"]["en"],
                     "impact_i18n": metadata["economic_impact_i18n"],
                     "formula": metadata["formula"],
@@ -1397,7 +1512,10 @@ def _conflict_detail_payload(
                 "route": route or "No Resolution Required",
                 "status": "ESCALATED" if route else "CLEAR",
                 "conclusion": (
-                    "Perbedaan proyeksi diteruskan ke Simulation Agent untuk kompromi fiskal berbatas."
+                    "Pelanggaran constraint terverifikasi diteruskan langsung ke CAR tanpa kompromi LLM."
+                    if vector.get("dC")
+                    and vector_metadata["dC"]["calculation"].get("violation")
+                    else "Perbedaan proyeksi diteruskan ke Simulation Agent untuk kompromi fiskal berbatas."
                     if vector.get("dP")
                     else "Konflik dipertahankan sebagai dissent terstruktur untuk mekanisme resolusi terkait."
                     if route
@@ -1408,12 +1526,59 @@ def _conflict_detail_payload(
     )
 
 
+def _conflict_narrative(
+    component: str,
+    agent_i_name: str,
+    agent_j_name: str,
+    artifacts_i: dict[str, Any],
+    artifacts_j: dict[str, Any],
+    calculation: dict[str, Any],
+    route: str | None,
+) -> dict[str, str]:
+    field = {
+        "dE": "evidence",
+        "dA": "assumptions",
+        "dP": "predictions",
+        "dR": "risks",
+        "dU": "uncertainties",
+        "dO": "objectives",
+        "dC": "constraints",
+        "dREC": "recommendation",
+    }.get(component, component)
+    left = artifacts_i.get(field)
+    right = artifacts_j.get(field)
+    left_text = "; ".join(_artifact_content(item) for item in (left if isinstance(left, list) else [left]) if _artifact_content(item))
+    right_text = "; ".join(_artifact_content(item) for item in (right if isinstance(right, list) else [right]) if _artifact_content(item))
+    if component == "dP":
+        gap = calculation.get("deficit_range_gap_percent_gdp")
+        suffix_en = f" Deficit-range gap: {gap} percentage points of GDP." if gap is not None else ""
+        suffix_id = f" Selisih rentang defisit: {gap} poin persentase PDB." if gap is not None else ""
+        en = f"{agent_i_name} projects {left_text or 'an unreported outcome'}, while {agent_j_name} projects {right_text or 'a different outcome'}.{suffix_en}"
+        id_text = f"{agent_i_name} memproyeksikan {left_text or 'hasil yang tidak dilaporkan'}, sedangkan {agent_j_name} memproyeksikan {right_text or 'hasil yang berbeda'}.{suffix_id}"
+    elif component == "dU":
+        gap = calculation.get("confidence_gap")
+        en = f"{agent_i_name} reports {left_text or 'different uncertainty bounds'}, while {agent_j_name} reports {right_text or 'different uncertainty bounds'}. Confidence gap: {gap if gap is not None else 'not calculated'}."
+        id_text = f"{agent_i_name} melaporkan {left_text or 'batas ketidakpastian berbeda'}, sedangkan {agent_j_name} melaporkan {right_text or 'batas ketidakpastian berbeda'}. Selisih confidence: {gap if gap is not None else 'tidak dihitung'}."
+    elif component == "dC":
+        en = f"Constraint positions differ: {agent_i_name} reports {left_text or 'no explicit constraint artifact'}, while {agent_j_name} reports {right_text or 'no explicit constraint artifact'}. This is pre-CAR screening; verified hard constraints bypass LLM compromise."
+        id_text = f"Posisi constraint berbeda: {agent_i_name} melaporkan {left_text or 'tidak ada artefak constraint eksplisit'}, sedangkan {agent_j_name} melaporkan {right_text or 'tidak ada artefak constraint eksplisit'}. Ini adalah screening pra-CAR; hard constraint terverifikasi melewati kompromi LLM."
+    else:
+        en = f"{agent_i_name} states {left_text or 'a different position'}, while {agent_j_name} states {right_text or 'a different position'}."
+        id_text = f"{agent_i_name} menyatakan {left_text or 'posisi berbeda'}, sedangkan {agent_j_name} menyatakan {right_text or 'posisi berbeda'}."
+    resolution_route = route or "No Resolution Required"
+    return {
+        "id": f"{id_text} Jalur: {resolution_route}.",
+        "en": f"{en} Route: {resolution_route}.",
+    }
+
+
 def _detect_ddr_conflicts(
     session: Any,
     scenario: Scenario,
     session_id: str,
     parsed_by_agent: list[tuple[Agent, SRRResponse]],
     influence_observations: list[AgentInfluenceObservation],
+    display_names: dict[int, str],
     logs: list[dict[str, Any]],
     emit: ProgressReporter,
 ) -> list[dict[str, Any]]:
@@ -1423,12 +1588,16 @@ def _detect_ddr_conflicts(
     }
     for index, (agent_i, response_i) in enumerate(parsed_by_agent):
         for agent_j, response_j in parsed_by_agent[index + 1 :]:
-            vector = detect_divergence_vector(
-                response_i.divergence_object(),
-                response_j.divergence_object(),
+            vector, conflict = _classify_conflict(
+                scenario,
+                agent_i,
+                response_i,
+                agent_j,
+                response_j,
+                display_names,
             )
-            components = [key for key, value in vector.items() if value]
-            route = resolve_disagreement_route(vector) if components else None
+            components = conflict["components"]
+            route = conflict["route"]
             active_conflicts = ", ".join(components) or "none"
             logs.append(
                 _log(
@@ -1463,6 +1632,7 @@ def _detect_ddr_conflicts(
                 vector,
                 route,
                 influence_by_agent,
+                display_names,
             )
             session.add(
                 DisagreementLog(
@@ -1475,16 +1645,9 @@ def _detect_ddr_conflicts(
                     **vector,
                 )
             )
-            if vector["dP"]:
-                conflicts.append(
-                    {
-                        "agent_i": agent_i.name,
-                        "agent_j": agent_j.name,
-                        "components": components,
-                        "route": route,
-                        "narrative": detail_payload["categories"],
-                    }
-                )
+            if components:
+                conflict["narrative"] = detail_payload["categories"]
+                conflicts.append(conflict)
     return conflicts
 
 
@@ -1670,6 +1833,10 @@ def execute_full_shcr_cycle(
             scenario_id,
             session_id,
         )
+        display_names = {
+            agent.id: _display_name_for_agent(run.mandate_payload, agent)
+            for agent in agents
+        }
         run.status = "RUNNING"
         run.started_at = run.started_at or datetime.now(timezone.utc)
         session.commit()
@@ -1856,7 +2023,21 @@ def execute_full_shcr_cycle(
         final_provenance = [_provenance_counts(response) for _, response in parsed_by_agent]
         tagged_items = sum(tagged for tagged, _ in final_provenance)
         total_items = sum(total for _, total in final_provenance)
-        logs.append(_log("DDR", "INFO", "Calculating disagreement vectors."))
+        logs.append(
+            _log(
+                "RAR-DAI",
+                "INFO",
+                "Calculating gated dynamic influence weights before DDR.",
+                code="RAR_DAI_CALCULATION_STARTED",
+                id_message="Menghitung bobot pengaruh dinamis bergate sebelum DDR.",
+                task={"type": "rar-dai", "phase": "pre-ddr"},
+                result={"status": "pending"},
+                why={
+                    "reason": "Influence must be normalized before pairwise conflict routing.",
+                    "formula": "w_i = softmax(g_i(Theta_X X + Theta_Q Q + Theta_H H + Theta_S S - Theta_U U))",
+                },
+            )
+        )
         emit(logs)
         agents_by_id = {agent.id: agent for agent in agents}
         influence_inputs: list[dict[str, float | int]] = []
@@ -1913,21 +2094,72 @@ def execute_full_shcr_cycle(
                     "normalized_weight": observation.normalized_weight,
                 }
 
+        session.commit()
+        logs.append(
+            _log(
+                "RAR-DAI",
+                "SUCCESS",
+                f"RAR-DAI weights calculated for {len(influence_observations)} agents.",
+                code="RAR_DAI_CALCULATION_COMPLETED",
+                task={"type": "rar-dai", "phase": "pre-ddr", "agent_count": len(influence_observations)},
+                result={
+                    "status": "calculated",
+                    "weighted_agent_count": sum(item.normalized_weight is not None for item in influence_observations),
+                },
+                why={
+                    "reason": "Weights prioritize complete, source-tagged, peer-aligned responses and penalize uncertainty.",
+                    "rule": "rar-dai-v2",
+                    "authority": "Influence prioritization only; CAR remains authoritative.",
+                },
+            )
+        )
+        emit(logs)
+        logs.append(_log("DDR", "INFO", "Calculating disagreement vectors."))
+        emit(logs)
         conflicts = _detect_ddr_conflicts(
             session,
             scenario,
             session_id,
             parsed_by_agent,
             influence_observations,
+            display_names,
             logs,
             emit,
         )
         simulation_rounds = 0
         simulation_artifact_id: int | None = None
-        remaining_conflicts = conflicts
+        hard_constraint_conflicts = [
+            item for item in conflicts if item.get("hard_stop")
+        ]
+        remaining_conflicts = [
+            item for item in conflicts if item.get("simulation_allowed")
+        ]
+        if hard_constraint_conflicts:
+            remaining_conflicts = []
+            logs.append(
+                _log(
+                    "CAR",
+                    "WARNING",
+                    "Verified dC violation triggered deterministic CAR hard-stop; simulation and LLM compromise were bypassed.",
+                    code="DDR_DC_HARD_STOP",
+                    id_message="Pelanggaran dC terverifikasi memicu hard-stop CAR deterministik; simulasi dan kompromi LLM dilewati.",
+                    task={"type": "hard-constraint-gate", "phase": "post-ddr"},
+                    result={
+                        "status": "INFEASIBLE",
+                        "hard_constraint_conflict_count": len(hard_constraint_conflicts),
+                        "simulation_bypassed": True,
+                    },
+                    why={
+                        "reason": "A verified hard constraint is non-overridable.",
+                        "rule": "dC -> CAR/Z3",
+                        "authority": "UU17_2003_P12",
+                    },
+                    metadata={"conflicts": hard_constraint_conflicts},
+                )
+            )
+            emit(logs)
         while (
             enable_simulation
-            and reviewer is not None
             and remaining_conflicts
             and simulation_rounds < MAX_SIMULATION_ROUNDS
         ):
@@ -1965,6 +2197,13 @@ def execute_full_shcr_cycle(
             if simulation_output is None:
                 break
             simulation_rounds = round_number
+            if reviewer is None:
+                if artifact is not None:
+                    artifact_payload = dict(artifact.output_payload)
+                    artifact_payload["follow_up_consensus_status"] = "not-configured"
+                    artifact.output_payload = artifact_payload
+                    session.commit()
+                break
             logs.append(
                 _log(
                     "SIMULATION_CONSENSUS",
@@ -1997,7 +2236,48 @@ def execute_full_shcr_cycle(
                 round_number,
             )
             session.commit()
-            remaining_conflicts = _collect_prediction_conflicts(parsed_by_agent)
+            follow_up_conflicts = _collect_prediction_conflicts(
+                scenario,
+                parsed_by_agent,
+                display_names,
+            )
+            follow_up_hard_stops = [
+                item for item in follow_up_conflicts if item.get("hard_stop")
+            ]
+            if follow_up_hard_stops:
+                hard_constraint_conflicts.extend(follow_up_hard_stops)
+                remaining_conflicts = []
+                logs.append(
+                    _log(
+                        "CAR",
+                        "WARNING",
+                        "Follow-up consensus introduced a verified dC violation; additional simulation was bypassed.",
+                        code="DDR_DC_HARD_STOP",
+                        id_message="Konsensus lanjutan menghasilkan pelanggaran dC terverifikasi; simulasi tambahan dilewati.",
+                        round_number=round_number,
+                        task={"type": "hard-constraint-gate", "phase": "post-simulation"},
+                        result={
+                            "status": "INFEASIBLE",
+                            "hard_constraint_conflict_count": len(
+                                follow_up_hard_stops
+                            ),
+                            "simulation_bypassed": True,
+                        },
+                        why={
+                            "reason": "A verified hard constraint is non-overridable.",
+                            "rule": "dC -> CAR/Z3",
+                            "authority": "UU17_2003_P12",
+                        },
+                        metadata={"conflicts": follow_up_hard_stops},
+                    )
+                )
+                emit(logs)
+            else:
+                remaining_conflicts = [
+                    item
+                    for item in follow_up_conflicts
+                    if item.get("simulation_allowed")
+                ]
             if artifact is not None:
                 artifact_payload = dict(artifact.output_payload)
                 artifact_payload["follow_up_consensus_status"] = "completed"
@@ -2071,6 +2351,11 @@ def execute_full_shcr_cycle(
         car_evaluation = evaluate_car_constraints(
             alternatives,
             scenario.max_deficit_constraint,
+            hard_stop_reason=(
+                "Verified dC conflict violates a non-overridable hard constraint."
+                if hard_constraint_conflicts
+                else None
+            ),
         )
         feasible = car_evaluation.feasible
         violation_rate = calculate_violation_rate(len(alternatives), len(feasible))
@@ -2193,10 +2478,39 @@ def execute_full_shcr_cycle(
             "token_usage": total_tokens,
             "simulation_artifact_id": simulation_artifact_id,
             "simulation_rounds": simulation_rounds,
-            "simulation_triggered": bool(conflicts),
+            "simulation_triggered": simulation_rounds > 0,
+            "task": {
+                "type": "shcr-cycle",
+                "scenario_id": scenario.id,
+                "session_id": session_id,
+            },
+            "result": {
+                "status": convergence_status.value,
+                "feasible_alternatives_count": len(feasible),
+                "selected_alternative": getattr(car_evaluation.selected, "name", None),
+            },
+            "why": {
+                "reason": (
+                    "Verified dC violation forced deterministic constraint arbitration."
+                    if hard_constraint_conflicts
+                    else "Final state follows RAR-DAI weighted DDR routing and CAR feasibility."
+                ),
+                "framework": "SRR + RAR-DAI + DDR + CAR/Z3",
+            },
             "car": {
                 "solver": "z3",
                 "solver_status": car_evaluation.solver_status,
+                "hard_stop": {
+                    "triggered": bool(hard_constraint_conflicts),
+                    "reason": (
+                        "Verified dC conflict violates a non-overridable hard constraint."
+                        if hard_constraint_conflicts
+                        else None
+                    ),
+                    "simulation_bypassed": bool(hard_constraint_conflicts),
+                    "llm_compromise_bypassed": bool(hard_constraint_conflicts),
+                    "conflict_count": len(hard_constraint_conflicts),
+                },
                 "hard_constraints": car_evaluation.hard_constraints,
                 "rejected_alternatives": car_evaluation.rejected,
                 "selected_alternative": (

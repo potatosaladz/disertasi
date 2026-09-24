@@ -289,11 +289,11 @@ def build_deterministic_simulation(
 
 
 def resolve_simulation_runtime_agent(agents: Sequence[object]) -> NativeSimulationAgent | None:
-    agent = build_native_simulation_agent()
-    if all((agent.llm_base_url, agent.llm_api_key, agent.llm_model)):
-        return agent
     for runtime_source in agents:
         agent = build_native_simulation_agent(runtime_source)
         if all((agent.llm_base_url, agent.llm_api_key, agent.llm_model)):
             return agent
+    agent = build_native_simulation_agent()
+    if all((agent.llm_base_url, agent.llm_api_key, agent.llm_model)):
+        return agent
     return None

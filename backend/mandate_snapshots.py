@@ -3,7 +3,13 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from .agent_templates import agent_revision, get_agent_spec, mandate_seed
+from .agent_templates import (
+    agent_revision,
+    agent_utility_metadata,
+    get_agent_spec,
+    mandate_seed,
+    semantic_agent_name,
+)
 from .core_algorithms import STATUTORY_DEFICIT_CEILING_PERCENT_GDP
 from .models import Agent, Scenario, ScenarioMandateSnapshot
 
@@ -11,6 +17,12 @@ from .models import Agent, Scenario, ScenarioMandateSnapshot
 def _default_dynamic_fields(agent: Agent, scenario: Scenario) -> dict[str, object]:
     return {
         "synthesis_status": "fallback",
+        "display_name": semantic_agent_name(agent, "fallback"),
+        "utility_metadata": agent_utility_metadata(
+            agent,
+            source="fallback",
+            result="Mandat deterministik dipakai karena generasi dinamis tidak tersedia.",
+        ),
         "scenario_mandate": (
             f"Evaluate the active APBN policy scenario from the {agent.role} mandate: "
             f"{scenario.description.strip()}"

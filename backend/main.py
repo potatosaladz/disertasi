@@ -18,9 +18,12 @@ from sqlalchemy.orm import Session
 
 from .agent_templates import (
     agent_revision,
+    agent_utility_metadata,
     get_agent_spec,
+    is_generated_agent_name,
     load_standard_agent_templates,
     mandate_seed,
+    semantic_agent_name,
     template_catalog,
 )
 from .core_algorithms import (
@@ -34,11 +37,18 @@ from .core_algorithms import (
     resolve_llm_runtime_config,
 )
 from .dashboard import router as dashboard_router
+from .global_config import (
+    apply_global_llm_config,
+    apply_global_values,
+    get_global_llm_config,
+    global_config_snapshot,
+)
 from .database import SessionLocal
 from .init_db import initialize_database
 from .models import (
     Agent,
     AgentInfluenceObservation,
+    GlobalLLMConfig,
     DisagreementLog,
     ReasoningLog,
     Scenario,
@@ -63,6 +73,31 @@ class LoadTemplatesRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     configs: dict[str, TemplateLLMConfig] = Field(default_factory=dict)
+
+
+class GlobalLLMConfigResponse(BaseModel):
+    llm_base_url: str | None
+    llm_model: str | None
+    temperature: float
+    max_tokens: int
+    apply_to_all: bool
+    revision: int
+    has_llm_api_key: bool
+
+
+class GlobalLLMConfigUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    llm_base_url: str | None = Field(default=None, max_length=2048)
+    llm_api_key: str | None = Field(default=None, max_length=4096)
+    llm_model: str | None = Field(default=None, max_length=255)
+    temperature: float = Field(default=0.2, ge=0.0, le=2.0, allow_inf_nan=False)
+    max_tokens: int = Field(default=4000, gt=0)
+    apply_to_all: bool = False
+
+
+def global_llm_config_response(config: GlobalLLMConfig) -> GlobalLLMConfigResponse:
+    return GlobalLLMConfigResponse.model_validate(global_config_snapshot(config))
 
 
 class AgentCreate(BaseModel):
@@ -106,6 +141,7 @@ class AgentUpdate(BaseModel):
 class AgentResponse(BaseModel):
     id: int
     name: str
+    display_name: str
     role: str
     template_key: str | None
     theta_x: float
@@ -140,6 +176,8 @@ class MandateSynthesisError(BaseModel):
 class AgentDomainRules(BaseModel):
     agent_id: int
     name: str
+    display_name: str
+    utility_metadata: dict[str, str]
     role: str
     template_key: str | None
     mandate: str | None
@@ -196,6 +234,7 @@ def agent_response(agent: Agent) -> AgentResponse:
     return AgentResponse(
         id=agent.id,
         name=agent.name,
+        display_name=semantic_agent_name(agent),
         role=agent.role,
         template_key=agent.template_key,
         theta_x=agent.theta_x,
@@ -250,6 +289,30 @@ async def health() -> dict[str, str]:
     return {"status": "healthy", "database": "connected"}
 
 
+@app.get("/api/global-config", response_model=GlobalLLMConfigResponse)
+def get_global_config() -> GlobalLLMConfigResponse:
+    with SessionLocal() as session:
+        return global_llm_config_response(get_global_llm_config(session))
+
+
+@app.put("/api/global-config", response_model=GlobalLLMConfigResponse)
+def update_global_config(payload: GlobalLLMConfigUpdate) -> GlobalLLMConfigResponse:
+    with SessionLocal() as session:
+        config = get_global_llm_config(session)
+        values = payload.model_dump(exclude_unset=True)
+        if values.get("llm_api_key") == "":
+            values.pop("llm_api_key")
+        for field, value in values.items():
+            setattr(config, field, value)
+        config.revision += 1
+        if config.apply_to_all:
+            for agent in session.scalars(select(Agent).order_by(Agent.id)):
+                apply_global_llm_config(agent, config)
+        session.commit()
+        session.refresh(config)
+        return global_llm_config_response(config)
+
+
 @app.get("/api/agent-templates")
 def list_agent_templates() -> list[dict[str, object]]:
     return template_catalog()
@@ -280,7 +343,16 @@ def create_agent(payload: AgentCreate) -> AgentResponse:
         existing = session.scalar(select(Agent).where(Agent.name == payload.name))
         if existing is not None:
             raise HTTPException(status_code=409, detail="Agent name already exists")
-        values = payload.model_dump()
+        values = apply_global_values(payload.model_dump(), get_global_llm_config(session))
+        if is_generated_agent_name(payload.name):
+            transient = Agent(name=payload.name, role=payload.role, template_key=payload.template_key)
+            base_name = semantic_agent_name(transient)
+            candidate = base_name
+            suffix = 2
+            while session.scalar(select(Agent.id).where(Agent.name == candidate)) is not None:
+                candidate = f"{base_name}_{suffix}"
+                suffix += 1
+            values["name"] = candidate
         template = get_agent_spec(payload.template_key)
         if payload.template_key is not None and template is None:
             raise HTTPException(status_code=422, detail="Unknown agent template")
@@ -319,6 +391,7 @@ def update_agent(agent_id: int, payload: AgentUpdate) -> AgentResponse:
             updates.pop("llm_api_key")
         for field, value in updates.items():
             setattr(agent, field, value)
+        apply_global_llm_config(agent, get_global_llm_config(session))
         session.commit()
         session.refresh(agent)
         return agent_response(agent)
@@ -651,6 +724,12 @@ def _base_agent_domain_rules(agent: Agent) -> AgentDomainRules:
     return AgentDomainRules(
         agent_id=agent.id,
         name=agent.name,
+        display_name=semantic_agent_name(agent),
+        utility_metadata=agent_utility_metadata(
+            agent,
+            source="generated",
+            result="Menunggu keluaran argumentasi terstruktur.",
+        ),
         role=agent.role,
         template_key=agent.template_key,
         mandate=str(seed["mandate"]) or None,
@@ -665,6 +744,12 @@ def _fallback_agent_domain_rules(agent: Agent, scenario: Scenario) -> AgentDomai
     fallback_values = _synthesis_fallbacks(agent, scenario)
     return base.model_copy(
         update={
+            "display_name": semantic_agent_name(agent, "fallback"),
+            "utility_metadata": agent_utility_metadata(
+                agent,
+                source="fallback",
+                result="Mandat deterministik dipakai karena generasi dinamis tidak tersedia.",
+            ),
             "scenario_mandate": fallback_values.scenario_mandate,
             "scenario_focus": fallback_values.scenario_focus,
             "priority_questions": fallback_values.priority_questions,
@@ -875,6 +960,13 @@ def _safe_agent_domain_rule(raw_rule: object) -> AgentDomainRules:
     defaults: dict[str, object] = {
         "agent_id": 0,
         "name": "Unknown agent",
+        "display_name": "Fallback_Policy_Reviewer",
+        "utility_metadata": {
+            "task": "Evaluate the active policy scenario.",
+            "result": "Stored legacy mandate metadata is incomplete.",
+            "why": "A safe fallback preserves compatibility without fabricating identity.",
+            "name_source": "fallback",
+        },
         "role": "Unknown role",
         "template_key": None,
         "mandate": None,

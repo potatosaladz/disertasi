@@ -8,7 +8,12 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import select
 from sqlalchemy.orm import aliased
 
-from .agent_templates import agent_revision, resolve_agent_system_prompt
+from .agent_templates import (
+    agent_revision,
+    agent_utility_metadata,
+    resolve_agent_system_prompt,
+    semantic_agent_name,
+)
 from .analytical_events import analytical_event
 from .celery_client import celery_client
 from .core_algorithms import (
@@ -21,6 +26,7 @@ from .core_algorithms import (
 )
 from .database import SessionLocal
 from .localization import DEFAULT_LANGUAGE, Language, localize_payload
+from .global_config import get_global_llm_config, global_config_snapshot
 from .graph_network import run_graph_payload
 from .mandate_snapshots import refresh_mandate_snapshot
 from .models import (
@@ -37,6 +43,37 @@ from .models import (
 from .sanitization import sanitize_public_error, sanitize_public_value
 
 router = APIRouter(prefix="/api")
+
+_AUTO_POLLING_STATES = {
+    "PENDING",
+    "PROCESSING",
+    "TEMPORARY_HYDRATION_DELAY",
+}
+
+
+def _polling_contract(
+    status_value: str,
+    result_payload: object = None,
+) -> dict[str, object]:
+    normalized = status_value.upper()
+    if normalized in {"QUEUED", "PENDING"}:
+        polling_state = "PENDING"
+    elif normalized in {"RUNNING", "PROCESSING"}:
+        polling_state = "PROCESSING"
+    elif normalized == "TEMPORARY_HYDRATION_DELAY" or (
+        normalized == "SUCCEEDED" and result_payload is None
+    ):
+        polling_state = "TEMPORARY_HYDRATION_DELAY"
+    elif normalized == "SUCCEEDED":
+        polling_state = "SUCCEEDED"
+    else:
+        polling_state = "FAILED"
+    should_poll = polling_state in _AUTO_POLLING_STATES
+    return {
+        "polling_state": polling_state,
+        "should_poll": should_poll,
+        "terminal": not should_poll,
+    }
 
 
 def _disagreement_vector(log: DisagreementLog) -> dict[str, bool]:
@@ -58,6 +95,8 @@ def _disagreement_payload(
     right_name: str,
     simulations: list[SimulationArtifact],
     car_result: dict[str, Any] | None = None,
+    left_display_name: str | None = None,
+    right_display_name: str | None = None,
 ) -> dict[str, Any]:
     vector = _disagreement_vector(log)
     detail = (
@@ -197,8 +236,12 @@ def _disagreement_payload(
         )
     return {
         "id": log.id,
+        "agent_i_id": log.agent_i,
         "agent_i": left_name,
+        "agent_i_display_name": left_display_name or left_name,
+        "agent_j_id": log.agent_j,
         "agent_j": right_name,
+        "agent_j_display_name": right_display_name or right_name,
         **vector,
         "active_components": [key for key, value in vector.items() if value],
         "conflict_categories": categories,
@@ -227,15 +270,41 @@ def _disagreements_payload(
     left = aliased(Agent)
     right = aliased(Agent)
     rows = database.execute(
-        select(DisagreementLog, left.name, right.name)
+        select(DisagreementLog, left, right)
         .join(left, DisagreementLog.agent_i == left.id)
         .join(right, DisagreementLog.agent_j == right.id)
         .where(DisagreementLog.run_id == run_id)
         .order_by(DisagreementLog.id)
     ).all()
+    run = database.get(ConsensusSession, run_id)
+    display_names = {
+        item.get("agent_id"): item.get("display_name")
+        for item in (
+            run.mandate_payload.get("agent_rules", [])
+            if run is not None and isinstance(run.mandate_payload, dict)
+            else []
+        )
+        if isinstance(item, dict)
+        and isinstance(item.get("agent_id"), int)
+        and isinstance(item.get("display_name"), str)
+    }
     return [
-        _disagreement_payload(log, left_name, right_name, simulations, car_result)
-        for log, left_name, right_name in rows
+        _disagreement_payload(
+            log,
+            left_agent.name,
+            right_agent.name,
+            simulations,
+            car_result,
+            str(
+                display_names.get(left_agent.id)
+                or semantic_agent_name(left_agent)
+            ),
+            str(
+                display_names.get(right_agent.id)
+                or semantic_agent_name(right_agent)
+            ),
+        )
+        for log, left_agent, right_agent in rows
     ]
 
 
@@ -250,6 +319,13 @@ def _safe_agent_rules(raw_rules: object) -> list[dict[str, Any]]:
         for key, value in {
             "agent_id": 0,
             "name": "Unknown agent",
+            "display_name": "Fallback_Policy_Reviewer",
+            "utility_metadata": {
+                "task": "Evaluate the active policy scenario.",
+                "result": "Stored legacy mandate metadata is incomplete.",
+                "why": "A safe fallback preserves compatibility without fabricating identity.",
+                "name_source": "fallback",
+            },
             "role": "Unknown role",
             "template_key": None,
             "mandate": None,
@@ -466,10 +542,26 @@ def _agent_breakdown_payload(database: Any, run: ConsensusSession) -> list[dict[
             stages[-1] if stages else None,
         )
         current_position = pre_arbitration or final_position or _stage_payload({}, gates)
+        stored_utility = rule.get("utility_metadata")
+        utility_metadata = (
+            dict(stored_utility) if isinstance(stored_utility, dict) else {}
+        )
+        utility_metadata.update(
+            agent_utility_metadata(
+                agent,
+                source=str(utility_metadata.get("name_source") or rule.get("synthesis_status") or "generated"),
+                result=(
+                    f"Produced {len(current_position['alternatives'])} policy alternative(s); recommendation: "
+                    f"{_artifact_text(current_position['recommendation']) or 'not available'}."
+                ),
+            )
+        )
         breakdown.append(
             {
                 "agent_id": agent.id,
                 "agent_name": agent.name,
+                "display_name": str(rule.get("display_name") or semantic_agent_name(agent)),
+                "utility_metadata": utility_metadata,
                 "agent_role": agent.role,
                 "role": agent.role,
                 "template_key": agent.template_key,
@@ -515,6 +607,7 @@ def _collective_reasoning_payload(
             {
                 "agent_id": agent.get("agent_id"),
                 "agent_name": agent.get("agent_name"),
+                "display_name": agent.get("display_name"),
                 "agent_role": agent.get("agent_role"),
                 "schema_valid": agent.get("schema_valid"),
                 "position_stage": position.get("stage"),
@@ -1141,6 +1234,9 @@ def start_run(
                 "rules": mandate_snapshot.rules,
                 "agent_rules": mandate_snapshot.agent_rules,
             },
+            runtime_config_payload=global_config_snapshot(
+                get_global_llm_config(session)
+            ),
             status="QUEUED",
             celery_task_id=task_id,
             logs=queue_logs,
@@ -1192,6 +1288,7 @@ def start_run(
             "session_id": session_id,
             "scenario_id": scenario_id,
             "status": "QUEUED",
+            **_polling_contract("QUEUED"),
             "logs": response_logs,
         },
         lang,
@@ -1240,6 +1337,7 @@ def _run_payload(
         "session_id": session.id,
         "scenario_id": session.scenario_id,
         "status": session.status,
+        **_polling_contract(session.status, session.result_payload),
         "logs": list(session.logs or []),
         "simulation_artifacts": [
             _simulation_payload(artifact) for artifact in simulations
@@ -1265,6 +1363,7 @@ def _run_payload(
             for observation, agent_name in influences
         ],
         "result": session.result_payload,
+        "runtime_configuration": session.runtime_config_payload,
         "error": session.error,
         "progress_stage": session.progress_stage,
         "created_at": session.created_at.isoformat() if session.created_at else None,
@@ -1332,9 +1431,14 @@ def run_status(
         "RETRY": "RUNNING",
         "REVOKED": "FAILED",
     }
+    public_status = state_map.get(result.state, result.state)
     payload: dict[str, Any] = {
         "task_id": task_id,
-        "status": state_map.get(result.state, result.state),
+        "status": public_status,
+        **_polling_contract(
+            public_status,
+            result.result if result.successful() else None,
+        ),
         "logs": [],
         "result": None,
         "session_id": None,

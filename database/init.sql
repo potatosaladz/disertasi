@@ -15,6 +15,20 @@ ALTER TABLE IF EXISTS agents
     ADD COLUMN IF NOT EXISTS temperature DOUBLE PRECISION NOT NULL DEFAULT 0.2,
     ADD COLUMN IF NOT EXISTS max_tokens INTEGER NOT NULL DEFAULT 4000;
 
+CREATE TABLE IF NOT EXISTS global_llm_config (
+    id INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+    llm_base_url VARCHAR(2048),
+    llm_api_key VARCHAR(4096),
+    llm_model VARCHAR(255),
+    temperature DOUBLE PRECISION NOT NULL DEFAULT 0.2 CHECK (temperature >= 0 AND temperature <= 2),
+    max_tokens INTEGER NOT NULL DEFAULT 4000 CHECK (max_tokens > 0),
+    apply_to_all BOOLEAN NOT NULL DEFAULT FALSE,
+    revision INTEGER NOT NULL DEFAULT 1,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+INSERT INTO global_llm_config (id) VALUES (1) ON CONFLICT (id) DO NOTHING;
+
 DO $$
 BEGIN
     IF to_regclass('public.agents') IS NOT NULL THEN
@@ -69,6 +83,7 @@ BEGIN
             mandate_snapshot_id INTEGER NOT NULL REFERENCES scenario_mandate_snapshots(id) ON DELETE CASCADE,
             mandate_revision VARCHAR(64) NOT NULL,
             mandate_payload JSONB NOT NULL,
+            runtime_config_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
             celery_task_id VARCHAR(255) UNIQUE,
             status VARCHAR(20) NOT NULL DEFAULT 'QUEUED',
             error TEXT,
@@ -82,7 +97,8 @@ BEGIN
         ALTER TABLE consensus_sessions
             ADD COLUMN IF NOT EXISTS logs JSONB NOT NULL DEFAULT '[]'::jsonb,
             ADD COLUMN IF NOT EXISTS result_payload JSONB,
-            ADD COLUMN IF NOT EXISTS progress_stage VARCHAR(50);
+            ADD COLUMN IF NOT EXISTS progress_stage VARCHAR(50),
+            ADD COLUMN IF NOT EXISTS runtime_config_payload JSONB NOT NULL DEFAULT '{}'::jsonb;
         CREATE INDEX IF NOT EXISTS ix_consensus_sessions_scenario_id
             ON consensus_sessions (scenario_id);
         ALTER TABLE IF EXISTS reasoning_logs ADD COLUMN IF NOT EXISTS run_id VARCHAR(36) REFERENCES consensus_sessions(id) ON DELETE CASCADE;

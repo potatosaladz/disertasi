@@ -22,6 +22,9 @@ def analytical_event(
     statutory: dict[str, Any] | None = None,
     economic: dict[str, Any] | None = None,
     fallback: dict[str, Any] | None = None,
+    task: dict[str, Any] | None = None,
+    result: dict[str, Any] | None = None,
+    why: dict[str, Any] | None = None,
     metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return {
@@ -42,6 +45,9 @@ def analytical_event(
         "statutory": statutory or {"status": "not-calculated", "source_tags": []},
         "economic": economic or {"status": "not-calculated", "inputs": {}, "outputs": {}},
         "fallback": fallback or {"used": False, "kind": None, "reason": None},
+        "task": task or {"type": stage.casefold().replace("_", "-")},
+        "result": result or {"status": "not-calculated"},
+        "why": why or {"reason": "No additional theoretical rationale was supplied."},
         "metadata": metadata or {},
     }
 
@@ -72,6 +78,9 @@ def legacy_event(log: dict[str, Any]) -> dict[str, Any]:
         "statutory": {"status": "not-calculated", "source_tags": []},
         "economic": {"status": "not-calculated", "inputs": {}, "outputs": {}},
         "fallback": {"used": False, "kind": None, "reason": None},
+        "task": {"type": "legacy"},
+        "result": {"status": "not-calculated"},
+        "why": {"reason": "Legacy event has no structured theoretical context."},
         "metadata": {"legacy": True, "translation_status": "source-language-only"},
     }
 

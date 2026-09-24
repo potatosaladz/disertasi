@@ -1,5 +1,6 @@
 import hashlib
 import json
+import re
 from dataclasses import asdict, dataclass
 from typing import Any
 
@@ -7,6 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .models import Agent
+from .global_config import apply_global_values, get_global_llm_config
 
 
 @dataclass(frozen=True)
@@ -327,6 +329,59 @@ AGENTS: list[AgentSpec] = [
 
 STANDARD_APBN_AGENT_TEMPLATES = tuple(AGENTS)
 _AGENT_SPECS_BY_KEY = {agent.key: agent for agent in AGENTS}
+_SEMANTIC_AGENT_NAMES = {
+    "revenue": "Dynamic_Revenue_Validator",
+    "expenditure": "Dynamic_Expenditure_Reviewer",
+    "financing": "Dynamic_Fiscal_Reviewer",
+    "treasury": "Dynamic_Treasury_Guardian",
+    "macro": "Dynamic_Macro_Fiscal_Analyst",
+}
+
+
+def is_generated_agent_name(name: str) -> bool:
+    return bool(
+        re.fullmatch(
+            r"(?:run-agent|fallback-rules|dynamic-agent|auto-agent)[-_][0-9a-f-]{8,}",
+            name.strip(),
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def semantic_agent_name(agent: Agent, source: str = "generated") -> str:
+    template_name = _SEMANTIC_AGENT_NAMES.get(agent.template_key or "")
+    if template_name is not None:
+        return template_name if source == "generated" else template_name.replace("Dynamic_", "Fallback_", 1)
+    role = "_".join(part.capitalize() for part in re.sub(r"[^A-Za-z0-9]+", " ", agent.role).split())
+    role_name = role or "Policy_Reviewer"
+    prefix = "Fallback" if source == "fallback" else "Dynamic"
+    return f"{prefix}_{role_name}"[:255]
+
+
+def agent_utility_metadata(agent: Agent, *, source: str, result: str) -> dict[str, Any]:
+    spec = get_agent_spec(agent.template_key)
+    checks = list(spec.owned_checks) if spec is not None else []
+    task = (
+        f"Validate {', '.join(checks)} for the active scenario."
+        if checks
+        else f"Evaluate the active scenario from the {agent.role} mandate."
+    )
+    why_by_template = {
+        "financing": "Mencegah bias LLM tunggal pada evaluasi defisit dan pembiayaan.",
+        "revenue": "Memisahkan penerimaan terverifikasi dari proyeksi LLM yang belum terealisasi.",
+        "expenditure": "Menjaga legalitas, kualitas, dan prioritas belanja dalam proses kolektif.",
+        "treasury": "Menjaga likuiditas kas dan otoritas pembiayaan agar tidak diasumsikan oleh LLM.",
+        "macro": "Mengisolasi asumsi makro dan ketidakpastian transmisi dari fakta fiskal terverifikasi.",
+    }
+    return {
+        "task": task,
+        "result": result,
+        "why": why_by_template.get(
+            agent.template_key or "",
+            "Menambahkan perspektif fungsional independen untuk mengurangi bias agen tunggal.",
+        ),
+        "name_source": source,
+    }
 
 
 def mandate_seed(agent: Agent) -> dict[str, Any]:
@@ -427,17 +482,28 @@ def load_standard_agent_templates(
     created = 0
     agents: list[Agent] = []
     configurations = configs or {}
+    global_config = get_global_llm_config(session)
     for template in AGENTS:
         agent = existing_by_key.get(template.key) or existing_by_name.get(template.name)
         if agent is None:
-            agent = Agent(**template.as_agent_values())
+            values = apply_global_values(template.as_agent_values(), global_config)
+            agent = Agent(**values)
             session.add(agent)
             created += 1
         elif agent.template_key is None:
             agent.template_key = template.key
         for field, value in configurations.get(template.key, {}).items():
-            if value not in (None, ""):
+            if value not in (None, "") and not global_config.apply_to_all:
                 setattr(agent, field, value)
+        if global_config.apply_to_all:
+            for field in (
+                "llm_base_url",
+                "llm_api_key",
+                "llm_model",
+                "temperature",
+                "max_tokens",
+            ):
+                setattr(agent, field, getattr(global_config, field))
         agents.append(agent)
     session.commit()
     for agent in agents:

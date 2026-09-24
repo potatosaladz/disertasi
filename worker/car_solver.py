@@ -69,6 +69,8 @@ def _rejection(
 def evaluate_car_constraints(
     alternatives: Sequence[T],
     max_deficit: float,
+    *,
+    hard_stop_reason: str | None = None,
 ) -> CarEvaluation:
     requested_ceiling = _finite_decimal(max_deficit, "max_deficit")
     if requested_ceiling < 0:
@@ -150,6 +152,20 @@ def evaluate_car_constraints(
         if feasible
         else None
     )
+    if hard_stop_reason is not None:
+        rejected = [
+            _rejection(
+                index,
+                alternative,
+                _finite_decimal(_value(alternative, "deficit"), "deficit"),
+                ceiling,
+                ["DDR_DC_HARD_STOP"],
+                hard_stop_reason,
+            )
+            for index, alternative in enumerate(alternatives)
+        ]
+        feasible = []
+        selected = None
     deficit_constraint_codes = {"DEFICIT_3PCT", "SCENARIO_DEFICIT_CEILING"}
     deficit_rejections = [
         item
@@ -223,11 +239,26 @@ def evaluate_car_constraints(
             "reason": "Verified post-policy education spending share was not supplied.",
         }
     )
+    if hard_stop_reason is not None:
+        hard_constraints.insert(
+            0,
+            {
+                "code": "DDR_DC_HARD_STOP",
+                "formula": "verified_constraint_violation => INFEASIBLE",
+                "source_tags": ["UU17_2003_P12"],
+                "calculation_status": "calculated",
+                "status": "violated",
+                "solver": "z3",
+                "reason": hard_stop_reason,
+            },
+        )
     return CarEvaluation(
         feasible=list(feasible),
         rejected=rejected,
         solver_status=(
-            "sat"
+            "unsat"
+            if hard_stop_reason is not None
+            else "sat"
             if feasible
             else "unsat"
             if deficit_rejections and not non_deficit_rejections

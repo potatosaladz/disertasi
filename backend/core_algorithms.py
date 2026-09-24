@@ -498,10 +498,10 @@ def describe_divergence_vector(vector: Mapping[str, object]) -> list[dict[str, A
 
 
 def resolve_disagreement_route(vector: Mapping[str, object]) -> str:
-    if bool(vector.get("dP")):
-        return "Simulation Agent Requested"
     if bool(vector.get("dC")):
         return "Constraint Arbitration Required"
+    if bool(vector.get("dP")):
+        return "Simulation Agent Requested"
     if bool(vector.get("dE")):
         return "Provenance Retrieval Triggered"
     if bool(vector.get("dREC")):

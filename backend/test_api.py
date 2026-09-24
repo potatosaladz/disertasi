@@ -9,13 +9,14 @@ from sqlalchemy import delete, select
 
 from backend.celery_client import celery_client
 from backend.agent_templates import STANDARD_APBN_AGENT_TEMPLATES, agent_revision
-from backend.dashboard import _disagreement_payload
+from backend.dashboard import _disagreement_payload, _polling_contract
 from backend.database import SessionLocal
 from backend.main import app
 from backend.models import (
     Agent,
     ConsensusSession,
     DisagreementLog,
+    GlobalLLMConfig,
     MetricSnapshot,
     ReasoningLog,
     Scenario,
@@ -28,6 +29,54 @@ from backend.models import (
 def client() -> Iterator[TestClient]:
     with TestClient(app) as test_client:
         yield test_client
+
+
+def test_global_config_is_redacted_and_applied_to_all(client: TestClient) -> None:
+    first = client.post(
+        "/api/agents",
+        json={"name": "global-first", "role": "Fiscal"},
+    )
+    assert first.status_code == 201
+    updated = client.put(
+        "/api/global-config",
+        json={
+            "llm_base_url": "https://global.example/v1",
+            "llm_api_key": "global-secret",
+            "llm_model": "global-model",
+            "temperature": 0.4,
+            "max_tokens": 2200,
+            "apply_to_all": True,
+        },
+    )
+    assert updated.status_code == 200
+    assert updated.json()["has_llm_api_key"] is True
+    assert "llm_api_key" not in updated.json()
+    listed = client.get("/api/agents")
+    assert listed.status_code == 200
+    assert listed.json()[0]["llm_model"] == "global-model"
+    assert listed.json()[0]["has_llm_api_key"] is True
+    assert "global-secret" not in json.dumps(listed.json())
+    created = client.post(
+        "/api/agents",
+        json={"name": "global-second", "role": "Risk"},
+    )
+    assert created.status_code == 201
+    assert created.json()["llm_model"] == "global-model"
+    assert created.json()["has_llm_api_key"] is True
+
+
+def test_generated_agent_name_is_normalized(client: TestClient) -> None:
+    response = client.post(
+        "/api/agents",
+        json={
+            "name": f"run-agent-{uuid.uuid4()}",
+            "role": "Fiscal Reviewer",
+        },
+    )
+
+    assert response.status_code == 201
+    assert response.json()["name"] == "Dynamic_Fiscal_Reviewer"
+    assert response.json()["display_name"] == "Dynamic_Fiscal_Reviewer"
 
 
 def test_agent_theta_u_zero_persists(client: TestClient) -> None:
@@ -389,6 +438,13 @@ def test_domain_rules_aggregate_template_agents(
     assert revenue_rules == {
         "agent_id": template_agent.json()["id"],
         "name": template_agent.json()["name"],
+        "display_name": "Dynamic_Revenue_Validator",
+        "utility_metadata": {
+            "task": "Validate TAX_LEGAL_BASIS, PNBP_LEGAL_BASIS, VERIFIED_OFFSETS_ONLY for the active scenario.",
+            "result": "Menunggu keluaran argumentasi terstruktur.",
+            "why": "Memisahkan penerimaan terverifikasi dari proyeksi LLM yang belum terealisasi.",
+            "name_source": "generated",
+        },
         "role": "Penerimaan Negara",
         "template_key": "revenue",
         "mandate": next(
@@ -918,6 +974,9 @@ def test_run_submission_and_status(client: TestClient, monkeypatch: pytest.Monke
                 failure_count=0,
             )
         )
+        global_config = session.get(GlobalLLMConfig, 1)
+        assert global_config is not None
+        global_config.llm_api_key = "snapshot-secret"
         session.commit()
         scenario_id = scenario.id
         agent_ids = [agent.id for agent in agents]
@@ -941,6 +1000,9 @@ def test_run_submission_and_status(client: TestClient, monkeypatch: pytest.Monke
     assert latest.status_code == 200
     assert latest.json()["session_id"] == session_id
     assert latest.json()["status"] == "QUEUED"
+    assert latest.json()["polling_state"] == "PENDING"
+    assert latest.json()["should_poll"] is True
+    assert latest.json()["terminal"] is False
     assert latest.json()["progress_stage"] == "QUEUE"
     assert latest.json()["logs"][0]["stage"] == "QUEUE"
     assert history.status_code == 200
@@ -971,6 +1033,9 @@ def test_run_submission_and_status(client: TestClient, monkeypatch: pytest.Monke
         assert run.logs[0]["event_id"] == response.json()["logs"][0]["event_id"]
         assert run.logs[0]["messages"] == response.json()["logs"][0]["messages"]
         assert run.logs[0]["message"] == run.logs[0]["messages"]["en"]
+        assert run.runtime_config_payload["has_llm_api_key"] is True
+        assert "llm_api_key" not in run.runtime_config_payload
+        assert "snapshot-secret" not in json.dumps(run.runtime_config_payload)
         assert response.json()["logs"][0]["message"] == response.json()["logs"][0]["messages"]["id"]
         assert run.progress_stage == "QUEUE"
         session.delete(session.get(Scenario, scenario_id))
@@ -1213,6 +1278,17 @@ def test_dashboard_matrix_and_manifest(client: TestClient) -> None:
     assert ddr_response.status_code == 200
     ddr_payload = ddr_response.json()["disagreements"][0]
     assert ddr_payload["active_components"] == ["dE", "dP"]
+    breakdown_by_id = {
+        item["agent_id"]: item for item in dashboard_en.json()["agent_breakdown"]
+    }
+    assert ddr_payload["agent_i_id"] == agent_i.id
+    assert ddr_payload["agent_j_id"] == agent_j.id
+    assert ddr_payload["agent_i_display_name"] == breakdown_by_id[agent_i.id][
+        "display_name"
+    ]
+    assert ddr_payload["agent_j_display_name"] == breakdown_by_id[agent_j.id][
+        "display_name"
+    ]
     assert ddr_payload["conflict_categories"][0]["category"] == (
         "Evidence and provenance divergence"
     )
@@ -1238,6 +1314,8 @@ def test_dashboard_matrix_and_manifest(client: TestClient) -> None:
     assert consensus_node["details"]["logs"][0]["metadata"] == {"safe": "visible"}
     assert nodes["stage:ddr"]["details"]["disagreement_count"] == 1
     assert nodes["stage:ddr"]["details"]["simulation_trigger_count"] == 1
+    assert nodes["stage:ddr"]["details"]["conflicts"][0]["agent_i_display_name"] == ddr_payload["agent_i_display_name"]
+    assert nodes["stage:ddr"]["details"]["conflicts"][0]["agent_j_display_name"] == ddr_payload["agent_j_display_name"]
     assert edges["edge:ddr-simulation:1"]["kind"] == "escalation"
     assert edges["edge:simulation-feedback:1"]["kind"] == "feedback"
     assert edges["edge:simulation-feedback:1"]["target"] == "stage:simulation-consensus:1"
@@ -1291,6 +1369,34 @@ def test_dashboard_matrix_and_manifest(client: TestClient) -> None:
         session.commit()
 
 
+def test_polling_contract_only_allows_explicit_temporary_states() -> None:
+    assert _polling_contract("QUEUED") == {
+        "polling_state": "PENDING",
+        "should_poll": True,
+        "terminal": False,
+    }
+    assert _polling_contract("RUNNING") == {
+        "polling_state": "PROCESSING",
+        "should_poll": True,
+        "terminal": False,
+    }
+    assert _polling_contract("SUCCEEDED", None) == {
+        "polling_state": "TEMPORARY_HYDRATION_DELAY",
+        "should_poll": True,
+        "terminal": False,
+    }
+    assert _polling_contract("SUCCEEDED", {"status": "complete"}) == {
+        "polling_state": "SUCCEEDED",
+        "should_poll": False,
+        "terminal": True,
+    }
+    assert _polling_contract("FAILED") == {
+        "polling_state": "FAILED",
+        "should_poll": False,
+        "terminal": True,
+    }
+
+
 def test_run_status_success(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
     class FakeResult:
         state = "SUCCESS"
@@ -1328,6 +1434,9 @@ def test_run_status_success(client: TestClient, monkeypatch: pytest.MonkeyPatch)
     response = client.get("/api/runs/success-task")
     assert response.status_code == 200
     assert response.json()["status"] == "SUCCEEDED"
+    assert response.json()["polling_state"] == "SUCCEEDED"
+    assert response.json()["should_poll"] is False
+    assert response.json()["terminal"] is True
     assert response.json()["result"]["metric_snapshot_id"] == 9
     assert response.json()["result"]["token_usage"] == 42
     assert response.json()["result"]["nested"] == {"safe": "visible"}
@@ -1349,6 +1458,9 @@ def test_run_status_failure(client: TestClient, monkeypatch: pytest.MonkeyPatch)
     monkeypatch.setattr("backend.dashboard.AsyncResult", lambda *_args, **_kwargs: FakeResult())
     response = client.get("/api/runs/failed-task")
     assert response.json()["status"] == "FAILED"
+    assert response.json()["polling_state"] == "FAILED"
+    assert response.json()["should_poll"] is False
+    assert response.json()["terminal"] is True
     assert response.json()["error"] == "cycle failed"
 
 
