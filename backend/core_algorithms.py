@@ -367,8 +367,16 @@ def build_consensus_prompt(
 
 
 def validate_decision_artifacts(response: object) -> list[str]:
-    required_collections = ("evidence", "predictions", "risks", "uncertainties", "alternatives")
+    required_collections = ("evidence", "predictions", "risks", "uncertainties")
     missing = [field for field in required_collections if not _value(response, field)]
+    alternatives = _value(response, "alternatives")
+    fallback_metadata = (
+        response.get("fallback_metadata")
+        if isinstance(response, Mapping)
+        else getattr(response, "fallback_metadata", None)
+    )
+    if not alternatives and not fallback_metadata:
+        missing.append("alternatives")
     recommendation = _value(response, "recommendation")
     if recommendation is None:
         missing.append("recommendation")

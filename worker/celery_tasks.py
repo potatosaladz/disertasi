@@ -17,6 +17,7 @@ from backend.agent_templates import (
     agent_revision,
     mandate_seed,
     resolve_agent_system_prompt,
+    scenario_deliberative_agents,
     semantic_agent_name,
 )
 from backend.analytical_events import analytical_event, normalize_event
@@ -289,10 +290,13 @@ def _create_isolated_session(scenario_id: int) -> str:
                 )
             )
         )
-        agent_query = select(Agent)
-        if scoped_agent_ids:
-            agent_query = agent_query.where(Agent.id.in_(scoped_agent_ids))
-        agents = list(session.scalars(agent_query.order_by(Agent.id)))
+        scoped_agent_id_set = set(scoped_agent_ids)
+        scenario_agents = scenario_deliberative_agents(session, scenario_id)
+        agents = (
+            [agent for agent in scenario_agents if agent.id in scoped_agent_id_set]
+            if scoped_agent_id_set
+            else scenario_agents
+        )
         revision = agent_revision(agents, scenario)
         snapshot = session.scalar(
             select(ScenarioMandateSnapshot).where(
@@ -361,13 +365,12 @@ def _load_session_context(
         for item in run.mandate_payload.get("agent_rules", [])
         if isinstance(item, dict) and isinstance(item.get("agent_id"), int)
     ]
-    agents = list(
-        session.scalars(
-            select(Agent)
-            .where(Agent.id.in_(mandate_agent_ids))
-            .order_by(Agent.id)
-        )
-    )
+    mandate_agent_id_set = set(mandate_agent_ids)
+    agents = [
+        agent
+        for agent in scenario_deliberative_agents(session, scenario_id)
+        if agent.id in mandate_agent_id_set
+    ]
     if not agents:
         raise ValueError("At least one agent is required")
     global_config = get_global_llm_config(session)
@@ -392,6 +395,7 @@ def _load_session_context(
         run.mandate_snapshot_id = snapshot.id
         run.mandate_revision = snapshot.revision
         run.mandate_payload = {
+            **dict(run.mandate_payload or {}),
             "rules": snapshot.rules,
             "agent_rules": snapshot.agent_rules,
         }
@@ -410,6 +414,7 @@ def _load_session_context(
         run.mandate_snapshot_id = snapshot.id
         run.mandate_revision = snapshot.revision
         run.mandate_payload = {
+            **dict(run.mandate_payload or {}),
             "rules": snapshot.rules,
             "agent_rules": snapshot.agent_rules,
         }
@@ -863,7 +868,7 @@ def _determine_convergence(
                     round(alternative.deficit, 8),
                     round(alternative.utility, 8),
                 )
-                for alternative in response.alternatives
+                for alternative in response.decision_alternatives()
                 if id(alternative) in feasible_ids
             )
         )
@@ -915,7 +920,7 @@ def _ensure_influence_observations(
             response.predictions,
             response.risks,
             response.uncertainties,
-            response.alternatives,
+            response.decision_alternatives(),
         )
         complete_groups = sum(bool(group) for group in artifact_groups)
         completeness = complete_groups / len(artifact_groups)
@@ -1011,7 +1016,7 @@ def _has_effective_deficit_violation(
     )
     return any(
         alternative.deficit > effective_ceiling
-        for alternative in response.alternatives
+        for alternative in response.decision_alternatives()
     )
 
 
@@ -1371,7 +1376,7 @@ def _fiscal_alternative_payload(
             "within_effective_ceiling": alternative.deficit <= effective_ceiling,
             "source_tag": alternative.source_tag,
         }
-        for alternative in response.alternatives
+        for alternative in response.decision_alternatives()
     ]
 
 
@@ -1583,6 +1588,14 @@ def _detect_ddr_conflicts(
     emit: ProgressReporter,
 ) -> list[dict[str, Any]]:
     conflicts: list[dict[str, Any]] = []
+    pair_count = 0
+    active_pair_count = 0
+    component_counts = {
+        component: 0
+        for component in ("dE", "dA", "dP", "dR", "dU", "dO", "dC", "dREC")
+    }
+    route_counts: dict[str, int] = {}
+    pair_summaries: list[dict[str, Any]] = []
     influence_by_agent = {
         observation.agent_id: observation for observation in influence_observations
     }
@@ -1598,31 +1611,28 @@ def _detect_ddr_conflicts(
             )
             components = conflict["components"]
             route = conflict["route"]
-            active_conflicts = ", ".join(components) or "none"
-            logs.append(
-                _log(
-                    "DDR",
-                    "WARNING" if components else "SUCCESS",
-                    f"{agent_i.name} vs {agent_j.name}: conflicts={active_conflicts}; route={route or 'none'}.",
-                    code="DDR_PAIR_EVALUATED",
-                    metric={
-                        "name": "active_component_count",
-                        "value": len(components),
-                        "unit": "components",
-                        "status": "calculated",
-                    },
-                    metadata={
-                        "agent_i_id": agent_i.id,
-                        "agent_i_name": agent_i.name,
-                        "agent_j_id": agent_j.id,
-                        "agent_j_name": agent_j.name,
-                        "vector": vector,
-                        "active_components": components,
-                        "resolution_path": route,
-                    },
-                )
+            pair_count += 1
+            if components:
+                active_pair_count += 1
+            for component in components:
+                component_counts[component] += 1
+            route_name = str(route or "No Resolution Required")
+            route_counts[route_name] = route_counts.get(route_name, 0) + 1
+            pair_summaries.append(
+                {
+                    "agent_i_id": agent_i.id,
+                    "agent_i_name": agent_i.name,
+                    "agent_i_display_name": conflict["agent_i_display_name"],
+                    "agent_j_id": agent_j.id,
+                    "agent_j_name": agent_j.name,
+                    "agent_j_display_name": conflict["agent_j_display_name"],
+                    "vector": vector,
+                    "active_components": components,
+                    "resolution_path": route,
+                    "hard_stop": conflict["hard_stop"],
+                    "simulation_allowed": conflict["simulation_allowed"],
+                }
             )
-            emit(logs)
             detail_payload = _conflict_detail_payload(
                 scenario,
                 agent_i,
@@ -1648,6 +1658,46 @@ def _detect_ddr_conflicts(
             if components:
                 conflict["narrative"] = detail_payload["categories"]
                 conflicts.append(conflict)
+    hard_stop_count = sum(bool(item.get("hard_stop")) for item in conflicts)
+    simulation_count = sum(bool(item.get("simulation_allowed")) for item in conflicts)
+    logs.append(
+        _log(
+            "DDR",
+            "WARNING" if active_pair_count else "SUCCESS",
+            (
+                f"DDR evaluated {pair_count} agent pair(s): {active_pair_count} "
+                f"with divergence, {hard_stop_count} hard stop(s), and "
+                f"{simulation_count} simulation route(s)."
+            ),
+            code="DDR_BATCH_EVALUATED",
+            id_message=(
+                f"DDR mengevaluasi {pair_count} pasangan agen: {active_pair_count} "
+                f"dengan divergensi, {hard_stop_count} hard stop, dan "
+                f"{simulation_count} jalur simulasi."
+            ),
+            metric={
+                "name": "active_pair_count",
+                "value": active_pair_count,
+                "unit": "pairs",
+                "status": "calculated",
+            },
+            task={"type": "ddr-batch", "pair_count": pair_count},
+            result={
+                "active_pair_count": active_pair_count,
+                "hard_stop_count": hard_stop_count,
+                "simulation_route_count": simulation_count,
+            },
+            why={
+                "reason": "Pairwise audit records are persisted while progress output is batched to avoid repetitive warnings."
+            },
+            metadata={
+                "component_counts": component_counts,
+                "route_counts": route_counts,
+                "pairs": pair_summaries,
+            },
+        )
+    )
+    emit(logs)
     return conflicts
 
 
@@ -2346,7 +2396,8 @@ def execute_full_shcr_cycle(
         alternatives = [
             alternative
             for response in parsed_responses
-            for alternative in response.alternatives
+        for alternative in response.decision_alternatives()
+
         ]
         car_evaluation = evaluate_car_constraints(
             alternatives,
@@ -2485,9 +2536,16 @@ def execute_full_shcr_cycle(
                 "session_id": session_id,
             },
             "result": {
-                "status": convergence_status.value,
+                "status": car_evaluation.status
+                if hard_constraint_conflicts
+                else convergence_status.value,
                 "feasible_alternatives_count": len(feasible),
                 "selected_alternative": getattr(car_evaluation.selected, "name", None),
+                **(
+                    {"messages": car_evaluation.messages}
+                    if car_evaluation.messages
+                    else {}
+                ),
             },
             "why": {
                 "reason": (

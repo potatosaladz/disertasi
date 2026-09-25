@@ -8,6 +8,9 @@ ALTER TABLE IF EXISTS scenarios
 
 ALTER TABLE IF EXISTS agents
     ADD COLUMN IF NOT EXISTS template_key VARCHAR(100),
+    ADD COLUMN IF NOT EXISTS scenario_id INTEGER REFERENCES scenarios(id) ON DELETE CASCADE,
+    ADD COLUMN IF NOT EXISTS specialist_domain VARCHAR(100),
+    ADD COLUMN IF NOT EXISTS is_orchestrator BOOLEAN NOT NULL DEFAULT FALSE,
     ADD COLUMN IF NOT EXISTS llm_base_url VARCHAR(2048),
     ADD COLUMN IF NOT EXISTS llm_api_key VARCHAR(4096),
     ADD COLUMN IF NOT EXISTS llm_model VARCHAR(255),
@@ -34,6 +37,13 @@ BEGIN
     IF to_regclass('public.agents') IS NOT NULL THEN
         CREATE UNIQUE INDEX IF NOT EXISTS ix_agents_template_key
             ON agents (template_key) WHERE template_key IS NOT NULL;
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_singleton_orchestrator
+            ON agents (is_orchestrator) WHERE is_orchestrator IS TRUE;
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_scenario_specialist_domain
+            ON agents (scenario_id, specialist_domain)
+            WHERE scenario_id IS NOT NULL AND specialist_domain IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS ix_agents_scenario_id
+            ON agents (scenario_id);
         IF NOT EXISTS (
             SELECT 1 FROM pg_constraint WHERE conname = 'ck_agent_temperature_range'
         ) THEN

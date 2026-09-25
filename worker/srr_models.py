@@ -1,9 +1,14 @@
+import math
 import re
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from backend.core_algorithms import STATUTORY_DEFICIT_CEILING_PERCENT_GDP
+from worker.sanitization import (
+    coerce_llm_collection,
+    deterministic_fallback_metadata,
+)
 
 
 _NUMBER_TOKEN = r"[-+]?(?:\d{1,3}(?:[.,]\d{3})+|\d+)(?:[.,]\d+)?"
@@ -36,14 +41,22 @@ _INCREMENTAL_DEFICIT_PATTERNS = (
     ),
 )
 _TOTAL_DEFICIT_PERCENT_PATTERN = re.compile(
-    rf"\b(?:total\s+(?:projected\s+)?deficit|projected\s+total\s+deficit|"
-    rf"defisit\s+total|proyeksi\s+defisit\s+total)\b[^%;]{{0,80}}?({_NUMBER_TOKEN})\s*%",
+    rf"\b(?:total\s+(?:projected\s+)?deficit|projected\s+(?:total\s+)?deficit|"
+    rf"deficit\s+projection|defisit\s+total|proyeksi\s+defisit(?:\s+total)?)\b"
+    rf"[^%;]{{0,80}}?({_NUMBER_TOKEN})\s*%",
     flags=re.IGNORECASE,
 )
 _TOTAL_DEFICIT_PATTERN = re.compile(
-    r"\b(?:total\s+(?:projected\s+)?deficit|projected\s+total\s+deficit|defisit\s+total|proyeksi\s+defisit\s+total)\b",
+    r"\b(?:total\s+(?:projected\s+)?deficit|projected\s+(?:total\s+)?deficit|"
+    r"deficit\s+projection|defisit\s+total|proyeksi\s+defisit(?:\s+total)?)\b",
     flags=re.IGNORECASE,
 )
+_NEGATED_QUALITATIVE_PATTERN = re.compile(
+    r"\b(?:not|isn't|isnt|tidak|bukan)\s+(?:very\s+|sangat\s+)?"
+    r"(?:high|low|medium|moderate|tinggi|rendah|sedang)\b",
+    flags=re.IGNORECASE,
+)
+
 
 
 def _is_incremental_deficit(value: str) -> bool:
@@ -104,8 +117,9 @@ def _clean_number(
             or (_PERCENT_PATTERN.search(text) if prefer_percent or normalise_ratio else None)
         )
         if qualitative:
+            qualitative_text = _NEGATED_QUALITATIVE_PATTERN.sub("", lowered)
             for labels, score in _QUALITATIVE_SCORES:
-                if any(label in lowered for label in labels):
+                if any(label in qualitative_text for label in labels):
                     return score
             explicit_match = re.search(
                 rf"(?:utility|score|nilai)\s*[:=]?\s*({_NUMBER_TOKEN})",
@@ -123,7 +137,12 @@ def _clean_number(
                 number_match = _NUMBER_PATTERN.search(text)
         if number_match is None:
             return value
-        number = _parse_number_token(number_match.group(1) if percent_match else number_match.group(0))
+        token = (
+            number_match.group(1)
+            if number_match.lastindex
+            else number_match.group(0)
+        )
+        number = _parse_number_token(token)
         if normalise_ratio and (percent_match is not None or re.search(r"/\s*100\b", text)):
             number /= 100.0
     else:
@@ -270,18 +289,26 @@ class Alternative(BaseModel):
     utility: float = Field(ge=0.0, le=1.0, allow_inf_nan=False)
     source_tag: str | None = None
 
-    @field_validator("deficit", "utility", mode="before")
+    @field_validator("deficit", mode="before")
     @classmethod
-    def reject_boolean_numbers(cls, value: object) -> object:
+    def coerce_deficit(cls, value: object) -> object:
         if isinstance(value, bool):
             raise ValueError("Boolean values are not valid numeric inputs")
-        return value
+        return _clean_number(value, prefer_percent=True)
+
+    @field_validator("utility", mode="before")
+    @classmethod
+    def coerce_utility(cls, value: object) -> object:
+        if isinstance(value, bool):
+            raise ValueError("Boolean values are not valid numeric inputs")
+        return _clean_number(value, normalise_ratio=True, qualitative=True)
 
     @model_validator(mode="before")
     @classmethod
     def normalise_alternative(cls, value: object) -> object:
         if isinstance(value, dict):
             payload = dict(value)
+            payload.pop("decision_eligible", None)
             if not payload.get("name"):
                 for key in ("title", "alternative", "option", "content"):
                     if isinstance(payload.get(key), str) and payload[key].strip():
@@ -324,6 +351,7 @@ class SRRResponse(BaseModel):
     objectives: list[Objective] = Field(default_factory=list)
     constraints: list[Constraint] = Field(default_factory=list)
     alternatives: list[Alternative] = Field(default_factory=list)
+    fallback_metadata: dict[str, object] | None = None
     recommendation: Recommendation | None = None
     confidence: float | None = Field(default=None, ge=0.0, le=1.0)
     material_information_retention_macro_f1: float | None = Field(
@@ -331,6 +359,40 @@ class SRRResponse(BaseModel):
         ge=0.0,
         le=1.0,
     )
+
+    @field_validator(
+        "evidence",
+        "assumptions",
+        "predictions",
+        "risks",
+        "uncertainties",
+        "objectives",
+        "constraints",
+        mode="before",
+    )
+    @classmethod
+    def coerce_artifact_collections(cls, value: object) -> list[object]:
+        return coerce_llm_collection(value)
+
+    @field_validator("alternatives", mode="before")
+    @classmethod
+    def ensure_alternative_collection(cls, value: object) -> list[object]:
+        return coerce_llm_collection(value)
+
+    @field_validator(
+        "confidence",
+        "material_information_retention_macro_f1",
+        mode="before",
+    )
+    @classmethod
+    def coerce_optional_ratio(cls, value: object) -> float | None:
+        if isinstance(value, bool):
+            return None
+        cleaned = _clean_number(value, normalise_ratio=True)
+        if isinstance(cleaned, (int, float)) and math.isfinite(float(cleaned)):
+            number = float(cleaned)
+            return number if 0.0 <= number <= 1.0 else None
+        return None
 
     @model_validator(mode="before")
     @classmethod
@@ -343,6 +405,7 @@ class SRRResponse(BaseModel):
             if isinstance(nested, dict):
                 payload = {**nested, **{key: item for key, item in payload.items() if key != wrapper}}
                 break
+        payload.pop("fallback_metadata", None)
         aliases = {
             "reasoning_summary": ("agent_opinion", "opinion", "summary", "rationale"),
             "evidence": ("evidences", "required_evidence", "evidence_requirements"),
@@ -385,6 +448,8 @@ class SRRResponse(BaseModel):
             payload["alternatives"] = valid_alternatives
             if discarded_alternatives:
                 payload["discarded_alternatives"] = discarded_alternatives
+        if not payload.get("alternatives"):
+            payload["fallback_metadata"] = deterministic_fallback_metadata()
         if isinstance(payload.get("recommendation"), list):
             payload["recommendation"] = payload["recommendation"][0] if payload["recommendation"] else None
         if isinstance(payload.get("recommendation"), dict):
@@ -420,6 +485,9 @@ class SRRResponse(BaseModel):
         )
         return payload
 
+    def decision_alternatives(self) -> list[Alternative]:
+        return list(self.alternatives)
+
     def provenance_items(self) -> list[SRRItem | Alternative]:
         items: list[SRRItem | Alternative] = [
             *self.evidence,
@@ -429,7 +497,7 @@ class SRRResponse(BaseModel):
             *self.uncertainties,
             *self.objectives,
             *self.constraints,
-            *self.alternatives,
+            *self.decision_alternatives(),
         ]
         if self.recommendation is not None:
             items.append(self.recommendation)
@@ -446,7 +514,7 @@ class SRRResponse(BaseModel):
                 "predictions": [item.content for item in self.predictions],
                 "projected_deficits": [
                     {"name": item.name, "deficit": item.deficit}
-                    for item in self.alternatives
+                    for item in self.decision_alternatives()
                 ],
             },
             "R": [item.content for item in self.risks],
@@ -459,7 +527,7 @@ class SRRResponse(BaseModel):
                 "constraints": [item.content for item in self.constraints],
                 "statutory_deficit_violation": any(
                     item.deficit > STATUTORY_DEFICIT_CEILING_PERCENT_GDP
-                    for item in self.alternatives
+                    for item in self.decision_alternatives()
                 ),
             },
             "REC": self.recommendation.content

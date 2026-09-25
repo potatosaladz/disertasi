@@ -1,6 +1,8 @@
 import json
 import uuid
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 from typing import Any
 
 import pytest
@@ -8,12 +10,19 @@ from fastapi.testclient import TestClient
 from sqlalchemy import delete, select
 
 from backend.celery_client import celery_client
-from backend.agent_templates import STANDARD_APBN_AGENT_TEMPLATES, agent_revision
+from backend.agent_templates import (
+    MASTER_ORCHESTRATOR_NAME,
+    STANDARD_APBN_AGENT_TEMPLATES,
+    agent_revision,
+    ensure_phase_one_specialists,
+)
 from backend.dashboard import _disagreement_payload, _polling_contract
 from backend.database import SessionLocal
 from backend.main import app
+from backend.mandate_snapshots import refresh_mandate_snapshot
 from backend.models import (
     Agent,
+    AgentInfluenceObservation,
     ConsensusSession,
     DisagreementLog,
     GlobalLLMConfig,
@@ -77,6 +86,40 @@ def test_generated_agent_name_is_normalized(client: TestClient) -> None:
     assert response.status_code == 201
     assert response.json()["name"] == "Dynamic_Fiscal_Reviewer"
     assert response.json()["display_name"] == "Dynamic_Fiscal_Reviewer"
+    repeated = client.post(
+        "/api/agents",
+        json={
+            "name": f"run-agent-{uuid.uuid4()}",
+            "role": "Fiscal Reviewer",
+        },
+    )
+    assert repeated.status_code == 200
+    assert repeated.json()["id"] == response.json()["id"]
+    assert repeated.json()["reused"] is True
+    exact_retry = client.post(
+        "/api/agents",
+        json={"name": response.json()["name"], "role": "Fiscal Reviewer"},
+    )
+    assert exact_retry.status_code == 200
+    assert exact_retry.json()["id"] == response.json()["id"]
+    assert exact_retry.json()["reused"] is True
+    conflict = client.post(
+        "/api/agents",
+        json={
+            "name": f"run-agent-{uuid.uuid4()}",
+            "role": "Fiscal Reviewer",
+            "temperature": 0.7,
+        },
+    )
+    assert conflict.status_code == 409
+    with SessionLocal() as session:
+        assert len(
+            list(
+                session.scalars(
+                    select(Agent).where(Agent.role == "Fiscal Reviewer")
+                )
+            )
+        ) == 1
 
 
 def test_agent_theta_u_zero_persists(client: TestClient) -> None:
@@ -196,6 +239,306 @@ def test_legacy_scenario_ceiling_remains_serializable(client: TestClient) -> Non
         session.delete(session.get(Scenario, scenario_id))
         session.delete(session.get(Agent, agent_id))
         session.commit()
+
+
+def test_master_orchestrator_is_singleton_and_reuses_gap_specialist() -> None:
+    with SessionLocal() as session:
+        scenario = Scenario(
+            description="Macro-Fiscal Stabilization under inflation pressure",
+            max_deficit_constraint=3.0,
+        )
+        macro = Agent(
+            name="Existing Macro Specialist",
+            role="Strategi Ekonomi dan Fiskal",
+            template_key="macro",
+            system_prompt=next(
+                template.system_prompt
+                for template in STANDARD_APBN_AGENT_TEMPLATES
+                if template.key == "macro"
+            ),
+        )
+        session.add_all([scenario, macro])
+        session.flush()
+        participants, first = ensure_phase_one_specialists(session, scenario)
+        participants_again, second = ensure_phase_one_specialists(session, scenario)
+        session.commit()
+
+        orchestrators = list(
+            session.scalars(
+                select(Agent).where(Agent.is_orchestrator.is_(True))
+            )
+        )
+        assert len(orchestrators) == 1
+        assert orchestrators[0].name == MASTER_ORCHESTRATOR_NAME
+        assert orchestrators[0].is_orchestrator is True
+        assert first["orchestrator_id"] == second["orchestrator_id"]
+        assert first["created_specialist_ids"] == []
+        assert macro.id in first["reused_specialist_ids"]
+        assert [agent.id for agent in participants] == [macro.id]
+        assert [agent.id for agent in participants_again] == [macro.id]
+        assert orchestrators[0].id not in [agent.id for agent in participants]
+
+
+def test_phase_one_gap_detection_creates_only_missing_specialist() -> None:
+    with SessionLocal() as session:
+        scenario = Scenario(
+            description="Assess PNBP revenue resilience",
+            max_deficit_constraint=3.0,
+        )
+        existing = Agent(name="Existing Fiscal", role="Fiscal Reviewer")
+        session.add_all([scenario, existing])
+        session.flush()
+
+        participants, orchestration = ensure_phase_one_specialists(session, scenario)
+        session.commit()
+
+        revenue = session.scalar(
+            select(Agent).where(
+                Agent.scenario_id == scenario.id,
+                Agent.specialist_domain == "revenue",
+            )
+        )
+        assert revenue is not None
+        assert revenue.scenario_id == scenario.id
+        assert revenue.specialist_domain == "revenue"
+        assert revenue.template_key is None
+        assert orchestration["detected_domains"] == ["revenue"]
+        assert orchestration["created_specialist_ids"] == [revenue.id]
+        assert {agent.id for agent in participants} == {existing.id, revenue.id}
+
+        unrelated = Scenario(
+            description="Evaluate a universal policy proposal",
+            max_deficit_constraint=3.0,
+        )
+        session.add(unrelated)
+        session.flush()
+        unrelated_participants, unrelated_orchestration = ensure_phase_one_specialists(
+            session, unrelated
+        )
+        assert unrelated_orchestration["detected_domains"] == []
+        assert revenue.id not in {agent.id for agent in unrelated_participants}
+        assert {agent.id for agent in unrelated_participants} == {existing.id}
+
+
+def test_concurrent_orchestrator_and_specialist_provisioning_is_idempotent() -> None:
+    with SessionLocal() as session:
+        scenario = Scenario(
+            description="Evaluate tax revenue resilience",
+            max_deficit_constraint=3.0,
+        )
+        session.add(scenario)
+        session.commit()
+        scenario_id = scenario.id
+
+    barrier = Barrier(2)
+
+    def provision() -> dict[str, Any]:
+        with SessionLocal() as session:
+            scenario = session.get(Scenario, scenario_id)
+            assert scenario is not None
+            barrier.wait(timeout=10)
+            _, metadata = ensure_phase_one_specialists(session, scenario)
+            session.commit()
+            return metadata
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(lambda _index: provision(), range(2)))
+
+    with SessionLocal() as session:
+        orchestrators = list(
+            session.scalars(select(Agent).where(Agent.is_orchestrator.is_(True)))
+        )
+        specialists = list(
+            session.scalars(
+                select(Agent).where(
+                    Agent.scenario_id == scenario_id,
+                    Agent.specialist_domain == "revenue",
+                )
+            )
+        )
+        assert len(orchestrators) == 1
+        assert len(specialists) == 1
+        assert {item["orchestrator_id"] for item in results} == {
+            orchestrators[0].id
+        }
+        assert sum(bool(item["created_specialist_ids"]) for item in results) == 1
+
+
+def test_scenario_specialist_rules_are_aggregated_and_not_globally_listed(
+    client: TestClient,
+) -> None:
+    with SessionLocal() as session:
+        scenario = Scenario(
+            description="Assess tax revenue resilience",
+            max_deficit_constraint=3.0,
+        )
+        session.add(scenario)
+        session.flush()
+        participants, _ = ensure_phase_one_specialists(session, scenario)
+        specialist = next(
+            agent for agent in participants if agent.specialist_domain == "revenue"
+        )
+        source_snapshot = ScenarioMandateSnapshot(
+            scenario_id=scenario.id,
+            revision="pre-specialist",
+            generated=True,
+            agent_count=0,
+            rules={},
+            agent_rules=[],
+            status="success",
+            generated_count=0,
+            failure_count=0,
+        )
+        session.add(source_snapshot)
+        session.flush()
+        refresh_mandate_snapshot(
+            session,
+            scenario,
+            participants,
+            source_snapshot,
+        )
+        session.commit()
+        scenario_id = scenario.id
+        specialist_id = specialist.id
+
+    listed = client.get("/api/agents")
+    rules = client.get(f"/api/scenarios/{scenario_id}/domain-rules")
+
+    assert listed.status_code == 200
+    assert specialist_id not in {item["id"] for item in listed.json()}
+    assert rules.status_code == 200
+    payload = rules.json()
+    assert payload["agent_count"] == 1
+    assert payload["agent_rules"][0]["agent_id"] == specialist_id
+    assert "VERIFIED_OFFSETS_ONLY" in payload["rules"]["owned_checks"]
+
+
+def test_foreign_specialist_is_excluded_from_run_surfaces(
+    client: TestClient,
+) -> None:
+    with SessionLocal() as session:
+        target = Scenario(
+            description="Target scenario without a revenue domain",
+            max_deficit_constraint=3.0,
+        )
+        foreign = Scenario(
+            description="Foreign revenue scenario",
+            max_deficit_constraint=3.0,
+        )
+        global_agent = Agent(name=f"global-{uuid.uuid4()}", role="Global Reviewer")
+        foreign_specialist = Agent(
+            name=f"foreign-{uuid.uuid4()}",
+            role="Foreign Revenue Reviewer",
+            scenario_id=None,
+        )
+        session.add_all([target, foreign, global_agent])
+        session.flush()
+        foreign_specialist.scenario_id = foreign.id
+        foreign_specialist.specialist_domain = "revenue"
+        session.add(foreign_specialist)
+        session.flush()
+        revision = agent_revision([global_agent, foreign_specialist], target)
+        agent_rules = [
+            {"agent_id": global_agent.id, "scenario_mandate": "Global mandate"},
+            {
+                "agent_id": foreign_specialist.id,
+                "scenario_mandate": "Injected foreign mandate",
+            },
+        ]
+        snapshot = ScenarioMandateSnapshot(
+            scenario_id=target.id,
+            revision=revision,
+            generated=True,
+            agent_count=2,
+            rules={},
+            agent_rules=agent_rules,
+            status="success",
+            generated_count=2,
+            failure_count=0,
+        )
+        session.add(snapshot)
+        session.flush()
+        run_id = str(uuid.uuid4())
+        session.add(
+            ConsensusSession(
+                id=run_id,
+                scenario_id=target.id,
+                mandate_snapshot_id=snapshot.id,
+                mandate_revision=revision,
+                mandate_payload={"rules": {}, "agent_rules": agent_rules},
+                celery_task_id=f"scope-{run_id}",
+                status="SUCCEEDED",
+                result_payload={"status": "SUCCEEDED"},
+            )
+        )
+        session.flush()
+        session.add_all(
+            [
+                AgentInfluenceObservation(
+                    run_id=run_id,
+                    agent_id=global_agent.id,
+                    scenario_id=target.id,
+                    proposition="Target observation",
+                    X=1.0,
+                    Q=1.0,
+                    H=1.0,
+                    S=1.0,
+                    U=0.0,
+                    gate=1,
+                ),
+                AgentInfluenceObservation(
+                    run_id=run_id,
+                    agent_id=foreign_specialist.id,
+                    scenario_id=target.id,
+                    proposition="Injected foreign observation",
+                    X=1.0,
+                    Q=1.0,
+                    H=1.0,
+                    S=1.0,
+                    U=0.0,
+                    gate=1,
+                ),
+            ]
+        )
+        session.commit()
+        target_id = target.id
+        global_agent_id = global_agent.id
+        global_agent_name = global_agent.name
+        foreign_specialist_id = foreign_specialist.id
+
+    dashboard = client.get(
+        f"/api/scenarios/{target_id}/dashboard?session_id={run_id}"
+    )
+    run_status = client.get(f"/api/runs/scope-{run_id}")
+    graph = client.get(f"/api/scenarios/{target_id}/runs/{run_id}/graph")
+    manifest = client.get(
+        f"/api/scenarios/{target_id}/manifest?session_id={run_id}"
+    )
+
+    assert dashboard.status_code == 200
+    dashboard_ids = {
+        item["agent_id"] for item in dashboard.json()["agent_breakdown"]
+    }
+    assert dashboard_ids == {global_agent_id}
+    assert {item["agent"] for item in dashboard.json()["influence_observations"]} == {
+        global_agent_name
+    }
+    assert foreign_specialist_id not in {
+        item["agent_id"] for item in dashboard.json()["domain_rules"]["agent_rules"]
+    }
+    assert run_status.status_code == 200
+    assert {item["agent"] for item in run_status.json()["influence_observations"]} == {
+        global_agent_name
+    }
+    assert graph.status_code == 200
+    graph_ids = {
+        item["details"]["agent_id"]
+        for item in graph.json()["nodes"]
+        if item["kind"] == "agent"
+    }
+    assert graph_ids == {global_agent_id}
+    assert manifest.status_code == 200
+    assert {item["id"] for item in manifest.json()["agents"]} == {global_agent_id}
 
 
 def test_agent_templates_are_available_and_idempotent(client: TestClient) -> None:
@@ -1036,6 +1379,15 @@ def test_run_submission_and_status(client: TestClient, monkeypatch: pytest.Monke
         assert run.runtime_config_payload["has_llm_api_key"] is True
         assert "llm_api_key" not in run.runtime_config_payload
         assert "snapshot-secret" not in json.dumps(run.runtime_config_payload)
+        assert run.mandate_payload["orchestration"]["orchestrator_name"] == (
+            MASTER_ORCHESTRATOR_NAME
+        )
+        assert run.mandate_payload["orchestration"]["non_voting"] is True
+        assert all(
+            rule["agent_id"]
+            != run.mandate_payload["orchestration"]["orchestrator_id"]
+            for rule in run.mandate_payload["agent_rules"]
+        )
         assert response.json()["logs"][0]["message"] == response.json()["logs"][0]["messages"]["id"]
         assert run.progress_stage == "QUEUE"
         session.delete(session.get(Scenario, scenario_id))
@@ -1187,6 +1539,13 @@ def test_dashboard_matrix_and_manifest(client: TestClient) -> None:
                 result_payload={
                     "convergence_status": "INFEASIBLE",
                     "feasible_alternatives_count": 0,
+                    "result": {
+                        "status": "INFEASIBLE",
+                        "messages": {
+                            "id": "Simulasi dibatalkan: Benturan batas keras terdeteksi pada defisit",
+                            "en": "Simulation cancelled: A verified hard-limit conflict was detected in the deficit.",
+                        },
+                    },
                     "car": {
                         "solver": "z3",
                         "solver_status": "unsat",
@@ -1237,7 +1596,19 @@ def test_dashboard_matrix_and_manifest(client: TestClient) -> None:
         f"/api/scenarios/{scenario_id}/dashboard?session_id={run_id}&lang=en"
     )
     run_status_response = client.get(f"/api/runs/simulation-dashboard-{run_id}?lang=id")
+    run_status_en = client.get(f"/api/runs/simulation-dashboard-{run_id}?lang=en")
     assert run_status_response.status_code == 200
+    assert run_status_en.status_code == 200
+    assert run_status_response.json()["result"]["result"]["status"] == "INFEASIBLE"
+    assert run_status_response.json()["result"]["result"]["message"] == (
+        "Simulasi dibatalkan: Benturan batas keras terdeteksi pada defisit"
+    )
+    assert run_status_en.json()["result"]["result"]["message"] == (
+        "Simulation cancelled: A verified hard-limit conflict was detected in the deficit."
+    )
+    assert run_status_en.json()["result"]["result"]["messages"]["id"] == (
+        "Simulasi dibatalkan: Benturan batas keras terdeteksi pada defisit"
+    )
     assert run_status_response.json()["simulation_artifacts"][0]["input"]["conflicts"][0]["components"] == ["dP"]
     assert run_status_response.json()["simulation_artifacts"][0]["output"]["evidence_status"] == "modelled"
     run_agents = run_status_response.json()["agent_breakdown"]

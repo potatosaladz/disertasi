@@ -17,12 +17,17 @@ from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
 from .agent_templates import (
+    agent_domain_key,
     agent_revision,
     agent_utility_metadata,
+    find_agent_by_mandate,
     get_agent_spec,
+    global_deliberative_agents,
     is_generated_agent_name,
+    is_master_orchestrator,
     load_standard_agent_templates,
     mandate_seed,
+    scenario_deliberative_agents,
     semantic_agent_name,
     template_catalog,
 )
@@ -142,6 +147,7 @@ class AgentResponse(BaseModel):
     id: int
     name: str
     display_name: str
+    reused: bool = False
     role: str
     template_key: str | None
     theta_x: float
@@ -230,11 +236,12 @@ class ScenarioResponse(BaseModel):
     max_deficit_constraint: float
 
 
-def agent_response(agent: Agent) -> AgentResponse:
+def agent_response(agent: Agent, *, reused: bool = False) -> AgentResponse:
     return AgentResponse(
         id=agent.id,
         name=agent.name,
         display_name=semantic_agent_name(agent),
+        reused=reused,
         role=agent.role,
         template_key=agent.template_key,
         theta_x=agent.theta_x,
@@ -338,26 +345,75 @@ def load_agent_templates(payload: LoadTemplatesRequest | None = None) -> dict[st
 
 @app.post("/api/agents", response_model=AgentResponse, status_code=status.HTTP_201_CREATED)
 @app.post("/agents", response_model=AgentResponse, status_code=status.HTTP_201_CREATED)
-def create_agent(payload: AgentCreate) -> AgentResponse:
+def create_agent(payload: AgentCreate, response: Response) -> AgentResponse:
     with SessionLocal() as session:
-        existing = session.scalar(select(Agent).where(Agent.name == payload.name))
-        if existing is not None:
-            raise HTTPException(status_code=409, detail="Agent name already exists")
         values = apply_global_values(payload.model_dump(), get_global_llm_config(session))
-        if is_generated_agent_name(payload.name):
-            transient = Agent(name=payload.name, role=payload.role, template_key=payload.template_key)
-            base_name = semantic_agent_name(transient)
-            candidate = base_name
-            suffix = 2
-            while session.scalar(select(Agent.id).where(Agent.name == candidate)) is not None:
-                candidate = f"{base_name}_{suffix}"
-                suffix += 1
-            values["name"] = candidate
         template = get_agent_spec(payload.template_key)
         if payload.template_key is not None and template is None:
             raise HTTPException(status_code=422, detail="Unknown agent template")
         if template is not None:
             values["system_prompt"] = template.system_prompt
+        existing_named_agent = session.scalar(
+            select(Agent).where(Agent.name == payload.name)
+        )
+        if is_generated_agent_name(payload.name):
+            if existing_named_agent is not None and (
+                existing_named_agent.scenario_id is not None
+                or existing_named_agent.is_orchestrator
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Generated agent name belongs to a scoped system agent",
+                )
+            existing_mandate_agent = existing_named_agent or find_agent_by_mandate(
+                session,
+                role=payload.role,
+                template_key=payload.template_key,
+                system_prompt=values.get("system_prompt"),
+            )
+            if existing_mandate_agent is not None:
+                configuration_fields = (
+                    "role",
+                    "template_key",
+                    "theta_x",
+                    "theta_q",
+                    "theta_h",
+                    "theta_s",
+                    "theta_u",
+                    "llm_base_url",
+                    "llm_api_key",
+                    "llm_model",
+                    "system_prompt",
+                    "temperature",
+                    "max_tokens",
+                )
+                mismatched = [
+                    field
+                    for field in configuration_fields
+                    if getattr(existing_mandate_agent, field) != values.get(field)
+                ]
+                if mismatched:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "Generated agent already exists with conflicting "
+                            f"configuration: {', '.join(mismatched)}"
+                        ),
+                    )
+                response.status_code = status.HTTP_200_OK
+                return agent_response(existing_mandate_agent, reused=True)
+            transient = Agent(name=payload.name, role=payload.role, template_key=payload.template_key)
+            base_name = semantic_agent_name(transient)
+            candidate = base_name
+            suffix = 2
+            while session.scalar(
+                select(Agent.id).where(Agent.name == candidate)
+            ) is not None:
+                candidate = f"{base_name}_{suffix}"
+                suffix += 1
+            values["name"] = candidate
+        elif existing_named_agent is not None:
+            raise HTTPException(status_code=409, detail="Agent name already exists")
         agent = Agent(**values)
         session.add(agent)
         session.commit()
@@ -400,7 +456,10 @@ def update_agent(agent_id: int, payload: AgentUpdate) -> AgentResponse:
 @app.get("/api/agents", response_model=list[AgentResponse])
 def list_agents() -> list[AgentResponse]:
     with SessionLocal() as session:
-        return [agent_response(agent) for agent in session.scalars(select(Agent).order_by(Agent.id))]
+        return [
+            agent_response(agent)
+            for agent in global_deliberative_agents(session)
+        ]
 
 
 @app.get("/api/agents/{agent_id}", response_model=AgentResponse)
@@ -476,7 +535,7 @@ def test_agent_connection(agent_id: int) -> LLMConnectionTestResponse:
 
 
 def _combined_domain_rules(agents: list[Agent], scenario: Scenario) -> dict[str, object]:
-    specs = [spec for agent in agents if (spec := get_agent_spec(agent.template_key))]
+    specs = [spec for agent in agents if (spec := get_agent_spec(agent_domain_key(agent)))]
     return {
         "hard_constraints": sorted({item for spec in specs for item in spec.constraints}),
         "owned_checks": sorted({item for spec in specs for item in spec.owned_checks}),
@@ -1087,7 +1146,7 @@ def generate_domain_rules(scenario_id: int) -> DomainRulesResponse | JSONRespons
                     status_code=404,
                     content={"success": False, "detail": "Scenario not found"},
                 )
-            agents = list(session.scalars(select(Agent).order_by(Agent.id)))
+            agents = scenario_deliberative_agents(session, scenario_id)
             if not agents:
                 return JSONResponse(
                     status_code=409,
@@ -1159,8 +1218,18 @@ def generate_agent_domain_rules(scenario_id: int, agent_id: int) -> AgentDomainR
             raise HTTPException(status_code=404, detail="Scenario not found")
         if agent is None:
             raise HTTPException(status_code=404, detail="Agent not found")
+        if is_master_orchestrator(agent):
+            raise HTTPException(
+                status_code=409,
+                detail="Master_Orchestrator is a non-voting controller",
+            )
+        if agent.scenario_id is not None and agent.scenario_id != scenario_id:
+            raise HTTPException(
+                status_code=404,
+                detail="Agent is not assigned to this scenario",
+            )
         rule = _synthesize_agent_domain_rules(agent, scenario)
-        agents = list(session.scalars(select(Agent).order_by(Agent.id)))
+        agents = scenario_deliberative_agents(session, scenario_id)
         current_revision = agent_revision(agents, scenario)
         snapshot = session.scalar(
             select(ScenarioMandateSnapshot)
@@ -1240,7 +1309,7 @@ def get_domain_rules(scenario_id: int) -> DomainRulesResponse:
         scenario = session.get(Scenario, scenario_id)
         if scenario is None:
             raise HTTPException(status_code=404, detail="Scenario not found")
-        agents = list(session.scalars(select(Agent).order_by(Agent.id)))
+        agents = scenario_deliberative_agents(session, scenario_id)
         current_revision = agent_revision(agents, scenario)
         snapshot = session.scalar(
             select(ScenarioMandateSnapshot)

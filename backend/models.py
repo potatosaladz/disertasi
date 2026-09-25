@@ -9,6 +9,7 @@ from sqlalchemy import (
     Enum,
     Float,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
@@ -40,12 +41,34 @@ class Agent(Base):
             name="ck_agent_temperature_range",
         ),
         CheckConstraint("max_tokens > 0", name="ck_agent_max_tokens_positive"),
+        Index(
+            "uq_agent_singleton_orchestrator",
+            "is_orchestrator",
+            unique=True,
+            postgresql_where=text("is_orchestrator IS TRUE"),
+        ),
+        Index(
+            "uq_agent_scenario_specialist_domain",
+            "scenario_id",
+            "specialist_domain",
+            unique=True,
+            postgresql_where=text(
+                "scenario_id IS NOT NULL AND specialist_domain IS NOT NULL"
+            ),
+        ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     name: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
     role: Mapped[str] = mapped_column(String(255), nullable=False)
     template_key: Mapped[str | None] = mapped_column(String(100), unique=True)
+    scenario_id: Mapped[int | None] = mapped_column(
+        ForeignKey("scenarios.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    specialist_domain: Mapped[str | None] = mapped_column(String(100))
+    is_orchestrator: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
     theta_x: Mapped[float] = mapped_column(Float, nullable=False, default=1.0, server_default="1.0")
     theta_q: Mapped[float] = mapped_column(Float, nullable=False, default=1.0, server_default="1.0")
     theta_h: Mapped[float] = mapped_column(Float, nullable=False, default=1.0, server_default="1.0")

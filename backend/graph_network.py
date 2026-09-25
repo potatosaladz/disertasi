@@ -6,7 +6,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import aliased
 
-from .agent_templates import semantic_agent_name
+from .agent_templates import scenario_deliberative_agents, semantic_agent_name
 from .analytical_events import normalize_event
 from .localization import DEFAULT_LANGUAGE, Language, localize_payload
 from .models import (
@@ -138,10 +138,16 @@ def run_graph_payload(
     scenario = database.get(Scenario, run.scenario_id)
     if scenario is None:
         raise ValueError("Scenario for consensus run does not exist")
+    scoped_agent_ids = {
+        agent.id
+        for agent in scenario_deliberative_agents(database, run.scenario_id)
+    }
     mandate_rules = {
         item.get("agent_id"): item
         for item in run.mandate_payload.get("agent_rules", [])
-        if isinstance(item, dict) and isinstance(item.get("agent_id"), int)
+        if isinstance(item, dict)
+        and isinstance(item.get("agent_id"), int)
+        and item.get("agent_id") in scoped_agent_ids
     }
     mandate_agent_ids = list(mandate_rules)
     agents = list(
@@ -154,7 +160,10 @@ def run_graph_payload(
     reasoning = {
         item.agent_id: item
         for item in database.scalars(
-            select(ReasoningLog).where(ReasoningLog.run_id == run.id)
+            select(ReasoningLog).where(
+                ReasoningLog.run_id == run.id,
+                ReasoningLog.agent_id.in_(mandate_agent_ids),
+            )
         )
     }
     left = aliased(Agent)
@@ -163,7 +172,11 @@ def run_graph_payload(
         select(DisagreementLog, left, right)
         .join(left, DisagreementLog.agent_i == left.id)
         .join(right, DisagreementLog.agent_j == right.id)
-        .where(DisagreementLog.run_id == run.id)
+        .where(
+            DisagreementLog.run_id == run.id,
+            left.id.in_(mandate_agent_ids),
+            right.id.in_(mandate_agent_ids),
+        )
         .order_by(DisagreementLog.id)
     ).all()
     simulations = list(
@@ -176,7 +189,10 @@ def run_graph_payload(
     influence_observations = list(
         database.scalars(
             select(AgentInfluenceObservation)
-            .where(AgentInfluenceObservation.run_id == run.id)
+            .where(
+                AgentInfluenceObservation.run_id == run.id,
+                AgentInfluenceObservation.agent_id.in_(mandate_agent_ids),
+            )
             .order_by(AgentInfluenceObservation.id)
         )
     )

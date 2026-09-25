@@ -4,6 +4,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .agent_templates import (
+    agent_domain_key,
     agent_revision,
     agent_utility_metadata,
     get_agent_spec,
@@ -85,7 +86,7 @@ def _rebased_agent_rule(
 
 
 def _combined_rules(agents: list[Agent], scenario: Scenario) -> dict[str, object]:
-    specs = [spec for agent in agents if (spec := get_agent_spec(agent.template_key))]
+    specs = [spec for agent in agents if (spec := get_agent_spec(agent_domain_key(agent)))]
     return {
         "hard_constraints": sorted({item for spec in specs for item in spec.constraints}),
         "owned_checks": sorted({item for spec in specs for item in spec.owned_checks}),

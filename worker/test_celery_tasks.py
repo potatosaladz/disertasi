@@ -30,6 +30,7 @@ from worker.celery_tasks import (
 )
 from backend.core_algorithms import resolve_llm_runtime_config
 from backend.simulation_agent import SIMULATION_AGENT_NAME, SIMULATION_AGENT_VERSION
+from worker.car_solver import evaluate_car_constraints
 from worker.srr_models import Evidence, SRRResponse, SimulationResponse
 
 
@@ -160,7 +161,158 @@ def fiscal_payload(
     )
 
 
+def test_srr_response_coerces_scalar_lists_and_optional_numeric_strings() -> None:
+    parsed = SRRResponse.model_validate(
+        {
+            "evidence": "Budget baseline",
+            "assumptions": "Stable inflation; Stable exchange rate",
+            "predictions": "Revenue remains stable",
+            "risks": "Implementation delay",
+            "uncertainties": "Demand response",
+            "objectives": "Fiscal sustainability",
+            "constraints": "Deficit ceiling",
+            "alternatives": [
+                {
+                    "name": "Cohort rollout",
+                    "deficit": "2.68% PDB",
+                    "utility": "utility: 75",
+                }
+            ],
+            "recommendation": "Adopt cohort rollout",
+            "confidence": "80%",
+            "material_information_retention_macro_f1": "0.91",
+        }
+    )
+
+    assert [item.content for item in parsed.assumptions] == [
+        "Stable inflation",
+        "Stable exchange rate",
+    ]
+    assert parsed.objectives[0].content == "Fiscal sustainability"
+    assert parsed.constraints[0].content == "Deficit ceiling"
+    assert parsed.alternatives[0].deficit == pytest.approx(2.68)
+    assert parsed.alternatives[0].utility == pytest.approx(0.75)
+    assert parsed.confidence == pytest.approx(0.8)
+    assert parsed.material_information_retention_macro_f1 == pytest.approx(0.91)
+
+
+def test_srr_response_reports_fallback_metadata_without_fabricating_alternatives() -> None:
+    raw_json, parsed, validation_error = _validated_response(
+        json.dumps(
+            {
+                "evidence": ["Verified baseline"],
+                "predictions": ["Stable activity"],
+                "risks": ["Execution risk"],
+                "uncertainties": ["Demand response"],
+                "alternatives": [
+                    {
+                        "name": "Unquantified option",
+                        "deficit": "No verified GDP estimate",
+                        "utility": "high",
+                    }
+                ],
+                "recommendation": "Wait for verified fiscal data",
+                "confidence": "70%",
+            }
+        )
+    )
+
+    assert validation_error is None
+    assert parsed is not None
+    assert parsed.alternatives == []
+    assert parsed.decision_alternatives() == []
+    assert "fallback_metadata" not in raw_json
+    assert raw_json["alternatives"][0]["name"] == "Unquantified option"
+    assert parsed.fallback_metadata is not None
+    assert parsed.fallback_metadata["kind"] == "missing_alternatives"
+    assert parsed.fallback_metadata["decision_status"] == "evidence_required"
+    assert "decision_eligible" not in parsed.fallback_metadata
+    assert parsed.model_extra is not None
+    assert parsed.model_extra["discarded_alternatives"][0]["name"] == "Unquantified option"
+
+
+def test_llm_cannot_hide_alternative_from_car_with_eligibility_flag() -> None:
+    parsed = SRRResponse.model_validate(
+        {
+            "alternatives": [
+                {
+                    "name": "Unsafe proposal",
+                    "deficit": 4.0,
+                    "utility": 0.9,
+                    "decision_eligible": False,
+                }
+            ],
+            "fallback_metadata": {"kind": "provider-controlled"},
+        }
+    )
+
+    assert len(parsed.alternatives) == 1
+    assert parsed.decision_alternatives()[0].name == "Unsafe proposal"
+    assert "decision_eligible" not in parsed.alternatives[0].model_dump()
+    assert parsed.fallback_metadata is None
+    divergence = parsed.divergence_object()
+    constraints = divergence["C"]
+    assert isinstance(constraints, dict)
+    assert constraints["statutory_deficit_violation"] is True
+    car = evaluate_car_constraints(parsed.decision_alternatives(), 3.0)
+    assert car.feasible == []
+    assert car.selected is None
+    assert car.rejected[0]["violated_constraints"] == ["DEFICIT_3PCT"]
+
+
+def test_car_hard_stop_preserves_statutory_rejection_details() -> None:
+    alternatives = [
+        {"name": "Over ceiling", "deficit": 3.4, "utility": 0.8},
+        {"name": "Within ceiling", "deficit": 2.4, "utility": 0.7},
+    ]
+
+    evaluation = evaluate_car_constraints(
+        alternatives,
+        3.0,
+        hard_stop_reason="Verified dC conflict",
+    )
+
+    over_ceiling, within_ceiling = evaluation.rejected
+    assert over_ceiling["violated_constraints"] == [
+        "DEFICIT_3PCT",
+        "DDR_DC_HARD_STOP",
+    ]
+    assert over_ceiling["projected_deficit_percent_gdp"] == pytest.approx(3.4)
+    assert over_ceiling["ceiling_percent_gdp"] == pytest.approx(3.0)
+    assert over_ceiling["excess_percent_gdp"] == pytest.approx(0.4)
+    assert within_ceiling["violated_constraints"] == ["DDR_DC_HARD_STOP"]
+    assert evaluation.feasible == []
+    assert evaluation.selected is None
+
+
+def test_ambiguous_deficit_text_uses_explicit_total_and_rejects_negated_utility() -> None:
+    parsed = SRRResponse.model_validate(
+        {
+            "alternatives": [
+                {
+                    "name": "Mixed fiscal values",
+                    "deficit": "Tax relief is 2%; projected deficit is 4% of GDP",
+                    "utility": 0.8,
+                },
+                {
+                    "name": "Negated utility",
+                    "deficit": 2.4,
+                    "utility": "not high",
+                },
+            ]
+        }
+    )
+
+    assert [item.name for item in parsed.alternatives] == ["Mixed fiscal values"]
+    assert parsed.alternatives[0].deficit == pytest.approx(4.0)
+    assert parsed.fallback_metadata is None
+    assert parsed.model_extra is not None
+    discarded = parsed.model_extra["discarded_alternatives"]
+    assert discarded[0]["name"] == "Negated utility"
+
+
 def test_extract_llm_response_accepts_missing_usage_metadata() -> None:
+
     assert _extract_llm_response('{"evidence": []}') == ('{"evidence": []}', 0)
     content, tokens = _extract_llm_response({"choices": [{"message": {"content": "{}"}}]})
     assert content == "{}"
@@ -191,6 +343,9 @@ def test_sparse_srr_response_uses_defaults_and_allows_extra_fields() -> None:
 
     assert second.evidence == []
     assert first.alternatives == []
+    assert first.fallback_metadata is not None
+    assert first.fallback_metadata["kind"] == "missing_alternatives"
+    assert first.decision_alternatives() == []
     assert first.recommendation is None
     assert first.confidence is None
     assert first.material_information_retention_macro_f1 is None
@@ -547,6 +702,50 @@ def test_runtime_configuration_rejects_placeholder_defaults() -> None:
         )
 
 
+def test_worker_session_excludes_specialists_from_other_scenarios(
+    scenario_id: int,
+) -> None:
+    with SessionLocal() as session:
+        foreign_scenario = Scenario(
+            description="Foreign revenue specialist scope",
+            max_deficit_constraint=3.0,
+        )
+        session.add(foreign_scenario)
+        session.flush()
+        foreign_specialist = Agent(
+            name=f"foreign-specialist-{uuid4()}",
+            role="Revenue Specialist",
+            scenario_id=foreign_scenario.id,
+            specialist_domain="revenue",
+        )
+        session.add(foreign_specialist)
+        session.commit()
+        foreign_agent_id = foreign_specialist.id
+
+    session_id = _create_isolated_session(scenario_id)
+    with SessionLocal() as session:
+        run = session.get(ConsensusSession, session_id)
+        assert run is not None
+        original_ids = {
+            item["agent_id"] for item in run.mandate_payload["agent_rules"]
+        }
+        assert foreign_agent_id not in original_ids
+        run.mandate_payload = {
+            **run.mandate_payload,
+            "agent_rules": [
+                *run.mandate_payload["agent_rules"],
+                {"agent_id": foreign_agent_id, "scenario_mandate": "Injected"},
+            ],
+        }
+        session.flush()
+        _, scoped_agents, _, _ = _load_session_context(
+            session,
+            scenario_id,
+            session_id,
+        )
+        assert foreign_agent_id not in {agent.id for agent in scoped_agents}
+
+
 def test_worker_refreshes_snapshot_that_became_stale_after_queue(
     scenario_id: int,
 ) -> None:
@@ -671,8 +870,10 @@ def test_run_creates_rar_dai_observations_when_no_seed_exists(
     )
     codes = [log["code"] for log in result["logs"]]
     assert codes.index("RAR_DAI_CALCULATION_COMPLETED") < codes.index(
-        "DDR_PAIR_EVALUATED"
+        "DDR_BATCH_EVALUATED"
     )
+    assert codes.count("DDR_BATCH_EVALUATED") == 1
+    assert "DDR_PAIR_EVALUATED" not in codes
 
     with SessionLocal() as session:
         observations = list(
@@ -958,6 +1159,12 @@ def test_verified_dc_bypasses_simulation_and_forces_car_hard_stop(
     assert result["car"]["hard_stop"]["simulation_bypassed"] is True
     assert result["car"]["solver_status"] == "unsat"
     assert result["car"]["selected_alternative"] is None
+    assert result["result"]["status"] == "INFEASIBLE"
+    assert result["result"]["messages"]["id"] == (
+        "Simulasi dibatalkan: Benturan batas keras terdeteksi pada defisit"
+    )
+    assert not any(log["code"] == "SHCR_CYCLE_FAILED" for log in result["logs"])
+    assert sum(log["code"] == "DDR_BATCH_EVALUATED" for log in result["logs"]) == 1
     with SessionLocal() as session:
         disagreement = session.scalar(
             select(DisagreementLog).where(
@@ -1104,6 +1311,129 @@ def test_post_simulation_dc_stops_additional_rounds(
     assert result["car"]["hard_stop"]["triggered"] is True
     assert result["car"]["solver_status"] == "unsat"
     assert result["car"]["selected_alternative"] is None
+
+
+def test_fallback_metadata_never_enters_ddr_or_car(
+    scenario_id: int,
+) -> None:
+    def missing_alternatives(prediction: str) -> str:
+        return json.dumps(
+            {
+                "evidence": ["Verified baseline"],
+                "predictions": [prediction],
+                "risks": ["Delivery risk"],
+                "uncertainties": ["Demand response"],
+                "recommendation": "Gather verified fiscal data",
+                "confidence": "0.7",
+            }
+        )
+
+    responses = iter(
+        [
+            (missing_alternatives("Growth is stable"), 10),
+            (missing_alternatives("Growth may differ"), 11),
+        ]
+    )
+    result = execute_full_shcr_cycle(
+        scenario_id,
+        lambda _agent, _scenario: next(responses),
+        enable_simulation=False,
+    )
+
+    assert result["feasible_alternatives_count"] == 0
+    assert result["car"]["status"] == "NOT_EVALUATED"
+    assert result["car"]["rejected_alternatives"] == []
+    assert result["car"]["selected_alternative"] is None
+    with SessionLocal() as session:
+        logs = list(
+            session.scalars(
+                select(ReasoningLog).where(
+                    ReasoningLog.run_id == result["session_id"]
+                )
+            )
+        )
+        assert len(logs) == 2
+        assert all(log.is_schema_valid for log in logs)
+        for log in logs:
+            parsed = SRRResponse.model_validate(log.parsed_srr_objects)
+            assert parsed.alternatives == []
+            assert parsed.fallback_metadata is not None
+            assert parsed.decision_alternatives() == []
+        disagreements = list(
+            session.scalars(
+                select(DisagreementLog).where(
+                    DisagreementLog.run_id == result["session_id"]
+                )
+            )
+        )
+        assert disagreements
+        for disagreement in disagreements:
+            deficit_values = disagreement.detail_payload["vector_metadata"]["dP"]["calculation"]
+            assert deficit_values.get("agent_i_projected_deficits", []) == []
+            assert deficit_values.get("agent_j_projected_deficits", []) == []
+
+
+def test_three_agent_batch_preserves_every_pairwise_audit_row() -> None:
+    with SessionLocal() as session:
+        scenario = Scenario(
+            description=f"Three-agent audit {uuid4()}",
+            max_deficit_constraint=3.0,
+        )
+        agents = [
+            Agent(name=f"audit-agent-{index}-{uuid4()}", role=f"Audit {index}")
+            for index in range(3)
+        ]
+        session.add_all([scenario, *agents])
+        session.commit()
+        scenario_id = scenario.id
+
+    payloads = iter(
+        [
+            (response_payload(prediction="Stable growth", utility=0.8, recommendation="Maintain"), 1),
+            (response_payload(prediction="Stable growth", utility=0.8, recommendation="Maintain"), 1),
+            (response_payload(prediction="Lower growth", utility=0.8, recommendation="Maintain"), 1),
+        ]
+    )
+    result = execute_full_shcr_cycle(
+        scenario_id,
+        lambda _agent, _scenario: next(payloads),
+        enable_simulation=False,
+    )
+
+    with SessionLocal() as session:
+        disagreements = list(
+            session.scalars(
+                select(DisagreementLog)
+                .where(DisagreementLog.run_id == result["session_id"])
+                .order_by(DisagreementLog.agent_i, DisagreementLog.agent_j)
+            )
+        )
+        assert len(disagreements) == 3
+        pairs = {
+            (item.agent_i, item.agent_j): item
+            for item in disagreements
+        }
+        assert len(pairs) == 3
+        assert sum(
+            not any(
+                getattr(item, component)
+                for component in ("dE", "dA", "dP", "dR", "dU", "dO", "dC", "dREC")
+            )
+            for item in disagreements
+        ) == 1
+        events = [
+            item
+            for item in result["logs"]
+            if item.get("code") == "DDR_BATCH_EVALUATED"
+        ]
+        assert len(events) == 1
+        pair_details = events[0]["metadata"]["pairs"]
+        assert len(pair_details) == 3
+        assert {
+            (item["agent_i_id"], item["agent_j_id"])
+            for item in pair_details
+        } == set(pairs)
+        assert events[0]["result"]["active_pair_count"] == 2
 
 
 def test_all_eight_ddr_components_persist_granular_metadata(

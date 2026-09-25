@@ -11,7 +11,9 @@ from sqlalchemy.orm import aliased
 from .agent_templates import (
     agent_revision,
     agent_utility_metadata,
+    ensure_phase_one_specialists,
     resolve_agent_system_prompt,
+    scenario_deliberative_agents,
     semantic_agent_name,
 )
 from .analytical_events import analytical_event
@@ -269,14 +271,28 @@ def _disagreements_payload(
 ) -> list[dict[str, Any]]:
     left = aliased(Agent)
     right = aliased(Agent)
+    run = database.get(ConsensusSession, run_id)
+    scoped_agent_ids = {
+        agent.id
+        for agent in scenario_deliberative_agents(database, run.scenario_id)
+    } if run is not None else set()
+    run_agent_ids = {
+        item.get("agent_id")
+        for item in run.mandate_payload.get("agent_rules", [])
+        if isinstance(item, dict) and isinstance(item.get("agent_id"), int)
+    } if run is not None else set()
+    participant_ids = scoped_agent_ids & run_agent_ids
     rows = database.execute(
         select(DisagreementLog, left, right)
         .join(left, DisagreementLog.agent_i == left.id)
         .join(right, DisagreementLog.agent_j == right.id)
-        .where(DisagreementLog.run_id == run_id)
+        .where(
+            DisagreementLog.run_id == run_id,
+            left.id.in_(participant_ids),
+            right.id.in_(participant_ids),
+        )
         .order_by(DisagreementLog.id)
     ).all()
-    run = database.get(ConsensusSession, run_id)
     display_names = {
         item.get("agent_id"): item.get("display_name")
         for item in (
@@ -493,20 +509,31 @@ def _stage_payload(
         "uncertainties": artifacts.get("uncertainties") if isinstance(artifacts.get("uncertainties"), list) else [],
         "objectives": artifacts.get("objectives") if isinstance(artifacts.get("objectives"), list) else [],
         "alternatives": artifacts.get("alternatives") if isinstance(artifacts.get("alternatives"), list) else [],
+        "fallback_metadata": artifacts.get("fallback_metadata")
+        if isinstance(artifacts.get("fallback_metadata"), dict)
+        else None,
     }
 
 
 def _agent_breakdown_payload(database: Any, run: ConsensusSession) -> list[dict[str, Any]]:
+    scoped_agent_ids = {
+        agent.id
+        for agent in scenario_deliberative_agents(database, run.scenario_id)
+    }
     mandate_rules = {
         item.get("agent_id"): item
         for item in run.mandate_payload.get("agent_rules", [])
-        if isinstance(item, dict) and isinstance(item.get("agent_id"), int)
+        if isinstance(item, dict)
+        and isinstance(item.get("agent_id"), int)
+        and item.get("agent_id") in scoped_agent_ids
     }
     agent_ids = list(mandate_rules)
     if not agent_ids:
         return []
     agents = list(
-        database.scalars(select(Agent).where(Agent.id.in_(agent_ids)).order_by(Agent.id))
+        database.scalars(
+            select(Agent).where(Agent.id.in_(agent_ids)).order_by(Agent.id)
+        )
     )
     reasoning = {
         log.agent_id: log
@@ -581,6 +608,7 @@ def _agent_breakdown_payload(database: Any, run: ConsensusSession) -> list[dict[
                 "uncertainties": current_position["uncertainties"],
                 "objectives": current_position["objectives"],
                 "alternatives": current_position["alternatives"],
+                "fallback_metadata": current_position["fallback_metadata"],
                 "pre_arbitration": pre_arbitration,
                 "final_position": final_position,
                 "deliberation_stages": stages,
@@ -959,16 +987,48 @@ def _dashboard_payload(
         active_session_id = active_session.id if active_session is not None else None
         artifact_session_id = active_session_id or "__NO_ACTIVE_SESSION__"
 
-        agents = list(session.scalars(select(Agent).order_by(Agent.id)))
-        mandate_snapshot = session.scalar(
-            select(ScenarioMandateSnapshot)
-            .where(ScenarioMandateSnapshot.scenario_id == scenario_id)
-            .order_by(ScenarioMandateSnapshot.updated_at.desc(), ScenarioMandateSnapshot.id.desc())
-        )
+        if active_session is not None:
+            scoped_agent_ids = {
+                agent.id
+                for agent in scenario_deliberative_agents(session, scenario_id)
+            }
+            run_agent_ids = {
+                item.get("agent_id")
+                for item in active_session.mandate_payload.get("agent_rules", [])
+                if isinstance(item, dict) and isinstance(item.get("agent_id"), int)
+            }
+            agents = list(
+                session.scalars(
+                    select(Agent)
+                    .where(Agent.id.in_(run_agent_ids & scoped_agent_ids))
+                    .order_by(Agent.id)
+                )
+            )
+        else:
+            agents = scenario_deliberative_agents(session, scenario_id)
+        if active_session is not None:
+            mandate_snapshot = session.get(
+                ScenarioMandateSnapshot,
+                active_session.mandate_snapshot_id,
+            )
+        else:
+            mandate_snapshot = session.scalar(
+                select(ScenarioMandateSnapshot)
+                .where(ScenarioMandateSnapshot.scenario_id == scenario_id)
+                .order_by(
+                    ScenarioMandateSnapshot.updated_at.desc(),
+                    ScenarioMandateSnapshot.id.desc(),
+                )
+            )
+        current_agent_ids = {agent.id for agent in agents}
         current_revision = agent_revision(agents, scenario)
-        stored_agent_rules = _safe_agent_rules(
-            mandate_snapshot.agent_rules if mandate_snapshot is not None else []
-        )
+        stored_agent_rules = [
+            rule
+            for rule in _safe_agent_rules(
+                mandate_snapshot.agent_rules if mandate_snapshot is not None else []
+            )
+            if rule.get("agent_id") in current_agent_ids
+        ]
         stored_rules = (
             mandate_snapshot.rules
             if mandate_snapshot is not None and isinstance(mandate_snapshot.rules, dict)
@@ -1031,6 +1091,7 @@ def _dashboard_payload(
                 .where(
                     ReasoningLog.scenario_id == scenario_id,
                     ReasoningLog.run_id == artifact_session_id,
+                    ReasoningLog.agent_id.in_(current_agent_ids),
                 )
                 .order_by(ReasoningLog.id)
             )
@@ -1057,6 +1118,7 @@ def _dashboard_payload(
             .where(
                 AgentInfluenceObservation.scenario_id == scenario_id,
                 AgentInfluenceObservation.run_id == artifact_session_id,
+                AgentInfluenceObservation.agent_id.in_(current_agent_ids),
             )
             .order_by(AgentInfluenceObservation.id)
         ).all()
@@ -1151,7 +1213,7 @@ def start_run(
         scenario = session.get(Scenario, scenario_id)
         if scenario is None:
             raise HTTPException(status_code=404, detail="Scenario not found")
-        agents = list(session.scalars(select(Agent).order_by(Agent.id)))
+        agents, orchestration = ensure_phase_one_specialists(session, scenario)
         if len(agents) < 2:
             raise HTTPException(
                 status_code=409,
@@ -1233,6 +1295,7 @@ def start_run(
             mandate_payload={
                 "rules": mandate_snapshot.rules,
                 "agent_rules": mandate_snapshot.agent_rules,
+                "orchestration": orchestration,
             },
             runtime_config_payload=global_config_snapshot(
                 get_global_llm_config(session)
@@ -1314,10 +1377,22 @@ def _run_payload(
             simulations,
             _car_result(session),
         )
+        participant_ids = {
+            item.get("agent_id")
+            for item in session.mandate_payload.get("agent_rules", [])
+            if isinstance(item, dict) and isinstance(item.get("agent_id"), int)
+        }
+        scoped_participant_ids = participant_ids & {
+            agent.id
+            for agent in scenario_deliberative_agents(database, session.scenario_id)
+        }
         influences = database.execute(
             select(AgentInfluenceObservation, Agent.name)
             .join(Agent, AgentInfluenceObservation.agent_id == Agent.id)
-            .where(AgentInfluenceObservation.run_id == session.id)
+            .where(
+                AgentInfluenceObservation.run_id == session.id,
+                AgentInfluenceObservation.agent_id.in_(scoped_participant_ids),
+            )
             .order_by(AgentInfluenceObservation.id)
         ).all()
         scenario = database.get(Scenario, session.scenario_id)
@@ -1629,13 +1704,25 @@ def reproducibility_manifest(
 ) -> JSONResponse:
     dashboard = _dashboard_payload(scenario_id, session_id, lang)
     with SessionLocal() as session:
-        agents = list(session.scalars(select(Agent).order_by(Agent.id)))
+        dashboard_agent_ids = {
+            item.get("agent_id")
+            for item in dashboard.get("agent_breakdown", [])
+            if isinstance(item, dict) and isinstance(item.get("agent_id"), int)
+        }
+        agents = list(
+            session.scalars(
+                select(Agent)
+                .where(Agent.id.in_(dashboard_agent_ids))
+                .order_by(Agent.id)
+            )
+        )
         reasoning = session.execute(
             select(ReasoningLog, Agent)
             .join(Agent, ReasoningLog.agent_id == Agent.id)
             .where(
                 ReasoningLog.scenario_id == scenario_id,
                 ReasoningLog.run_id == dashboard["session_id"],
+                ReasoningLog.agent_id.in_(dashboard_agent_ids),
             )
             .order_by(ReasoningLog.id)
         ).all()

@@ -8,6 +8,10 @@ from backend.core_algorithms import STATUTORY_DEFICIT_CEILING_PERCENT_GDP
 
 T = TypeVar("T")
 STATUTORY_DEFICIT_CEILING = Decimal(str(STATUTORY_DEFICIT_CEILING_PERCENT_GDP))
+CAR_HARD_STOP_MESSAGES = {
+    "id": "Simulasi dibatalkan: Benturan batas keras terdeteksi pada defisit",
+    "en": "Simulation cancelled: A verified hard-limit conflict was detected in the deficit.",
+}
 
 
 @dataclass(frozen=True)
@@ -17,6 +21,8 @@ class CarEvaluation:
     solver_status: str
     selected: Any | None
     hard_constraints: list[dict[str, Any]]
+    status: str
+    messages: dict[str, str] | None = None
 
 
 def _value(item: object, field: str) -> Any:
@@ -153,17 +159,47 @@ def evaluate_car_constraints(
         else None
     )
     if hard_stop_reason is not None:
-        rejected = [
-            _rejection(
-                index,
-                alternative,
-                _finite_decimal(_value(alternative, "deficit"), "deficit"),
-                ceiling,
-                ["DDR_DC_HARD_STOP"],
-                hard_stop_reason,
+        existing_rejections = {
+            int(item["index"]): item
+            for item in rejected
+            if isinstance(item.get("index"), int)
+        }
+        hard_stop_rejections: list[dict[str, Any]] = []
+        for index, alternative in enumerate(alternatives):
+            existing_rejection = existing_rejections.get(index)
+            if existing_rejection is not None:
+                violated_constraints = list(
+                    existing_rejection.get("violated_constraints", [])
+                )
+                if "DDR_DC_HARD_STOP" not in violated_constraints:
+                    violated_constraints.append("DDR_DC_HARD_STOP")
+                hard_stop_rejections.append(
+                    {
+                        **existing_rejection,
+                        "violated_constraints": violated_constraints,
+                        "reason": (
+                            f"{existing_rejection['reason']} {hard_stop_reason}"
+                        ),
+                    }
+                )
+                continue
+            try:
+                hard_stop_deficit = _finite_decimal(
+                    _value(alternative, "deficit"), "deficit"
+                )
+            except (AttributeError, KeyError, TypeError, ValueError):
+                hard_stop_deficit = None
+            hard_stop_rejections.append(
+                _rejection(
+                    index,
+                    alternative,
+                    hard_stop_deficit,
+                    ceiling,
+                    ["DDR_DC_HARD_STOP"],
+                    hard_stop_reason,
+                )
             )
-            for index, alternative in enumerate(alternatives)
-        ]
+        rejected = hard_stop_rejections
         feasible = []
         selected = None
     deficit_constraint_codes = {"DEFICIT_3PCT", "SCENARIO_DEFICIT_CEILING"}
@@ -268,4 +304,14 @@ def evaluate_car_constraints(
         ),
         selected=selected,
         hard_constraints=hard_constraints,
+        status=(
+            "INFEASIBLE"
+            if hard_stop_reason is not None or alternatives and not feasible
+            else "FEASIBLE"
+            if feasible
+            else "NOT_EVALUATED"
+        ),
+        messages=CAR_HARD_STOP_MESSAGES.copy()
+        if hard_stop_reason is not None
+        else None,
     )

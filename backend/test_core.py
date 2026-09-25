@@ -578,6 +578,11 @@ def test_car_hard_stop_forces_unsat_without_selection() -> None:
     assert result.feasible == []
     assert result.selected is None
     assert result.solver_status == "unsat"
+    assert result.status == "INFEASIBLE"
+    assert result.messages == {
+        "id": "Simulasi dibatalkan: Benturan batas keras terdeteksi pada defisit",
+        "en": "Simulation cancelled: A verified hard-limit conflict was detected in the deficit.",
+    }
     assert result.rejected[0]["violated_constraints"] == ["DDR_DC_HARD_STOP"]
     assert result.hard_constraints[0]["code"] == "DDR_DC_HARD_STOP"
 

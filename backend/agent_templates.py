@@ -4,10 +4,11 @@ import re
 from dataclasses import asdict, dataclass
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
-from .models import Agent
+from .models import Agent, Scenario
 from .global_config import apply_global_values, get_global_llm_config
 
 
@@ -328,6 +329,29 @@ AGENTS: list[AgentSpec] = [
 ]
 
 STANDARD_APBN_AGENT_TEMPLATES = tuple(AGENTS)
+MASTER_ORCHESTRATOR_TEMPLATE_KEY = "master_orchestrator"
+MASTER_ORCHESTRATOR_NAME = "Master_Orchestrator"
+MASTER_ORCHESTRATOR_ROLE = "Non-voting SHCR orchestration controller"
+MASTER_ORCHESTRATOR_MANDATE = (
+    "Coordinate phase ordering, detect uncovered scenario domains, reuse existing "
+    "specialists, and create a missing specialist only when deterministic Phase 1 "
+    "coverage analysis identifies a domain gap. The orchestrator never votes, "
+    "receives RAR-DAI weight, or participates in DDR."
+)
+def _domain_patterns(*terms: str) -> tuple[re.Pattern[str], ...]:
+    return tuple(
+        re.compile(rf"(?<![A-Za-z0-9_]){re.escape(term)}(?![A-Za-z0-9_])")
+        for term in terms
+    )
+
+
+_DOMAIN_GAP_PATTERNS: dict[str, tuple[re.Pattern[str], ...]] = {
+    "revenue": _domain_patterns("revenue", "tax", "pnbp", "penerimaan", "pajak", "cukai"),
+    "expenditure": _domain_patterns("expenditure", "spending", "belanja", "education", "pendidikan"),
+    "financing": _domain_patterns("financing", "debt", "deficit", "pembiayaan", "utang", "defisit"),
+    "treasury": _domain_patterns("treasury", "liquidity", "cash", "sal", "kas", "likuiditas"),
+    "macro": _domain_patterns("macro", "inflation", "growth", "exchange rate", "makro", "inflasi", "pertumbuhan", "nilai tukar", "stabilization"),
+}
 _AGENT_SPECS_BY_KEY = {agent.key: agent for agent in AGENTS}
 _SEMANTIC_AGENT_NAMES = {
     "revenue": "Dynamic_Revenue_Validator",
@@ -339,17 +363,28 @@ _SEMANTIC_AGENT_NAMES = {
 
 
 def is_generated_agent_name(name: str) -> bool:
+    candidate = name.strip()
     return bool(
         re.fullmatch(
             r"(?:run-agent|fallback-rules|dynamic-agent|auto-agent)[-_][0-9a-f-]{8,}",
-            name.strip(),
+            candidate,
             flags=re.IGNORECASE,
+        )
+        or re.fullmatch(
+            r"(?:Dynamic|Fallback)_[A-Za-z0-9_]+",
+            candidate,
         )
     )
 
 
+def agent_domain_key(agent: Agent) -> str | None:
+    return agent.template_key or agent.specialist_domain
+
+
 def semantic_agent_name(agent: Agent, source: str = "generated") -> str:
-    template_name = _SEMANTIC_AGENT_NAMES.get(agent.template_key or "")
+    if agent.is_orchestrator:
+        return MASTER_ORCHESTRATOR_NAME
+    template_name = _SEMANTIC_AGENT_NAMES.get(agent_domain_key(agent) or "")
     if template_name is not None:
         return template_name if source == "generated" else template_name.replace("Dynamic_", "Fallback_", 1)
     role = "_".join(part.capitalize() for part in re.sub(r"[^A-Za-z0-9]+", " ", agent.role).split())
@@ -359,7 +394,7 @@ def semantic_agent_name(agent: Agent, source: str = "generated") -> str:
 
 
 def agent_utility_metadata(agent: Agent, *, source: str, result: str) -> dict[str, Any]:
-    spec = get_agent_spec(agent.template_key)
+    spec = get_agent_spec(agent_domain_key(agent))
     checks = list(spec.owned_checks) if spec is not None else []
     task = (
         f"Validate {', '.join(checks)} for the active scenario."
@@ -377,7 +412,7 @@ def agent_utility_metadata(agent: Agent, *, source: str, result: str) -> dict[st
         "task": task,
         "result": result,
         "why": why_by_template.get(
-            agent.template_key or "",
+            agent_domain_key(agent) or "",
             "Menambahkan perspektif fungsional independen untuk mengurangi bias agen tunggal.",
         ),
         "name_source": source,
@@ -385,7 +420,8 @@ def agent_utility_metadata(agent: Agent, *, source: str, result: str) -> dict[st
 
 
 def mandate_seed(agent: Agent) -> dict[str, Any]:
-    template = _AGENT_SPECS_BY_KEY.get(agent.template_key) if agent.template_key else None
+    domain_key = agent_domain_key(agent)
+    template = _AGENT_SPECS_BY_KEY.get(domain_key) if domain_key else None
     if template is not None:
         return {
             "mandate": template.mandate,
@@ -429,6 +465,9 @@ def agent_revision(agents: list[Agent], scenario: object | None = None) -> str:
                 "id": agent.id,
                 "name": agent.name,
                 "template_key": agent.template_key,
+                "specialist_domain": agent.specialist_domain,
+                "scenario_id": agent.scenario_id,
+                "is_orchestrator": agent.is_orchestrator,
                 "role": agent.role,
                 "seed": mandate_seed(agent),
                 "llm_base_url": agent.llm_base_url,
@@ -455,12 +494,222 @@ def get_agent_spec(template_key: str | None) -> AgentSpec | None:
 
 
 def resolve_agent_system_prompt(agent: Agent) -> str | None:
-    template = get_agent_spec(agent.template_key)
+    template = get_agent_spec(agent_domain_key(agent))
     return template.system_prompt if template is not None else agent.system_prompt
 
 
 def template_catalog() -> list[dict[str, Any]]:
     return [template.as_payload() for template in AGENTS]
+
+
+def find_agent_by_mandate(
+    session: Session,
+    *,
+    role: str,
+    template_key: str | None,
+    system_prompt: str | None,
+) -> Agent | None:
+    candidates = list(
+        session.scalars(
+            select(Agent).where(
+                Agent.role == role,
+                Agent.template_key == template_key,
+                Agent.scenario_id.is_(None),
+                Agent.is_orchestrator.is_(False),
+            ).order_by(Agent.id)
+        )
+    )
+    normalized_mandate = " ".join((system_prompt or "").casefold().split())
+    if normalized_mandate:
+        return next(
+            (
+                agent
+                for agent in candidates
+                if " ".join((agent.system_prompt or "").casefold().split())
+                == normalized_mandate
+            ),
+            None,
+        )
+    return next(
+        (
+            agent
+            for agent in candidates
+            if agent.name.startswith(("Dynamic_", "Fallback_"))
+        ),
+        None,
+    )
+
+
+def is_master_orchestrator(agent: Agent) -> bool:
+    return agent.is_orchestrator
+
+
+def deliberative_agents(agents: list[Agent]) -> list[Agent]:
+    return [agent for agent in agents if not agent.is_orchestrator]
+
+
+def global_deliberative_agents(session: Session) -> list[Agent]:
+    return list(
+        session.scalars(
+            select(Agent)
+            .where(
+                Agent.is_orchestrator.is_(False),
+                Agent.scenario_id.is_(None),
+            )
+            .order_by(Agent.id)
+        )
+    )
+
+
+def scenario_deliberative_agents(
+    session: Session,
+    scenario_id: int,
+) -> list[Agent]:
+    return list(
+        session.scalars(
+            select(Agent)
+            .where(
+                Agent.is_orchestrator.is_(False),
+                or_(Agent.scenario_id.is_(None), Agent.scenario_id == scenario_id),
+            )
+            .order_by(Agent.id)
+        )
+    )
+
+
+def get_or_create_master_orchestrator(session: Session) -> tuple[Agent, bool]:
+    orchestrator = session.scalar(
+        select(Agent).where(
+            or_(
+                Agent.is_orchestrator.is_(True),
+                Agent.template_key == MASTER_ORCHESTRATOR_TEMPLATE_KEY,
+            )
+        )
+    )
+    if orchestrator is not None:
+        orchestrator.is_orchestrator = True
+        if orchestrator.template_key is None:
+            orchestrator.template_key = MASTER_ORCHESTRATOR_TEMPLATE_KEY
+        session.flush()
+        return orchestrator, False
+    global_config = get_global_llm_config(session)
+    values = apply_global_values(
+        {
+            "template_key": MASTER_ORCHESTRATOR_TEMPLATE_KEY,
+            "name": MASTER_ORCHESTRATOR_NAME,
+            "role": MASTER_ORCHESTRATOR_ROLE,
+            "system_prompt": MASTER_ORCHESTRATOR_MANDATE,
+            "temperature": 0.0,
+            "max_tokens": 1000,
+            "theta_x": 0.0,
+            "theta_q": 0.0,
+            "theta_h": 0.0,
+            "theta_s": 0.0,
+            "theta_u": 0.0,
+            "is_orchestrator": True,
+        },
+        global_config,
+    )
+    inserted_id = session.scalar(
+        insert(Agent)
+        .values(**values)
+        .on_conflict_do_nothing()
+        .returning(Agent.id)
+    )
+    session.flush()
+    orchestrator = session.scalar(
+        select(Agent).where(Agent.is_orchestrator.is_(True))
+    )
+    if orchestrator is None:
+        raise ValueError("Master_Orchestrator identity conflicts with an existing agent")
+    return orchestrator, inserted_id is not None
+
+
+def detected_scenario_domains(scenario: Scenario) -> list[str]:
+    description = " ".join(scenario.description.casefold().split())
+    return [
+        key
+        for key, patterns in _DOMAIN_GAP_PATTERNS.items()
+        if any(pattern.search(description) for pattern in patterns)
+    ]
+
+
+def ensure_phase_one_specialists(
+    session: Session,
+    scenario: Scenario,
+) -> tuple[list[Agent], dict[str, Any]]:
+    orchestrator, orchestrator_created = get_or_create_master_orchestrator(session)
+    global_agents = global_deliberative_agents(session)
+    existing_by_key = {
+        agent.template_key: agent
+        for agent in global_agents
+        if agent.template_key is not None
+    }
+    detected_domains = detected_scenario_domains(scenario)
+    created_specialists: list[Agent] = []
+    reused_specialists: list[Agent] = []
+    global_config = get_global_llm_config(session)
+    for key in detected_domains:
+        spec = _AGENT_SPECS_BY_KEY[key]
+        specialist = existing_by_key.get(key)
+        if specialist is None:
+            specialist = session.scalar(
+                select(Agent).where(
+                    Agent.scenario_id == scenario.id,
+                    Agent.specialist_domain == key,
+                    Agent.is_orchestrator.is_(False),
+                )
+            )
+        if specialist is None:
+            values = {
+                **spec.as_agent_values(),
+                "template_key": None,
+                "name": f"Dynamic_{key.title()}_Reviewer_S{scenario.id}",
+                "scenario_id": scenario.id,
+                "specialist_domain": key,
+            }
+            if global_config.llm_base_url:
+                values["llm_base_url"] = global_config.llm_base_url
+            if global_config.llm_api_key:
+                values["llm_api_key"] = global_config.llm_api_key
+            if global_config.llm_model:
+                values["llm_model"] = global_config.llm_model
+            values["temperature"] = global_config.temperature
+            values["max_tokens"] = global_config.max_tokens
+            inserted_id = session.scalar(
+                insert(Agent)
+                .values(**values)
+                .on_conflict_do_nothing()
+                .returning(Agent.id)
+            )
+            specialist = session.scalar(
+                select(Agent).where(
+                    Agent.scenario_id == scenario.id,
+                    Agent.specialist_domain == key,
+                    Agent.is_orchestrator.is_(False),
+                )
+            )
+            if specialist is None:
+                raise ValueError(
+                    f"Could not provision scenario specialist for domain '{key}'"
+                )
+            if inserted_id is not None:
+                created_specialists.append(specialist)
+            else:
+                reused_specialists.append(specialist)
+        else:
+            reused_specialists.append(specialist)
+    session.flush()
+    participants = scenario_deliberative_agents(session, scenario.id)
+    return participants, {
+        "orchestrator_id": orchestrator.id,
+        "orchestrator_name": orchestrator.name,
+        "orchestrator_created": orchestrator_created,
+        "detected_domains": detected_domains,
+        "created_specialist_ids": [agent.id for agent in created_specialists],
+        "reused_specialist_ids": [agent.id for agent in reused_specialists],
+        "non_voting": True,
+    }
 
 
 def load_standard_agent_templates(

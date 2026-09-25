@@ -10,6 +10,9 @@ _SCENARIO_COLUMNS: dict[str, str] = {
 _AGENT_COLUMNS: dict[str, str] = {
     "llm_base_url": "VARCHAR(2048)",
     "template_key": "VARCHAR(100) UNIQUE",
+    "scenario_id": "INTEGER REFERENCES scenarios(id) ON DELETE CASCADE",
+    "specialist_domain": "VARCHAR(100)",
+    "is_orchestrator": "BOOLEAN NOT NULL DEFAULT FALSE",
     "llm_api_key": "VARCHAR(4096)",
     "llm_model": "VARCHAR(255)",
     "system_prompt": "TEXT",
@@ -156,6 +159,19 @@ def _upgrade_agents_table() -> None:
         for name, definition in _AGENT_COLUMNS.items():
             if name not in existing:
                 connection.execute(text(f'ALTER TABLE agents ADD COLUMN "{name}" {definition}'))
+        connection.execute(text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_singleton_orchestrator "
+            "ON agents (is_orchestrator) WHERE is_orchestrator IS TRUE"
+        ))
+        connection.execute(text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_scenario_specialist_domain "
+            "ON agents (scenario_id, specialist_domain) "
+            "WHERE scenario_id IS NOT NULL AND specialist_domain IS NOT NULL"
+        ))
+        connection.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_agents_scenario_id "
+            "ON agents (scenario_id)"
+        ))
         connection.execute(text(
             "CREATE UNIQUE INDEX IF NOT EXISTS ix_agents_template_key "
             "ON agents (template_key) WHERE template_key IS NOT NULL"
