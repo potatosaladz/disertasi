@@ -5,6 +5,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from backend.core_algorithms import STATUTORY_DEFICIT_CEILING_PERCENT_GDP
+from backend.simulation_agent import SIMULATION_AGENT_NAME, SIMULATION_AGENT_VERSION
 from worker.sanitization import (
     coerce_llm_collection,
     deterministic_fallback_metadata,
@@ -557,8 +558,8 @@ class SimulationResponse(SRRResponse):
     modelled_variables: list[str] = Field(default_factory=list)
     limitations: list[str] = Field(default_factory=list)
     evidence_status: Literal["modelled"] = "modelled"
-    agent_name: str = "Simulation Agent / Arbiter Simulasi Makro-Fiskal"
-    simulation_version: str = "native-simulation-v1"
+    agent_name: str = SIMULATION_AGENT_NAME
+    simulation_version: str = SIMULATION_AGENT_VERSION
 
     @model_validator(mode="before")
     @classmethod

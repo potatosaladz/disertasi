@@ -565,7 +565,7 @@ export default function Home() {
     const response = await apiFetch("/api/agent-templates", { cache: "no-store" });
     if (!response.ok) throw new Error(t("error.templateStatus", { status: response.status }));
     const payload: AgentTemplate[] = await response.json();
-    if (!Array.isArray(payload) || payload.length !== 5) throw new Error(t("error.templateInvalid"));
+    if (!Array.isArray(payload) || payload.length !== 7) throw new Error(t("error.templateInvalid"));
     setTemplates(payload);
   }
 

@@ -527,6 +527,21 @@ def test_simulation_response_uses_summary_fallback_for_empty_llm_value() -> None
     )
 
 
+def test_simulation_response_uses_current_service_identity_defaults() -> None:
+    parsed = SimulationResponse.model_validate(
+        {
+            "simulation_summary": "Arbitration complete",
+            "conflict_summary": ["Prediction divergence"],
+            "resolution": "Use a phased compromise",
+            "alternatives": [{"name": "Phased", "deficit": 2.4, "utility": 0.8}],
+            "recommendation": {"content": "Use phased compromise"},
+        }
+    )
+
+    assert parsed.agent_name == SIMULATION_AGENT_NAME
+    assert parsed.simulation_version == SIMULATION_AGENT_VERSION
+
+
 def test_recommendation_verdict_alias_is_normalised() -> None:
     parsed = SRRResponse.model_validate(
         {
@@ -971,6 +986,8 @@ def test_ddr_invokes_native_simulation_and_feeds_follow_up_round(
                     "modelled_variables": ["deficit"],
                     "limitations": ["Not legal authority"],
                     "evidence_status": "modelled",
+                    "agent_name": "obsolete provider identity",
+                    "simulation_version": "obsolete-provider-version",
                 }
             ),
             7,
@@ -993,6 +1010,11 @@ def test_ddr_invokes_native_simulation_and_feeds_follow_up_round(
     assert len(peer_batches) == 6
     assert any(item["agent"] == SIMULATION_AGENT_NAME for item in peer_batches[2])
     assert any(log["stage"] == "SIMULATION" for log in result["logs"])
+    assert any(log["stage"] == "SIMULATION_RPC" for log in result["logs"])
+    assert any(log["code"] == "CAR_RPC_PRECHECK_COMPLETED" for log in result["logs"])
+    assert result["car"]["rpc_precheck"]["decision_authority"] is False
+    assert result["car"]["rpc_precheck"]["vote_eligible"] is False
+    assert result["car"]["rpc_precheck"]["car_eligible"] is False
     assert any(log["stage"] == "SIMULATION_CONSENSUS" for log in result["logs"])
     simulation_consensus_logs = [
         log for log in result["logs"] if log["stage"] == "SIMULATION_CONSENSUS"
@@ -1012,7 +1034,18 @@ def test_ddr_invokes_native_simulation_and_feeds_follow_up_round(
             for artifact in artifacts
         )
         assert all(artifact.status == "SUCCEEDED" for artifact in artifacts)
+        assert artifacts[-1].output_payload["agent_name"] == SIMULATION_AGENT_NAME
+        assert artifacts[-1].output_payload["simulation_version"] == SIMULATION_AGENT_VERSION
         assert artifacts[-1].output_payload["evidence_status"] == "modelled"
+        assert len(artifacts[-1].output_payload["rpc_tool_calls"]) == 3
+        assert artifacts[-1].output_payload["rpc_interface"] == {
+            "protocol_version": "1",
+            "agent_name": SIMULATION_AGENT_NAME,
+            "vote_eligible": False,
+            "decision_authority": False,
+            "car_eligible": False,
+        }
+        assert len(artifacts[-1].input_payload["rpc_tool_calls"]) == 3
         assert artifacts[-1].output_payload["alternatives"][0]["source_tag"] == "SIMULATION_MODELLED"
         assert artifacts[-1].output_payload["remaining_prediction_conflicts"] == 0
         artifact_inputs = [artifact.input_payload for artifact in artifacts]
@@ -1073,6 +1106,55 @@ def test_native_simulation_falls_back_when_provider_fails(
         assert artifact.status == "SUCCEEDED"
         assert artifact.output_payload["fallback_reason"] == "ConnectionError"
         assert artifact.output_payload["evidence_status"] == "modelled"
+
+
+def test_unanimous_deficit_violations_bypass_simulation_and_rpc(
+    scenario_id: int,
+) -> None:
+    responses = iter(
+        [
+            (
+                fiscal_payload(
+                    name="Illegal A",
+                    prediction="Growth rises",
+                    deficit=3.4,
+                    constraint="Deficit exceeds the legal ceiling",
+                ),
+                10,
+            ),
+            (
+                fiscal_payload(
+                    name="Illegal B",
+                    prediction="Growth falls",
+                    deficit=3.5,
+                    constraint="Deficit exceeds the legal ceiling",
+                ),
+                11,
+            ),
+        ]
+    )
+    simulation_calls: list[list[dict[str, object]]] = []
+
+    def simulation_call(
+        _scenario: Scenario,
+        conflicts: list[dict[str, object]],
+        _peers: list[dict[str, object]],
+    ) -> tuple[str, int]:
+        simulation_calls.append(conflicts)
+        raise AssertionError("simulation must be bypassed for unanimous deficit violations")
+
+    result = execute_full_shcr_cycle(
+        scenario_id,
+        lambda _agent, _scenario: next(responses),
+        simulation_call=simulation_call,
+    )
+
+    assert simulation_calls == []
+    assert result["simulation_triggered"] is False
+    assert result["car"]["hard_stop"]["triggered"] is True
+    assert result["car"]["rpc_precheck"]["status"] == "bypassed"
+    assert result["car"]["solver_status"] == "unsat"
+    assert not any(log["stage"] == "SIMULATION_RPC" for log in result["logs"])
 
 
 def test_invalid_consensus_review_retains_validated_initial_artifacts(
@@ -1171,6 +1253,8 @@ def test_verified_dc_bypasses_simulation_and_forces_car_hard_stop(
     assert result["convergence_status"] == "INFEASIBLE"
     assert result["car"]["hard_stop"]["triggered"] is True
     assert result["car"]["hard_stop"]["simulation_bypassed"] is True
+    assert result["car"]["rpc_precheck"]["status"] == "bypassed"
+    assert not any(log["stage"] == "SIMULATION_RPC" for log in result["logs"])
     assert result["car"]["solver_status"] == "unsat"
     assert result["car"]["selected_alternative"] is None
     assert result["result"]["status"] == "INFEASIBLE"
@@ -1573,11 +1657,9 @@ def test_all_infeasible_cycle_cannot_resurrect_fallback_alternative(
                 )
             )
         )
-        assert len(artifacts) == 1
-        assert artifacts[0].output_payload["fallback"]["used"] is True
-        assert artifacts[0].output_payload["alternatives"] == []
-        assert artifacts[0].output_payload["selected_alternative"] is None
-        assert artifacts[0].output_payload["resolution_status"] == "INFEASIBLE"
+        assert artifacts == []
+    assert result["simulation_triggered"] is False
+    assert result["car"]["rpc_precheck"]["status"] == "bypassed"
 
 
 def test_formulation_dry_run_stops_before_deliberation(scenario_id: int) -> None:
@@ -1785,6 +1867,7 @@ def test_run_full_shcr_cycle_populates_postgres(scenario_id: int) -> None:
     result = execute_full_shcr_cycle(scenario_id, lambda _agent, _scenario: next(responses))
 
     assert result["hard_constraint_violation_rate"] == 50.0
+
     assert result["feasible_alternatives_count"] == 2
     assert result["convergence_status"] == "PARETO_SET"
     assert result["token_usage"] == 250

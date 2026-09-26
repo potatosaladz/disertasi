@@ -58,8 +58,11 @@ from backend.simulation_agent import (
     MAX_SIMULATION_ROUNDS,
     SIMULATION_AGENT_NAME,
     SIMULATION_AGENT_VERSION,
+    SIMULATION_RPC_TOOL_MANIFEST,
     SIMULATION_TRIGGER,
     build_deterministic_simulation,
+    invoke_fiscal_simulation_rpc,
+    invoke_fiscal_simulation_rpc_suite,
     build_simulation_consensus_prompt,
     build_simulation_prompt,
     build_simulation_system_prompt,
@@ -679,8 +682,59 @@ def _run_native_simulation(
     safe_peer_outputs = [
         sanitize_simulation_payload(dict(peer)) for peer in peer_outputs
     ]
+    rpc_tool_results = invoke_fiscal_simulation_rpc_suite(
+        scenario_description=scenario.description,
+        simulation_payload=scenario.simulation_payload(),
+        peer_outputs=safe_peer_outputs,
+    )
+    calculated_tool_count = sum(
+        result["status"] == "calculated" for result in rpc_tool_results
+    )
+    logs.append(
+        _log(
+            "SIMULATION_RPC",
+            "SUCCESS" if calculated_tool_count == len(rpc_tool_results) else "INFO",
+            (
+                f"{SIMULATION_AGENT_NAME} completed {calculated_tool_count}/"
+                f"{len(rpc_tool_results)} allowlisted RPC calculation(s)."
+            ),
+            code="SIMULATION_RPC_TOOLS_EXECUTED",
+            id_message=(
+                f"{SIMULATION_AGENT_NAME} menyelesaikan {calculated_tool_count}/"
+                f"{len(rpc_tool_results)} kalkulasi RPC yang diizinkan."
+            ),
+            round_number=round_number,
+            task={"type": "simulation-rpc", "phase": "post-ddr"},
+            result={
+                "status": (
+                    "calculated"
+                    if calculated_tool_count == len(rpc_tool_results)
+                    else "partially_calculated"
+                    if calculated_tool_count
+                    else "not_calculated"
+                ),
+                "tool_count": len(rpc_tool_results),
+                "calculated_tool_count": calculated_tool_count,
+                "tools": [item["tool_name"] for item in rpc_tool_results],
+            },
+            why={
+                "reason": "Sectoral agents receive auditable deterministic calculations before simulation arbitration.",
+                "authority": "Non-voting calculation service; CAR remains authoritative.",
+            },
+        )
+    )
+    emit(logs)
     simulation_input = {
         "conflicts": conflicts,
+        "rpc_interface": {
+            "protocol_version": "1",
+            "agent_name": SIMULATION_AGENT_NAME,
+            "tools": SIMULATION_RPC_TOOL_MANIFEST,
+            "vote_eligible": False,
+            "decision_authority": False,
+            "car_eligible": False,
+        },
+        "rpc_tool_calls": rpc_tool_results,
         "sectoral_inputs": [
             {
                 "agent": peer.get("agent"),
@@ -741,7 +795,14 @@ def _run_native_simulation(
                 raw_content, token_usage = _default_simulation_call(
                     scenario,
                     conflicts,
-                    peer_outputs,
+                    [
+                        *peer_outputs,
+                        {
+                            "agent": SIMULATION_AGENT_NAME,
+                            "role": "Non-voting RPC calculation service",
+                            "rpc_tool_results": rpc_tool_results,
+                        },
+                    ],
                     agents,
                 )
                 raw_payload = extract_json_object(raw_content)
@@ -759,6 +820,16 @@ def _run_native_simulation(
             )
             parsed = SimulationResponse.model_validate(raw_payload)
         output_payload = sanitize_simulation_payload(parsed.model_dump(mode="json"))
+        output_payload["agent_name"] = SIMULATION_AGENT_NAME
+        output_payload["simulation_version"] = SIMULATION_AGENT_VERSION
+        output_payload["rpc_tool_calls"] = rpc_tool_results
+        output_payload["rpc_interface"] = {
+            "protocol_version": "1",
+            "agent_name": SIMULATION_AGENT_NAME,
+            "vote_eligible": False,
+            "decision_authority": False,
+            "car_eligible": False,
+        }
         output_payload["fallback"] = {
             "used": fallback_reason is not None,
             "kind": "deterministic-native" if fallback_reason else None,
@@ -1007,9 +1078,10 @@ def _ensure_influence_observations(
 
 
 def _has_effective_deficit_violation(response: SRRResponse) -> bool:
-    return any(
+    alternatives = response.decision_alternatives()
+    return bool(alternatives) and all(
         alternative.deficit > STATUTORY_DEFICIT_CEILING_PERCENT_GDP
-        for alternative in response.decision_alternatives()
+        for alternative in alternatives
     )
 
 
@@ -1027,10 +1099,10 @@ def _classify_conflict(
     )
     violation_i = _has_effective_deficit_violation(response_i)
     violation_j = _has_effective_deficit_violation(response_j)
-    vector["dC"] = bool(vector["dC"] or violation_i != violation_j)
+    vector["dC"] = bool(vector["dC"] or violation_i or violation_j)
     components = [key for key, value in vector.items() if value]
     route = resolve_disagreement_route(vector) if components else None
-    hard_stop = bool(vector["dC"] and (violation_i or violation_j))
+    hard_stop = bool(violation_i or violation_j)
     return vector, {
         "agent_i": agent_i.name,
         "agent_i_display_name": display_names.get(
@@ -2571,9 +2643,55 @@ def execute_full_shcr_cycle(
         alternatives = [
             alternative
             for response in parsed_responses
-        for alternative in response.decision_alternatives()
-
+            for alternative in response.decision_alternatives()
         ]
+        if hard_constraint_conflicts:
+            car_rpc_precheck: dict[str, Any] = {
+                "protocol_version": "1",
+                "agent_name": SIMULATION_AGENT_NAME,
+                "tool_name": "fiscal.compare_deficit_alternatives",
+                "status": "bypassed",
+                "calculation": {},
+                "limitations": [
+                    "Verified hard-constraint conflicts bypass RPC calculation and proceed directly to CAR."
+                ],
+                "decision_authority": False,
+                "vote_eligible": False,
+                "car_eligible": False,
+            }
+        else:
+            car_rpc_precheck = invoke_fiscal_simulation_rpc(
+                "fiscal.compare_deficit_alternatives",
+                scenario_description=scenario.description,
+                simulation_payload=scenario.simulation_payload(),
+                peer_outputs=[
+                    {
+                        "agent": agent.name,
+                        "role": agent.role,
+                        "srr": response.model_dump(mode="json"),
+                    }
+                    for agent, response in parsed_by_agent
+                ],
+            )
+            logs.append(
+                _log(
+                    "SIMULATION_RPC",
+                    "INFO",
+                    "Fiscal Simulation RPC supplied a non-authoritative deficit precheck to CAR.",
+                    code="CAR_RPC_PRECHECK_COMPLETED",
+                    id_message="RPC Simulasi Fiskal memberikan pra-periksa defisit non-otoritatif kepada CAR.",
+                    task={"type": "simulation-rpc", "phase": "pre-car"},
+                    result={
+                        "status": car_rpc_precheck["status"],
+                        "tool_name": car_rpc_precheck["tool_name"],
+                    },
+                    why={
+                        "reason": "The calculation exposes arithmetic before independent Z3 adjudication.",
+                        "authority": "CAR remains authoritative and re-evaluates all constraints.",
+                    },
+                )
+            )
+            emit(logs)
         car_evaluation = evaluate_car_constraints(
             alternatives,
             STATUTORY_DEFICIT_CEILING_PERCENT_GDP,
@@ -2733,6 +2851,7 @@ def execute_full_shcr_cycle(
             "car": {
                 "solver": "z3",
                 "solver_status": car_evaluation.solver_status,
+                "rpc_precheck": car_rpc_precheck,
                 "hard_stop": {
                     "triggered": bool(hard_constraint_conflicts),
                     "reason": (

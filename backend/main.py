@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 import socket
 import warnings
 from collections.abc import AsyncIterator
@@ -18,6 +19,7 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
 from .agent_templates import (
+    ORCHESTRATED_AGENT_KEYS,
     agent_domain_key,
     agent_revision,
     agent_utility_metadata,
@@ -45,6 +47,7 @@ from .core_algorithms import (
     extract_llm_completion,
     llm_request_headers,
     log_llm_outbound,
+    repair_json_trailing_commas,
     resolve_llm_runtime_config,
 )
 from .dashboard import router as dashboard_router
@@ -426,28 +429,35 @@ def _orchestrator_llm_domain_selection(
                 "parameters": scenario.simulation_payload(),
             },
             "candidate_domains": [
-                {"key": "revenue", "role": "State Revenue Specialist"},
-                {"key": "expenditure", "role": "Government Expenditure Specialist"},
-                {"key": "financing", "role": "Budget Financing Specialist"},
-                {"key": "treasury", "role": "Treasury Liquidity Specialist"},
-                {"key": "macro", "role": "Macro-Fiscal Stabilization Specialist"},
+                {"key": key, "role": role}
+                for key, role in (
+                    ("revenue", "State Revenue Agent / Penerimaan Negara"),
+                    ("expenditure", "Government Expenditure Agent / Belanja Pemerintah"),
+                    ("budget", "BudgetAgent / Anggaran Pemerintah"),
+                    ("financing", "Financing & Debt Agent / Pembiayaan Pemerintah"),
+                    ("macro", "Macro-Fiscal Stabilization Agent / Strategi Ekonomi dan Fiskal"),
+                    ("fiscal_risk", "Fiscal Risk & Contingency Agent / Manajemen Risiko Fiskal"),
+                    ("critic", "Adversarial Fiscal Critic Agent / Penelaah & Kritik Kebijakan Fiskal"),
+                )
             ],
             "required_output": {
-                "agents": [
-                    {"domain": "revenue"},
-                    {"domain": "expenditure"},
-                    {"domain": "financing"},
-                    {"domain": "macro"},
-                ]
+                "agents": [{"domain": key} for key in ORCHESTRATED_AGENT_KEYS],
+                "tool_agent": {
+                    "name": "Fiscal Simulation & RPC Tool Agent / Agen Simulasi & Kalkulasi Fiskal",
+                    "voting": False,
+                    "included_in_agents": False,
+                },
             },
         }
         instructions = (
-            "You are the SHCR Master Orchestrator. Read the scenario goal and all supplied "
-            "parameters, then return JSON only with an agents array containing EXACTLY FOUR "
-            "unique domain keys selected from revenue, expenditure, financing, treasury, macro. "
-            "Choose the four most relevant domains. Use domain roles State Revenue Specialist, "
-            "Government Expenditure Specialist, Budget Financing Specialist, and Macro-Fiscal "
-            "Stabilization Specialist when relevant. Do not return prose or any fifth agent."
+            "You are the SHCR Master Orchestrator. Read the active scenario goal and every supplied "
+            "parameter. Return JSON only with an agents array containing EXACTLY SEVEN unique "
+            "domain keys: revenue, expenditure, budget, financing, macro, fiscal_risk, and critic. "
+            "The roster roles are State Revenue Agent, Government Expenditure Agent, BudgetAgent, "
+            "Financing & Debt Agent, Macro-Fiscal Stabilization Agent, Fiscal Risk & Contingency "
+            "Agent, and Adversarial Fiscal Critic Agent. Do not include the Simulation/RPC Tool Agent "
+            "in the voting roster; it is a separate non-voting service. Do not return prose or any "
+            "other number of agents."
         )
         result = _create_completion_with_retry(
             OpenAI(
@@ -475,22 +485,21 @@ def _orchestrator_llm_domain_selection(
         content, _ = extract_llm_completion(result)
         parsed = extract_json_object(content)
         raw_agents = parsed.get("agents")
-        if not isinstance(raw_agents, list) or len(raw_agents) != 4:
-            raise ValueError("Orchestrator must return exactly four agents")
+        if not isinstance(raw_agents, list) or len(raw_agents) != 7:
+            raise ValueError("Orchestrator must return exactly seven agents")
         domains = [
             item.get("domain")
             for item in raw_agents
             if isinstance(item, dict) and isinstance(item.get("domain"), str)
         ]
-        if len(domains) != 4 or len(set(domains)) != 4:
-            raise ValueError("Orchestrator domains must be four unique known keys")
-        allowed_domains = {"revenue", "expenditure", "financing", "treasury", "macro"}
-        if set(domains) - allowed_domains:
-            raise ValueError("Orchestrator returned an unknown domain")
+        if len(domains) != 7 or len(set(domains)) != 7:
+            raise ValueError("Orchestrator domains must be seven unique known keys")
+        if set(domains) != set(ORCHESTRATED_AGENT_KEYS):
+            raise ValueError("Orchestrator returned an incomplete or unknown voting roster")
         return cast(list[str], domains), None
     except Exception as error:
         logger.warning(
-            "[WARNING] Orchestrator LLM unavailable or invalid; using deterministic four-agent selection (%s)",
+            "[WARNING] Orchestrator LLM unavailable or invalid; using deterministic seven-agent selection (%s)",
             type(error).__name__,
         )
         return fallback_domains, f"{type(error).__name__}: deterministic selection used"
@@ -896,6 +905,61 @@ class MandateSynthesisResponse(BaseModel):
         return value if isinstance(value, (str, list, dict)) else None
 
 
+def _mandate_json_repair_applied(raw_content: str) -> bool:
+    cleaned = raw_content.strip().lstrip("\ufeff")
+    if repair_json_trailing_commas(cleaned) != cleaned:
+        return True
+    try:
+        payload = json.loads(cleaned)
+    except json.JSONDecodeError:
+        return False
+    choices = payload.get("choices") if isinstance(payload, dict) else None
+    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+        return False
+    message = choices[0].get("message")
+    nested = message.get("content") if isinstance(message, dict) else None
+    return isinstance(nested, str) and repair_json_trailing_commas(nested) != nested
+
+
+def _recover_mandate_fields(raw_content: str) -> dict[str, Any]:
+    aliases = {
+        "scenario_mandate": ("scenario_mandate", "scenarioMandate", "mandate", "operating_mandate"),
+        "scenario_focus": ("scenario_focus", "scenarioFocus", "focus", "focus_areas"),
+        "priority_questions": ("priority_questions", "priorityQuestions", "questions", "key_questions"),
+        "required_evidence": ("required_evidence", "requiredEvidence", "evidence", "evidence_requirements"),
+        "epistemic_logic_traceability": ("epistemic_logic_traceability", "epistemicTraceability", "traceability", "auditability"),
+        "structured_consensus_protocol": ("structured_consensus_protocol", "structuredConsensusProtocol", "consensus_protocol", "disagreement_handling"),
+        "regulatory_compliance_alignment": ("regulatory_compliance_alignment", "regulatoryComplianceAlignment", "compliance_alignment", "regulatory_alignment"),
+    }
+    cleaned = repair_json_trailing_commas(raw_content.strip().lstrip("\ufeff"))
+    decoder = json.JSONDecoder()
+    recovered: dict[str, Any] = {}
+    for canonical, field_aliases in aliases.items():
+        key_pattern = "|".join(re.escape(alias) for alias in field_aliases)
+        match = re.search(
+            rf"(?i)[\"'](?:{key_pattern})[\"']\s*:\s*",
+            cleaned,
+        )
+        if match is None:
+            continue
+        remainder = cleaned[match.end() :].lstrip()
+        try:
+            value, _ = decoder.raw_decode(remainder)
+        except json.JSONDecodeError:
+            if remainder.startswith("'"):
+                scalar = re.match(r"'((?:\\.|[^'\\])*)'", remainder, flags=re.DOTALL)
+                value = scalar.group(1) if scalar else None
+            elif remainder.startswith("["):
+                closing = remainder.find("]")
+                fragment = remainder[: closing + 1] if closing >= 0 else remainder
+                value = re.findall(r"[\"']([^\"']+)[\"']", fragment)
+            else:
+                value = None
+        if isinstance(value, (str, list, dict)):
+            recovered[canonical] = value
+    return recovered
+
+
 def _validated_mandate_payload(payload: dict[str, Any]) -> MandateSynthesisResponse:
     unwrapped = _mandate_payload(payload)
     choices = unwrapped.get("choices")
@@ -1211,7 +1275,33 @@ def _synthesize_agent_domain_rules(agent: Agent, scenario: Scenario) -> AgentDom
             },
         )
         content, tokens = extract_llm_completion(response)
-        parsed = _validated_mandate_payload(extract_json_object(content))
+        repaired_trailing_commas = _mandate_json_repair_applied(content)
+        parse_error: MandateSynthesisError | None = None
+        try:
+            parsed = _validated_mandate_payload(extract_json_object(content))
+            if repaired_trailing_commas:
+                parse_error = MandateSynthesisError(
+                    code="INVALID_JSON",
+                    message="JSON trailing commas were repaired before validation",
+                    retryable=False,
+                )
+        except (ValueError, json.JSONDecodeError) as error:
+            logger.exception(
+                "Mandate synthesis returned malformed JSON for agent %s; attempting field-level repair",
+                agent.id,
+            )
+            recovered = _recover_mandate_fields(content)
+            parsed = _validated_mandate_payload(recovered)
+            parse_error = MandateSynthesisError(
+                code="INVALID_JSON",
+                message=f"{type(error).__name__}: response repaired field by field",
+                retryable=False,
+            )
+            logger.warning(
+                "Mandate synthesis JSON repaired for agent %s; recovered fields: %s",
+                agent.id,
+                ", ".join(sorted(recovered)) or "none (safe field defaults applied)",
+            )
         fallback_values = _synthesis_fallbacks(agent, scenario)
         scenario_mandate = _normalise_mandate_text(
             parsed.scenario_mandate,
@@ -1271,6 +1361,7 @@ def _synthesize_agent_domain_rules(agent: Agent, scenario: Scenario) -> AgentDom
                 "llm_model": config.model,
                 "latency_ms": (perf_counter() - started_at) * 1000,
                 "token_usage": tokens,
+                "error": parse_error,
             }
         )
     except Exception as error:

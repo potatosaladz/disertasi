@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+import hashlib
 import json
 import math
 import os
@@ -10,19 +11,44 @@ from .core_algorithms import (
 )
 from .sanitization import sanitize_public_dict
 
-SIMULATION_AGENT_KEY = "native_simulation_agent"
-SIMULATION_AGENT_NAME = "Simulation Agent / Arbiter Simulasi Makro-Fiskal"
-SIMULATION_AGENT_ROLE = "Arbiter Simulasi Makro-Fiskal"
-SIMULATION_AGENT_VERSION = "native-simulation-v1"
+SIMULATION_AGENT_KEY = "fiscal_simulation_rpc_tool"
+SIMULATION_AGENT_NAME = "Fiscal Simulation & RPC Tool Agent / Agen Simulasi & Kalkulasi Fiskal"
+SIMULATION_AGENT_ROLE = "Non-voting deterministic fiscal simulation and calculation service"
+SIMULATION_AGENT_VERSION = "fiscal-simulation-rpc-v1"
+SIMULATION_RPC_PROTOCOL_VERSION = "1"
+SIMULATION_RPC_TOOLS = (
+    "fiscal.calculate_baseline",
+    "fiscal.compare_deficit_alternatives",
+    "fiscal.calculate_cash_headroom",
+)
+SIMULATION_RPC_TOOL_MANIFEST = {
+    "fiscal.calculate_baseline": {
+        "purpose": "Calculate program-cost coverage, recognized financing, gap, and surplus.",
+        "required_inputs": ["program_cost"],
+    },
+    "fiscal.compare_deficit_alternatives": {
+        "purpose": "Compare supplied alternative deficit ratios with the statutory ceiling.",
+        "required_inputs": ["peer_outputs[].srr.alternatives[].deficit"],
+    },
+    "fiscal.calculate_cash_headroom": {
+        "purpose": "Calculate projected cash headroom over the verified operational minimum.",
+        "required_inputs": [
+            "verified_projected_cash_after_policy",
+            "verified_operational_cash_minimum",
+        ],
+    },
+}
 SIMULATION_TRIGGER = "Simulation Agent Requested"
 SIMULATION_SOURCE_TAG = "SIMULATION_MODELLED"
 MAX_SIMULATION_ROUNDS = 3
 
 SIMULATION_AGENT_MANDATE = """MANDATE:
+- Expose a strict RPC-style interface for deterministic fiscal baseline, deficit-ceiling, financing-identity, and cash-headroom calculations.
 - Act as the neutral macro-fiscal simulation arbiter when sectoral agents reach a decision deadlock.
+- Accept calls only through the allowlisted fiscal.calculate_baseline, fiscal.compare_deficit_alternatives, and fiscal.calculate_cash_headroom methods.
+- Return calculation status, input hash, outputs, limitations, decision_authority=false, vote_eligible=false, and car_eligible=false for every RPC call.
 - Reproduce competing sectoral positions inside one explicit, inspectable accounting sandbox before proposing a resolution.
-- Bridge dissent by exposing where positions differ and which differences are evidential rather than interpretive.
-- Never convert a modelled outcome into legal authority, realized revenue, or verified fiscal space.
+- Never convert a modelled outcome into legal authority, realized revenue, verified fiscal space, a vote, or a CAR verdict.
 
 PRIMARY SOURCES:
 - UU17_2003_P12 (statutory deficit ceiling)
@@ -107,6 +133,7 @@ def build_simulation_system_prompt() -> str:
         "DDR invokes you automatically when sectoral agents disagree on predictions. Arbitrate through "
         "explicit simulation rather than advocacy.\n\n"
         f"{SIMULATION_AGENT_MANDATE}\n\n"
+        f"RPC TOOL MANIFEST:\n{json.dumps(SIMULATION_RPC_TOOL_MANIFEST, ensure_ascii=False, sort_keys=True)}\n\n"
         f"{SIMULATION_OUTPUT_CONTRACT}\n\n"
         f"{SRR_OUTPUT_INSTRUCTIONS}"
     )
@@ -159,6 +186,181 @@ def build_simulation_consensus_prompt(
 
 def sanitize_simulation_payload(payload: dict[str, Any]) -> dict[str, Any]:
     return sanitize_public_dict(payload)
+
+
+def _finite_number(value: object) -> float | None:
+    if (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(float(value))
+    ):
+        return float(value)
+    return None
+
+
+def _rpc_result(
+    tool_name: str,
+    inputs: Mapping[str, Any],
+    *,
+    status: str,
+    calculation: Mapping[str, Any],
+    limitations: Sequence[str],
+) -> dict[str, Any]:
+    safe_inputs = sanitize_public_dict(dict(inputs))
+    inputs_hash = hashlib.sha256(
+        json.dumps(safe_inputs, ensure_ascii=False, sort_keys=True).encode()
+    ).hexdigest()
+    return {
+        "protocol_version": SIMULATION_RPC_PROTOCOL_VERSION,
+        "agent_name": SIMULATION_AGENT_NAME,
+        "tool_name": tool_name,
+        "status": status,
+        "inputs_hash": inputs_hash,
+        "calculation": dict(calculation),
+        "limitations": list(limitations),
+        "decision_authority": False,
+        "vote_eligible": False,
+        "car_eligible": False,
+    }
+
+
+def invoke_fiscal_simulation_rpc(
+    tool_name: str,
+    *,
+    scenario_description: str,
+    simulation_payload: Mapping[str, Any],
+    peer_outputs: Sequence[Mapping[str, Any]] = (),
+) -> dict[str, Any]:
+    if tool_name not in SIMULATION_RPC_TOOLS:
+        raise ValueError(f"Unknown fiscal simulation RPC tool: {tool_name}")
+    inputs = {
+        "scenario_description": scenario_description,
+        "simulation_payload": dict(simulation_payload),
+        "peer_outputs": list(peer_outputs),
+    }
+    if tool_name == "fiscal.calculate_baseline":
+        program_cost = _finite_number(simulation_payload.get("program_cost"))
+        source_fields = (
+            "proposed_reallocation",
+            "proposed_additional_revenue",
+            "proposed_debt_financing",
+            "proposed_sal_use",
+            "proposed_other_financing",
+        )
+        supplied_sources = {
+            field: number
+            for field in source_fields
+            if (number := _finite_number(simulation_payload.get(field))) is not None
+        }
+        if program_cost is None:
+            return _rpc_result(
+                tool_name,
+                inputs,
+                status="not_calculated",
+                calculation={},
+                limitations=("Program cost is required for the financing baseline.",),
+            )
+        recognized_financing = sum(supplied_sources.values())
+        return _rpc_result(
+            tool_name,
+            inputs,
+            status="calculated",
+            calculation={
+                "method": "direct-financing-identity",
+                "program_cost": program_cost,
+                "recognized_financing": recognized_financing,
+                "financing_gap": max(0.0, program_cost - recognized_financing),
+                "financing_surplus": max(0.0, recognized_financing - program_cost),
+                "source_components": supplied_sources,
+            },
+            limitations=(
+                "Missing financing components are not inferred.",
+                "The result is arithmetic only and is not a CAR determination.",
+            ),
+        )
+    if tool_name == "fiscal.calculate_cash_headroom":
+        projected_cash = _finite_number(
+            simulation_payload.get("verified_projected_cash_after_policy")
+        )
+        minimum_cash = _finite_number(
+            simulation_payload.get("verified_operational_cash_minimum")
+        )
+        if projected_cash is None or minimum_cash is None:
+            return _rpc_result(
+                tool_name,
+                inputs,
+                status="not_calculated",
+                calculation={},
+                limitations=(
+                    "Verified projected cash and operational minimum are both required.",
+                ),
+            )
+        return _rpc_result(
+            tool_name,
+            inputs,
+            status="calculated",
+            calculation={
+                "method": "projected-cash-minus-operational-minimum",
+                "projected_cash_after_policy": projected_cash,
+                "operational_cash_minimum": minimum_cash,
+                "cash_headroom": projected_cash - minimum_cash,
+            },
+            limitations=("Cash timing and source provenance require independent verification.",),
+        )
+    alternatives: list[dict[str, Any]] = []
+    for peer in peer_outputs:
+        srr = peer.get("srr")
+        if not isinstance(srr, Mapping):
+            continue
+        raw_alternatives = srr.get("alternatives")
+        if not isinstance(raw_alternatives, Sequence):
+            continue
+        for alternative in raw_alternatives:
+            if not isinstance(alternative, Mapping):
+                continue
+            deficit = _finite_number(alternative.get("deficit"))
+            if deficit is None:
+                continue
+            alternatives.append(
+                {
+                    "name": str(alternative.get("name") or "Unnamed alternative"),
+                    "projected_deficit_percent_gdp": deficit,
+                    "within_statutory_ceiling": (
+                        deficit <= STATUTORY_DEFICIT_CEILING_PERCENT_GDP
+                    ),
+                }
+            )
+    return _rpc_result(
+        tool_name,
+        inputs,
+        status="calculated" if alternatives else "not_calculated",
+        calculation={
+            "method": "direct-statutory-threshold-comparison",
+            "ceiling_percent_gdp": STATUTORY_DEFICIT_CEILING_PERCENT_GDP,
+            "alternatives": alternatives,
+        },
+        limitations=(
+            "Alternative deficits originate in sectoral outputs and remain modelled until verified.",
+            "Threshold comparison is not a CAR verdict or authorization.",
+        ),
+    )
+
+
+def invoke_fiscal_simulation_rpc_suite(
+    *,
+    scenario_description: str,
+    simulation_payload: Mapping[str, Any],
+    peer_outputs: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    return [
+        invoke_fiscal_simulation_rpc(
+            tool_name,
+            scenario_description=scenario_description,
+            simulation_payload=simulation_payload,
+            peer_outputs=peer_outputs,
+        )
+        for tool_name in SIMULATION_RPC_TOOLS
+    ]
 
 
 def build_deterministic_simulation(

@@ -28,6 +28,7 @@ from backend.simulation_agent import (
     build_native_simulation_agent,
     build_simulation_consensus_prompt,
     build_simulation_system_prompt,
+    invoke_fiscal_simulation_rpc,
     sanitize_simulation_payload,
 )
 from worker.car_solver import evaluate_car_constraints
@@ -54,6 +55,22 @@ def test_extract_json_object_cleans_markdown_and_surrounding_text() -> None:
     assert extract_json_object('Result follows: {"status": "ok"} done') == {"status": "ok"}
     with pytest.raises(ValueError, match="does not contain"):
         extract_json_object("not-json")
+
+
+def test_extract_json_object_repairs_fences_and_trailing_commas() -> None:
+    assert extract_json_object(
+        'Prose before\n```json\n{"status":"ok","items":[1,2,],}\n```\nprose after'
+    ) == {"status": "ok", "items": [1, 2]}
+    assert extract_json_object('{"text":"literal ,} remains",}') == {
+        "text": "literal ,} remains"
+    }
+
+
+def test_extract_json_object_does_not_adopt_nested_object_from_malformed_parent() -> None:
+    with pytest.raises(ValueError, match="does not contain"):
+        extract_json_object(
+            '{"scenario_mandate":"wanted" "meta":{"status":"nested"}}'
+        )
 
 
 def test_llm_headers_and_completion_extraction() -> None:
@@ -166,6 +183,53 @@ def test_native_simulation_agent_is_hardcoded_and_prompted_for_safe_arbitration(
     assert "Do not reveal hidden chain-of-thought" in system_prompt
     assert "modelled evidence" in follow_up_prompt
     assert "preserve valid dissent" in follow_up_prompt.lower()
+
+
+def test_fiscal_simulation_rpc_is_non_voting_and_deterministic() -> None:
+    result = invoke_fiscal_simulation_rpc(
+        "fiscal.calculate_baseline",
+        scenario_description="Fund a targeted programme",
+        simulation_payload={
+            "program_cost": 100.0,
+            "proposed_reallocation": 25.0,
+            "proposed_additional_revenue": 30.0,
+            "proposed_debt_financing": 20.0,
+        },
+    )
+
+    assert result["status"] == "calculated"
+    assert result["calculation"]["recognized_financing"] == 75.0
+    assert result["calculation"]["financing_gap"] == 25.0
+    assert result["decision_authority"] is False
+    assert result["vote_eligible"] is False
+    assert result["car_eligible"] is False
+    repeated = invoke_fiscal_simulation_rpc(
+        "fiscal.calculate_baseline",
+        scenario_description="Fund a targeted programme",
+        simulation_payload={
+            "program_cost": 100.0,
+            "proposed_reallocation": 25.0,
+            "proposed_additional_revenue": 30.0,
+            "proposed_debt_financing": 20.0,
+        },
+    )
+    assert repeated == result
+
+
+def test_fiscal_simulation_rpc_rejects_unknown_tool_and_missing_inputs() -> None:
+    with pytest.raises(ValueError, match="Unknown fiscal simulation RPC tool"):
+        invoke_fiscal_simulation_rpc(
+            "fiscal.execute_arbitrary_code",
+            scenario_description="Invalid tool",
+            simulation_payload={},
+        )
+    result = invoke_fiscal_simulation_rpc(
+        "fiscal.calculate_cash_headroom",
+        scenario_description="Cash test",
+        simulation_payload={"verified_projected_cash_after_policy": 20.0},
+    )
+    assert result["status"] == "not_calculated"
+    assert result["calculation"] == {}
 
 
 def test_deterministic_simulation_filters_hard_constraint_and_tags_outputs() -> None:

@@ -115,32 +115,90 @@ def build_agent_system_prompt(
     return "\n\n".join(sections)
 
 
+def repair_json_trailing_commas(value: str) -> str:
+    result: list[str] = []
+    in_string = False
+    escaped = False
+    index = 0
+    while index < len(value):
+        character = value[index]
+        if in_string:
+            result.append(character)
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+            index += 1
+            continue
+        if character == '"':
+            in_string = True
+            result.append(character)
+            index += 1
+            continue
+        if character == ",":
+            next_index = index + 1
+            while next_index < len(value) and value[next_index].isspace():
+                next_index += 1
+            if next_index < len(value) and value[next_index] in "}]":
+                index += 1
+                continue
+        result.append(character)
+        index += 1
+    return "".join(result)
+
+
+def _balanced_json_objects(value: str) -> list[str]:
+    candidates: list[str] = []
+    start: int | None = None
+    depth = 0
+    in_string = False
+    escaped = False
+    for index, character in enumerate(value):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+            continue
+        if character == '"':
+            in_string = True
+        elif character == "{":
+            if depth == 0:
+                start = index
+            depth += 1
+        elif character == "}" and depth:
+            depth -= 1
+            if depth == 0 and start is not None:
+                candidates.append(value[start : index + 1])
+                start = None
+    return candidates
+
+
 def extract_json_object(raw_content: str) -> dict[str, Any]:
     cleaned = raw_content.strip().lstrip("\ufeff")
-    fenced = re.fullmatch(
+    fenced = re.search(
         r"```(?:json)?\s*(.*?)\s*```",
         cleaned,
         flags=re.IGNORECASE | re.DOTALL,
     )
     if fenced:
         cleaned = fenced.group(1).strip()
-    try:
-        payload = json.loads(cleaned)
-    except json.JSONDecodeError:
-        payload = None
-        decoder = json.JSONDecoder()
-        for match in re.finditer(r"\{", cleaned):
-            try:
-                candidate, _ = decoder.raw_decode(cleaned[match.start() :])
-            except json.JSONDecodeError:
-                continue
-            if isinstance(candidate, dict):
-                payload = candidate
-                break
-        if payload is None:
-            raise ValueError("LLM response does not contain a valid JSON object")
-    if not isinstance(payload, dict):
-        raise ValueError(f"Expected a JSON object, received {type(payload).__name__}")
+    candidates = [cleaned, *_balanced_json_objects(cleaned)]
+    payload: dict[str, Any] | None = None
+    for candidate in dict.fromkeys(candidates):
+        try:
+            parsed = json.loads(repair_json_trailing_commas(candidate))
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            payload = parsed
+            break
+    if payload is None:
+        raise ValueError("LLM response does not contain a valid JSON object")
     choices = payload.get("choices")
     if isinstance(choices, Sequence) and not isinstance(choices, (str, bytes)) and choices:
         choice = choices[0]

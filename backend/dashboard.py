@@ -9,6 +9,8 @@ from sqlalchemy import select
 from sqlalchemy.orm import aliased
 
 from .agent_templates import (
+    ORCHESTRATED_AGENT_KEYS,
+    agent_domain_key,
     agent_revision,
     agent_utility_metadata,
     ensure_phase_one_specialists,
@@ -1210,10 +1212,12 @@ def start_run(
         if scenario is None:
             raise HTTPException(status_code=404, detail="Scenario not found")
         agents, orchestration = ensure_phase_one_specialists(session, scenario)
-        if len(agents) < 2:
+        if [agent_domain_key(agent) for agent in agents] != list(
+            ORCHESTRATED_AGENT_KEYS
+        ):
             raise HTTPException(
                 status_code=409,
-                detail="At least two configured agents are required for deliberation",
+                detail="Exactly seven canonical voting agents are required for deliberation",
             )
         current_revision = agent_revision(agents, scenario)
         mandate_snapshot = session.scalar(

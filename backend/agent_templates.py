@@ -185,8 +185,50 @@ AGENTS: list[AgentSpec] = [
         ),
     ),
     AgentSpec(
+        key="budget",
+        name="BudgetAgent / Anggaran Pemerintah",
+        mandate=(
+            "Evaluate aggregate budget architecture, appropriation consistency, fiscal-space allocation, "
+            "and the internal consistency between policy cost, funding sources, and the enacted APBN posture."
+        ),
+        primary_sources=("UUD45_P23_23A_31", "UU17_2003_P12", "UU17_2025_POSTURE", "UU1_2004_P3"),
+        owned_checks=("BUDGET_IDENTITY", "APPROPRIATION_AVAILABLE", "DEFICIT_3PCT"),
+        parameters=(
+            "2026 enacted revenue, expenditure, deficit, and financing posture",
+            "proposed programme cost and duration supplied by the active scenario",
+            "verified reallocation and financing capacity supplied externally",
+        ),
+        constraints=(
+            "Every proposed cost must map to an identified and legally usable funding source.",
+            "Budget arithmetic must reconcile before a policy can advance.",
+            "The statutory deficit ceiling remains non-overridable.",
+        ),
+        impact_dimensions=(
+            "aggregate APBN balance",
+            "appropriation consistency",
+            "funding-source composition",
+            "remaining fiscal space",
+        ),
+        risk_dimensions=(
+            "unfunded policy cost",
+            "double-counted financing",
+            "appropriation mismatch",
+            "erosion of fiscal buffer",
+        ),
+        uncertainty_dimensions=(
+            "timing of appropriations and disbursement",
+            "availability of proposed offsets",
+            "classification of financing sources",
+        ),
+        decision_principles=(
+            "Reject unreconciled budget arithmetic.",
+            "Treat unverified resources as unavailable.",
+            "Keep legal compliance separate from policy preference.",
+        ),
+    ),
+    AgentSpec(
         key="financing",
-        name="Budget Financing & Debt Agent / Pembiayaan Anggaran",
+        name="Financing & Debt Agent / Pembiayaan Pemerintah",
         mandate=(
             "Evaluate the APBN deficit, additional financing identity, financing gap, debt-financing authority, and borrowing "
             "sustainability without substituting unrelated debt statistics for a legal definition."
@@ -233,49 +275,87 @@ AGENTS: list[AgentSpec] = [
         ),
     ),
     AgentSpec(
-        key="treasury",
-        name="Treasury & Fiscal Liquidity Agent / Perbendaharaan dan Kas Negara",
+        key="fiscal_risk",
+        name="Fiscal Risk & Contingency Agent / Manajemen Risiko Fiskal",
         mandate=(
-            "Protect the Government's ability to meet payment obligations, evaluate SAL use, cash availability, purpose-specific "
-            "approval, timing of inflows/outflows, and operational cash requirements. Never invent a SAL floor."
+            "Evaluate contingent liabilities, guarantees, state-owned enterprise and public-private partnership exposures, "
+            "structural fiscal risks, stress buffers, and SAL drawdown implications. Separate quantified exposure from "
+            "unquantified risk and never invent probabilities or liability values."
         ),
-        primary_sources=("UU17_2025_P27", "UU17_2025_P28", "UU17_2025_P42", "PMK44_2024_CASH"),
-        owned_checks=("SAL_AVAILABILITY", "SAL_AUTHORITY", "OPERATIONAL_CASH_MINIMUM"),
+        primary_sources=("UU17_2025_POSTURE", "UU17_2025_P27", "UU17_2025_P28", "UU17_2025_P42"),
+        owned_checks=("CONTINGENT_LIABILITY_DISCLOSURE", "FISCAL_RISK_BUFFER", "SAL_RISK_AUTHORITY"),
         parameters=(
-            "verified available SAL supplied externally; otherwise UNKNOWN",
-            "verified operational cash minimum/projected cash supplied externally; otherwise UNKNOWN",
-            "SAL purpose: cash management / cover deficit / SBN market stabilization / other",
-            "Minister of Finance authorization and DPR approval evidence supplied externally",
+            "contingent liabilities and guarantees only when supplied with evidence",
+            "verified SAL availability and purpose-specific approvals",
+            "structural fiscal risk indicators and exposure horizons",
         ),
         constraints=(
-            "No hard-coded 1.5%-of-revenue SAL floor.",
-            "SAL use cannot exceed verified availability.",
-            "SBN-market-stabilization SAL use requires DPR approval under Article 27.",
-            "Other purpose-specific SAL approval rules follow Article 28.",
-            "Cash management must preserve sufficient access to cash and consider operational minimum/risk.",
+            "Do not fabricate contingent-liability values or probabilities.",
+            "SAL risk mitigation remains subject to verified availability and legal authority.",
+            "A contingent exposure is not automatically a realized deficit.",
         ),
         impact_dimensions=(
-            "verified SAL remaining after the proposal",
-            "projected cash position relative to a verified operational minimum",
-            "timing/concentration of payment outflows",
-            "continuity of government payment obligations",
+            "potential fiscal exposure and timing",
+            "risk-buffer adequacy",
+            "SAL drawdown and liquidity interaction",
+            "structural sustainability under adverse scenarios",
         ),
         risk_dimensions=(
-            "cash shortfall or timing mismatch",
-            "SAL overuse or use without required authority",
-            "concentration of large outflows before inflows",
-            "payment-continuity risk",
+            "called guarantees and contingent liabilities",
+            "state-owned enterprise or PPP exposure",
+            "structural revenue or expenditure shock",
+            "cascading liquidity and fiscal-buffer depletion",
         ),
         uncertainty_dimensions=(
-            "actual available SAL",
-            "cash-flow forecast after the policy",
-            "operational minimum cash requirement",
-            "payment calendar and timing of revenue inflows",
+            "exposure valuation and crystallization timing",
+            "probability and severity where evidence is absent",
+            "correlation between fiscal shocks",
         ),
         decision_principles=(
-            "Reject SAL use that exceeds verified availability or lacks a required hard authorization.",
-            "Condition support when cash sufficiency cannot be evaluated because core cash evidence is missing.",
-            "Phasing is a possible risk mitigation, not an invented statutory requirement or fixed quarterly rule.",
+            "Escalate material unquantified exposures as uncertainty, not as fabricated point estimates.",
+            "Condition recommendations on disclosure and risk-buffer evidence.",
+            "Never treat SAL as available without verified balances and authorization.",
+        ),
+    ),
+    AgentSpec(
+        key="critic",
+        name="Adversarial Fiscal Critic Agent / Penelaah & Kritik Kebijakan Fiskal",
+        mandate=(
+            "Independently stress-test sectoral assumptions, detect optimistic bias and omitted downside cases, and test "
+            "legal enforceability. Challenge unsupported certainty without inventing contrary facts or overriding specialist evidence."
+        ),
+        primary_sources=("UUD45_P23_23A_31", "UU17_2003_P12", "UU17_2025_POSTURE", "UU1_2004_P3"),
+        owned_checks=("ASSUMPTION_FALSIFIABILITY", "LEGAL_ENFORCEABILITY", "DOWNSIDE_SENSITIVITY"),
+        parameters=(
+            "all scenario assumptions and source tags",
+            "sectoral predictions, recommendations, and uncertainty statements",
+            "applicable statutory authority and implementation prerequisites",
+        ),
+        constraints=(
+            "Criticism must cite a specific assumption, omission, or legal requirement.",
+            "Do not replace missing evidence with an adversarial guess.",
+            "The critic has no veto over statutory CAR or the documented sectoral record.",
+        ),
+        impact_dimensions=(
+            "robustness under downside sensitivity",
+            "legal and administrative enforceability",
+            "decision reversibility and failure conditions",
+        ),
+        risk_dimensions=(
+            "optimistic forecast bias",
+            "omitted implementation dependencies",
+            "unfunded downside exposure",
+            "unsupported legal interpretation",
+        ),
+        uncertainty_dimensions=(
+            "assumption sensitivity and parameter ranges",
+            "evidence gaps in optimistic forecasts",
+            "legal interpretation requiring authoritative review",
+        ),
+        decision_principles=(
+            "Present falsifiable counterarguments with sources or clearly label them as questions.",
+            "Preserve valid dissent and distinguish criticism from verified fact.",
+            "Do not substitute adversarial preference for CAR or legal authority.",
         ),
     ),
     AgentSpec(
@@ -336,12 +416,19 @@ MASTER_ORCHESTRATOR_TEMPLATE_KEY = "master_orchestrator"
 MASTER_ORCHESTRATOR_NAME = "Master_Orchestrator"
 MASTER_ORCHESTRATOR_ROLE = "Non-voting SHCR orchestration controller"
 MASTER_ORCHESTRATOR_MANDATE = (
-    "Read the active scenario goal and context, rank the supported fiscal domains, and return "
-    "exactly four unique specialist domains from revenue, expenditure, financing, treasury, and "
-    "macro. The normal specialist roster is State Revenue, Government Expenditure, Budget "
-    "Financing, and Macro-Fiscal Stabilization, with treasury substituted only when scenario "
-    "alignment warrants it. Coordinate only; never vote, receive RAR-DAI weight, or participate "
-    "in DDR."
+    "Read the active scenario goal and context and provision exactly seven voting specialists: "
+    "revenue, expenditure, budget, financing, macro, fiscal_risk, and critic. Coordinate only; "
+    "never vote, receive RAR-DAI weight, or participate in DDR. The Fiscal Simulation & RPC Tool "
+    "Agent is a separate non-voting callable service and is not counted in the seven specialists."
+)
+ORCHESTRATED_AGENT_KEYS = (
+    "revenue",
+    "expenditure",
+    "budget",
+    "financing",
+    "macro",
+    "fiscal_risk",
+    "critic",
 )
 def _domain_patterns(*terms: str) -> tuple[re.Pattern[str], ...]:
     return tuple(
@@ -353,9 +440,11 @@ def _domain_patterns(*terms: str) -> tuple[re.Pattern[str], ...]:
 _DOMAIN_GAP_PATTERNS: dict[str, tuple[re.Pattern[str], ...]] = {
     "revenue": _domain_patterns("revenue", "tax", "pnbp", "penerimaan", "pajak", "cukai"),
     "expenditure": _domain_patterns("expenditure", "spending", "belanja", "education", "pendidikan"),
+    "budget": _domain_patterns("budget", "apbn", "appropriation", "anggaran", "alokasi"),
     "financing": _domain_patterns("financing", "debt", "deficit", "pembiayaan", "utang", "defisit"),
-    "treasury": _domain_patterns("treasury", "liquidity", "cash", "sal", "kas", "likuiditas"),
     "macro": _domain_patterns("macro", "inflation", "growth", "exchange rate", "makro", "inflasi", "pertumbuhan", "nilai tukar", "stabilization"),
+    "fiscal_risk": _domain_patterns("fiscal risk", "contingent", "guarantee", "sal", "risiko fiskal", "kontinjensi", "jaminan"),
+    "critic": _domain_patterns("risk", "assumption", "legal", "bias", "risiko", "asumsi", "hukum", "kritik"),
 }
 _AGENT_SPECS_BY_KEY: dict[str, AgentSpec] = {agent.key: agent for agent in AGENTS}
 _DOMAIN_SCENARIO_FIELDS: dict[str, tuple[str, ...]] = {
@@ -381,6 +470,14 @@ _DOMAIN_SCENARIO_FIELDS: dict[str, tuple[str, ...]] = {
         "output_outcome_documented",
         "domestic_product_compliance_documented",
     ),
+    "budget": (
+        "program_cost",
+        "proposed_reallocation",
+        "appropriation_available",
+        "verified_reallocation_capacity",
+        "proposed_additional_revenue",
+        "proposed_debt_financing",
+    ),
     "financing": (
         "proposed_debt_financing",
         "debt_financing_mode",
@@ -388,15 +485,6 @@ _DOMAIN_SCENARIO_FIELDS: dict[str, tuple[str, ...]] = {
         "verified_debt_financing_headroom",
         "verified_cumulative_borrowing_pct_gdp",
         "dpr_additional_sbn_approval_obtained",
-    ),
-    "treasury": (
-        "proposed_sal_use",
-        "sal_purpose",
-        "verified_sal_available",
-        "verified_operational_cash_minimum",
-        "verified_projected_cash_after_policy",
-        "finance_minister_sal_authorized",
-        "dpr_sal_approval_obtained",
     ),
     "macro": (
         "growth_outlook",
@@ -406,6 +494,26 @@ _DOMAIN_SCENARIO_FIELDS: dict[str, tuple[str, ...]] = {
         "icp_outlook",
         "oil_lifting_outlook",
         "gas_lifting_outlook",
+    ),
+    "fiscal_risk": (
+        "proposed_sal_use",
+        "sal_purpose",
+        "verified_sal_available",
+        "verified_operational_cash_minimum",
+        "verified_projected_cash_after_policy",
+        "verified_cumulative_borrowing_pct_gdp",
+        "finance_minister_sal_authorized",
+        "dpr_sal_approval_obtained",
+    ),
+    "critic": (
+        "program_cost",
+        "duration_months",
+        "evaluation_trigger",
+        "verified_reallocation_capacity",
+        "verified_revenue_offset_capacity",
+        "verified_debt_financing_headroom",
+        "growth_outlook",
+        "inflation_outlook",
     ),
 }
 
@@ -424,17 +532,16 @@ _DOMAIN_EVIDENCE_FIELDS: dict[str, tuple[str, ...]] = {
         "output_outcome_documented",
         "domestic_product_compliance_documented",
     ),
+    "budget": (
+        "appropriation_available",
+        "verified_reallocation_capacity",
+        "verified_revenue_offset_capacity",
+        "verified_debt_financing_headroom",
+    ),
     "financing": (
         "verified_debt_financing_headroom",
         "verified_cumulative_borrowing_pct_gdp",
         "dpr_additional_sbn_approval_obtained",
-    ),
-    "treasury": (
-        "verified_sal_available",
-        "verified_operational_cash_minimum",
-        "verified_projected_cash_after_policy",
-        "finance_minister_sal_authorized",
-        "dpr_sal_approval_obtained",
     ),
     "macro": (
         "growth_outlook",
@@ -445,14 +552,32 @@ _DOMAIN_EVIDENCE_FIELDS: dict[str, tuple[str, ...]] = {
         "oil_lifting_outlook",
         "gas_lifting_outlook",
     ),
+    "fiscal_risk": (
+        "verified_sal_available",
+        "verified_operational_cash_minimum",
+        "verified_projected_cash_after_policy",
+        "verified_cumulative_borrowing_pct_gdp",
+        "finance_minister_sal_authorized",
+        "dpr_sal_approval_obtained",
+    ),
+    "critic": (
+        "appropriation_available",
+        "verified_reallocation_capacity",
+        "verified_revenue_offset_capacity",
+        "verified_debt_financing_headroom",
+        "output_outcome_documented",
+        "domestic_product_compliance_documented",
+    ),
 }
 
 _SEMANTIC_AGENT_NAMES = {
     "revenue": "Dynamic_Revenue_Validator",
     "expenditure": "Dynamic_Expenditure_Reviewer",
+    "budget": "Dynamic_Budget_Reviewer",
     "financing": "Dynamic_Fiscal_Reviewer",
-    "treasury": "Dynamic_Treasury_Guardian",
     "macro": "Dynamic_Macro_Fiscal_Analyst",
+    "fiscal_risk": "Dynamic_Fiscal_Risk_Analyst",
+    "critic": "Dynamic_Adversarial_Fiscal_Critic",
 }
 
 
@@ -496,11 +621,13 @@ def agent_utility_metadata(agent: Agent, *, source: str, result: str) -> dict[st
         else f"Evaluate the active scenario from the {agent.role} mandate."
     )
     why_by_template = {
-        "financing": "Mencegah bias LLM tunggal pada evaluasi defisit dan pembiayaan.",
         "revenue": "Memisahkan penerimaan terverifikasi dari proyeksi LLM yang belum terealisasi.",
         "expenditure": "Menjaga legalitas, kualitas, dan prioritas belanja dalam proses kolektif.",
-        "treasury": "Menjaga likuiditas kas dan otoritas pembiayaan agar tidak diasumsikan oleh LLM.",
+        "budget": "Memastikan identitas anggaran, appropriasi, biaya, dan sumber pendanaan konsisten.",
+        "financing": "Menjaga pembiayaan, defisit, dan risiko utang tetap terverifikasi.",
         "macro": "Mengisolasi asumsi makro dan ketidakpastian transmisi dari fakta fiskal terverifikasi.",
+        "fiscal_risk": "Mengungkap kewajiban kontinjensi, risiko struktural, dan tekanan buffer fiskal.",
+        "critic": "Menguji bias optimistis, asumsi rapuh, dan enforceability hukum secara adversarial.",
     }
     return {
         "task": task,
@@ -700,13 +827,23 @@ def scenario_deliberative_agents(
     scenario_id: int,
 ) -> list[Agent]:
     scoped_agents = scenario_scoped_agents(session, scenario_id)
+    global_agents = global_deliberative_agents(session)
+    preferred_by_key: dict[str, Agent] = {}
+    for agent in [*global_agents, *scoped_agents]:
+        key = agent_domain_key(agent)
+        if key not in ORCHESTRATED_AGENT_KEYS:
+            continue
+        preferred_by_key[key] = agent
+    if preferred_by_key:
+        return [
+            preferred_by_key[key]
+            for key in ORCHESTRATED_AGENT_KEYS
+            if key in preferred_by_key
+        ]
     has_scoped_template_set = any(
         agent.template_key is not None for agent in scoped_agents
     )
-    if has_scoped_template_set:
-        return scoped_agents
-    global_agents = global_deliberative_agents(session)
-    return [*global_agents, *scoped_agents]
+    return scoped_agents if has_scoped_template_set else [*global_agents, *scoped_agents]
 
 
 def get_or_create_master_orchestrator(
@@ -823,8 +960,7 @@ def orchestrated_scenario_agent_plan(
             "verified_evidence_completeness": completeness,
             "orchestration_score": score,
         }
-    ordered = sorted(domain_scores, key=lambda key: (-domain_scores[key], key))
-    selected_domains = ordered[:4]
+    selected_domains = list(ORCHESTRATED_AGENT_KEYS)
     weights = {
         domain: calculate_orchestrator_rar_dai_weights(
             metrics[domain]["domain_alignment"],
@@ -844,22 +980,13 @@ def ensure_phase_one_specialists(
     )
     scoped_agents = scenario_scoped_agents(session, scenario.id)
     global_agents = global_deliberative_agents(session)
-    has_scenario_templates = any(agent.template_key is not None for agent in scoped_agents)
-    coverage_agents = scoped_agents if has_scenario_templates else global_agents
     existing_by_key = {
-        agent_domain_key(agent): agent
-        for agent in coverage_agents
-        if agent_domain_key(agent) is not None
+        domain: agent
+        for agent in [*global_agents, *scoped_agents]
+        if (domain := agent_domain_key(agent)) in ORCHESTRATED_AGENT_KEYS
     }
-    selected_domains = (
-        [
-            domain
-            for agent in scoped_agents
-            if (domain := agent_domain_key(agent)) is not None
-        ]
-        if has_scenario_templates
-        else detected_scenario_domains(scenario)
-    )
+    detected_domains = detected_scenario_domains(scenario)
+    selected_domains = list(ORCHESTRATED_AGENT_KEYS)
     _, orchestration_plan = orchestrated_scenario_agent_plan(scenario)
     created_specialists: list[Agent] = []
     reused_specialists: list[Agent] = []
@@ -924,11 +1051,14 @@ def ensure_phase_one_specialists(
             reused_specialists.append(specialist)
     session.flush()
     participants = scenario_deliberative_agents(session, scenario.id)
+    participant_domains = [agent_domain_key(agent) for agent in participants]
+    if participant_domains != list(ORCHESTRATED_AGENT_KEYS):
+        raise ValueError("Phase-one provisioning requires the canonical seven-agent voting roster")
     return participants, {
         "orchestrator_id": orchestrator.id,
         "orchestrator_name": orchestrator.name,
         "orchestrator_created": orchestrator_created,
-        "detected_domains": selected_domains,
+        "detected_domains": detected_domains,
         "selected_domains": selected_domains,
         "created_specialist_ids": [agent.id for agent in created_specialists],
         "reused_specialist_ids": [agent.id for agent in reused_specialists],
@@ -954,8 +1084,8 @@ def orchestrate_scenario_agents(
     session.flush()
     planned_domains, orchestration_plan = orchestrated_scenario_agent_plan(scenario)
     domains = selected_domains or planned_domains
-    if len(domains) != 4 or len(set(domains)) != 4:
-        raise ValueError("Orchestration requires exactly four unique domains")
+    if len(domains) != 7 or len(set(domains)) != 7:
+        raise ValueError("Orchestration requires exactly seven unique voting domains")
     unknown_domains = set(domains) - set(_AGENT_SPECS_BY_KEY)
     if unknown_domains:
         raise ValueError(f"Unknown orchestration domains: {sorted(unknown_domains)}")
@@ -985,8 +1115,8 @@ def orchestrate_scenario_agents(
         session.add(agent)
         agents.append(agent)
     session.flush()
-    if len(agents) != 4 or len({agent.agent_uuid for agent in agents}) != 4:
-        raise ValueError("Orchestration failed to persist four unique agents")
+    if len(agents) != 7 or len({agent.agent_uuid for agent in agents}) != 7:
+        raise ValueError("Orchestration failed to persist seven unique voting agents")
     return agents, {
         "selected_domains": domains,
         "selection_metrics": orchestration_plan["metrics"],

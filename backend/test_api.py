@@ -12,10 +12,12 @@ from sqlalchemy import delete, select
 from backend.celery_client import celery_client
 from backend.agent_templates import (
     MASTER_ORCHESTRATOR_NAME,
+    ORCHESTRATED_AGENT_KEYS,
     STANDARD_APBN_AGENT_TEMPLATES,
     agent_revision,
     ensure_phase_one_specialists,
     orchestrated_scenario_agent_plan,
+    scenario_deliberative_agents,
 )
 from backend.dashboard import _disagreement_payload, _polling_contract
 from backend.database import SessionLocal
@@ -349,50 +351,88 @@ def test_master_orchestrator_is_singleton_and_reuses_gap_specialist() -> None:
         assert orchestrators[0].name == MASTER_ORCHESTRATOR_NAME
         assert orchestrators[0].is_orchestrator is True
         assert first["orchestrator_id"] == second["orchestrator_id"]
-        assert first["created_specialist_ids"] == []
+        assert len(first["created_specialist_ids"]) == 6
         assert macro.id in first["reused_specialist_ids"]
-        assert [agent.id for agent in participants] == [macro.id]
-        assert [agent.id for agent in participants_again] == [macro.id]
+        assert [agent.template_key or agent.specialist_domain for agent in participants] == list(
+            ORCHESTRATED_AGENT_KEYS
+        )
+        assert [agent.id for agent in participants] == [agent.id for agent in participants_again]
         assert orchestrators[0].id not in [agent.id for agent in participants]
 
 
-def test_phase_one_gap_detection_creates_only_missing_specialist() -> None:
+def test_phase_one_gap_detection_creates_canonical_seven_specialists() -> None:
     with SessionLocal() as session:
-        scenario = Scenario(
-            description="Assess PNBP revenue resilience",
-        )
+        scenario = Scenario(description="Assess PNBP revenue resilience")
         existing = Agent(name="Existing Fiscal", role="Fiscal Reviewer")
-        session.add_all([scenario, existing])
+        retired = Agent(
+            name="Retired Treasury Agent",
+            role="Legacy treasury",
+            template_key="treasury",
+        )
+        session.add_all([scenario, existing, retired])
         session.flush()
 
         participants, orchestration = ensure_phase_one_specialists(session, scenario)
         session.commit()
 
-        revenue = session.scalar(
-            select(Agent).where(
-                Agent.scenario_id == scenario.id,
-                Agent.specialist_domain == "revenue",
+        assert [agent.template_key or agent.specialist_domain for agent in participants] == list(
+            ORCHESTRATED_AGENT_KEYS
+        )
+        assert len(participants) == 7
+        assert retired.id not in {agent.id for agent in participants}
+        assert orchestration["detected_domains"] == ["revenue"]
+        assert orchestration["selected_domains"] == list(ORCHESTRATED_AGENT_KEYS)
+
+        global_roster = list(
+            session.scalars(
+                select(Agent).where(
+                    Agent.scenario_id.is_(None), Agent.template_key.in_(ORCHESTRATED_AGENT_KEYS)
+                )
             )
         )
-        assert revenue is not None
-        assert revenue.scenario_id == scenario.id
-        assert revenue.specialist_domain == "revenue"
-        assert revenue.template_key is None
-        assert orchestration["detected_domains"] == ["revenue"]
-        assert orchestration["created_specialist_ids"] == [revenue.id]
-        assert {agent.id for agent in participants} == {existing.id, revenue.id}
+        assert len(global_roster) == 0
 
-        unrelated = Scenario(
-            description="Evaluate a universal policy proposal",
-        )
+        unrelated = Scenario(description="Evaluate a universal policy proposal")
         session.add(unrelated)
         session.flush()
-        unrelated_participants, unrelated_orchestration = ensure_phase_one_specialists(
-            session, unrelated
+        unrelated_participants, _ = ensure_phase_one_specialists(session, unrelated)
+        assert [agent.template_key or agent.specialist_domain for agent in unrelated_participants] == list(
+            ORCHESTRATED_AGENT_KEYS
         )
-        assert unrelated_orchestration["detected_domains"] == []
-        assert revenue.id not in {agent.id for agent in unrelated_participants}
-        assert {agent.id for agent in unrelated_participants} == {existing.id}
+        assert {agent.scenario_id for agent in unrelated_participants} == {unrelated.id}
+
+
+def test_scenario_deliberation_excludes_unrecognized_and_simulation_agents() -> None:
+    with SessionLocal() as session:
+        scenario = Scenario(description="Canonical voting roster")
+        voting_agents = [
+            Agent(
+                name=f"voter-{key}",
+                role=key,
+                template_key=key,
+                llm_base_url="https://fiscal.example/v1",
+                llm_api_key="fiscal-secret",
+                llm_model="fiscal-model",
+            )
+            for key in ORCHESTRATED_AGENT_KEYS
+        ]
+        extra_agent = Agent(name="Custom observer", role="Observer")
+        simulation_agent = Agent(
+            name="Fiscal Simulation & RPC Tool Agent / Agen Simulasi & Kalkulasi Fiskal",
+            role="Non-voting service",
+        )
+        retired_agent = Agent(
+            name="Retired Treasury Agent", role="Treasury", template_key="treasury"
+        )
+        session.add_all(
+            [scenario, *voting_agents, extra_agent, simulation_agent, retired_agent]
+        )
+        session.flush()
+        participants = scenario_deliberative_agents(session, scenario.id)
+
+        assert [agent.template_key for agent in participants] == list(ORCHESTRATED_AGENT_KEYS)
+
+
 
 
 def test_concurrent_orchestrator_and_specialist_provisioning_is_idempotent() -> None:
@@ -617,10 +657,19 @@ def test_agent_templates_are_available_and_idempotent(client: TestClient) -> Non
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("application/json")
     templates = response.json()
-    assert len(templates) == 5
+    assert len(templates) == 7
     assert [item["key"] for item in templates] == [
-        "revenue", "expenditure", "financing", "treasury", "macro"
+        "revenue", "expenditure", "budget", "financing", "fiscal_risk", "critic", "macro"
     ]
+    assert {item["name"] for item in templates} == {
+        "State Revenue Agent / Penerimaan Negara",
+        "Government Expenditure Agent / Belanja Pemerintah",
+        "BudgetAgent / Anggaran Pemerintah",
+        "Financing & Debt Agent / Pembiayaan Pemerintah",
+        "Fiscal Risk & Contingency Agent / Manajemen Risiko Fiskal",
+        "Adversarial Fiscal Critic Agent / Penelaah & Kritik Kebijakan Fiskal",
+        "Macro-Fiscal Stabilization Agent / Strategi Ekonomi dan Fiskal",
+    }
     assert {item["key"] for item in templates} == {
         template.key for template in STANDARD_APBN_AGENT_TEMPLATES
     }
@@ -634,13 +683,13 @@ def test_agent_templates_are_available_and_idempotent(client: TestClient) -> Non
     second = client.post("/api/agents/load-templates")
     assert first.status_code == 200
     assert second.status_code == 200
-    assert first.json()["total"] == 5
+    assert first.json()["total"] == 7
     assert second.json()["created"] == 0
 
     with SessionLocal() as session:
         template_names = [template.name for template in STANDARD_APBN_AGENT_TEMPLATES]
         template_agents = list(session.scalars(select(Agent).where(Agent.name.in_(template_names))))
-        assert len(template_agents) == 5
+        assert len(template_agents) == 7
         assert all(agent.system_prompt for agent in template_agents)
         revenue = next(agent for agent in template_agents if agent.template_key == "revenue")
         assert revenue.system_prompt is not None
@@ -1293,6 +1342,115 @@ def test_mandate_synthesis_retries_http_530_then_persists_fallback(
     assert payload["agent_rules"][0]["error"]["code"] == "PROVIDER_ERROR"
 
 
+def test_mandate_synthesis_repairs_malformed_json_fields(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    malformed = (
+        '{"scenario_mandate":"Recovered mandate"\n'
+        '"priority_questions":["Recovered question",]\n'
+        '"required_evidence":["Recovered evidence",]\n'
+        '"regulatory_compliance_alignment":["Recovered legal check",]'
+    )
+
+    class FakeCompletions:
+        def create(self, **_kwargs: object) -> object:
+            message = type("Message", (), {"content": malformed})()
+            choice = type("Choice", (), {"message": message})()
+            return type("Response", (), {"choices": [choice], "usage": None})()
+
+    class FakeClient:
+        def __init__(self, **_kwargs: object) -> None:
+            self.chat = type("Chat", (), {"completions": FakeCompletions()})()
+
+    monkeypatch.setattr("backend.main.OpenAI", FakeClient)
+    agent = client.post(
+        "/api/agents",
+        json={
+            "name": f"repaired-mandate-{uuid.uuid4()}",
+            "role": "Repair Test",
+            "llm_base_url": "https://repair.example/v1",
+            "llm_api_key": "repair-secret",
+            "llm_model": "repair-model",
+        },
+    ).json()
+    scenario = client.post(
+        "/api/scenarios", json={"description": "Mandate malformed JSON repair"}
+    ).json()
+
+    response = client.post(f"/api/scenarios/{scenario['id']}/domain-rules")
+
+    assert response.status_code == 200
+    rule = next(
+        item for item in response.json()["agent_rules"] if item["agent_id"] == agent["id"]
+    )
+    assert rule["synthesis_status"] == "generated"
+    assert rule["scenario_mandate"] == "Recovered mandate"
+    assert rule["priority_questions"] == ["Recovered question"]
+    assert rule["required_evidence"] == ["Recovered evidence"]
+    assert rule["regulatory_compliance_alignment"] == ["Recovered legal check"]
+    assert rule["error"]["code"] == "INVALID_JSON"
+    assert rule["error"]["retryable"] is False
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    [
+        '{"scenario_mandate":"Recovered mandate",}',
+        json.dumps(
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": '{"scenario_mandate":"Recovered mandate",}'
+                        }
+                    }
+                ]
+            }
+        ),
+    ],
+)
+def test_mandate_synthesis_reports_repaired_trailing_comma(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    malformed: str,
+) -> None:
+
+    class FakeCompletions:
+        def create(self, **_kwargs: object) -> object:
+            message = type("Message", (), {"content": malformed})()
+            choice = type("Choice", (), {"message": message})()
+            return type("Response", (), {"choices": [choice], "usage": None})()
+
+    class FakeClient:
+        def __init__(self, **_kwargs: object) -> None:
+            self.chat = type("Chat", (), {"completions": FakeCompletions()})()
+
+    monkeypatch.setattr("backend.main.OpenAI", FakeClient)
+    agent = client.post(
+        "/api/agents",
+        json={
+            "name": f"trailing-comma-mandate-{uuid.uuid4()}",
+            "role": "Repair Test",
+            "llm_base_url": "https://repair.example/v1",
+            "llm_api_key": "repair-secret",
+            "llm_model": "repair-model",
+        },
+    ).json()
+    scenario = client.post(
+        "/api/scenarios", json={"description": "Mandate trailing comma repair"}
+    ).json()
+
+    response = client.post(f"/api/scenarios/{scenario['id']}/domain-rules")
+
+    rule = next(
+        item for item in response.json()["agent_rules"] if item["agent_id"] == agent["id"]
+    )
+    assert rule["synthesis_status"] == "generated"
+    assert rule["scenario_mandate"] == "Recovered mandate"
+    assert rule["error"]["code"] == "INVALID_JSON"
+
+
 def test_domain_rules_include_custom_agent_mandate(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1548,7 +1706,7 @@ def test_force_delete_mocked_scenario_cascades_running_run_and_artifacts(
             scenario_id=scenario.id,
             revision=revision,
             generated=True,
-            agent_count=2,
+            agent_count=len(agents),
             rules={},
             agent_rules=[
                 {"agent_id": agent.id, "scenario_mandate": agent.role}
@@ -1663,7 +1821,7 @@ def test_force_delete_mocked_scenario_cascades_running_run_and_artifacts(
             ) is None
 
 
-def test_orchestrated_plan_selects_exactly_four_relevant_domains() -> None:
+def test_orchestrated_plan_selects_exactly_seven_voting_domains() -> None:
     scenario = Scenario(
         description=(
             "Tax revenue, public expenditure, debt financing, treasury liquidity, "
@@ -1678,13 +1836,21 @@ def test_orchestrated_plan_selects_exactly_four_relevant_domains() -> None:
 
     selected, plan = orchestrated_scenario_agent_plan(scenario)
 
-    assert len(selected) == 4
-    assert len(set(selected)) == 4
-    assert set(selected) <= {"revenue", "expenditure", "financing", "treasury", "macro"}
+    assert len(selected) == 7
+    assert len(set(selected)) == 7
+    assert selected == [
+        "revenue",
+        "expenditure",
+        "budget",
+        "financing",
+        "macro",
+        "fiscal_risk",
+        "critic",
+    ]
     assert set(plan["weights"]) == set(selected)
 
 
-def test_orchestrator_uses_explicit_scenario_config_and_persists_four_agents(
+def test_orchestrator_uses_explicit_scenario_config_and_persists_seven_agents(
     client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1699,8 +1865,11 @@ def test_orchestrator_uses_explicit_scenario_config_and_persists_four_agents(
                     "agents": [
                         {"domain": "revenue"},
                         {"domain": "expenditure"},
+                        {"domain": "budget"},
                         {"domain": "financing"},
                         {"domain": "macro"},
+                        {"domain": "fiscal_risk"},
+                        {"domain": "critic"},
                     ]
                 }
             )
@@ -1743,9 +1912,9 @@ def test_orchestrator_uses_explicit_scenario_config_and_persists_four_agents(
 
     assert response.status_code == 200
     payload = response.json()
-    assert payload["total"] == 4
+    assert payload["total"] == 7
     assert payload["orchestration"]["selection_source"] == "master_orchestrator_llm"
-    assert len({agent["agent_uuid"] for agent in payload["agents"]}) == 4
+    assert len({agent["agent_uuid"] for agent in payload["agents"]}) == 7
     assert all(uuid.UUID(agent["agent_uuid"]) for agent in payload["agents"])
     assert {agent["scenario_id"] for agent in payload["agents"]} == {scenario["id"]}
     assert clients == [
@@ -1807,8 +1976,11 @@ def test_orchestrator_configs_are_isolated_between_scenarios(
                     "agents": [
                         {"domain": "revenue"},
                         {"domain": "expenditure"},
+                        {"domain": "budget"},
                         {"domain": "financing"},
                         {"domain": "macro"},
+                        {"domain": "fiscal_risk"},
+                        {"domain": "critic"},
                     ]
                 }
             )
@@ -1855,7 +2027,7 @@ def test_orchestrator_configs_are_isolated_between_scenarios(
         assert len({item.agent_uuid for item in orchestrators}) == 2
 
 
-def test_orchestrator_failure_falls_back_to_exactly_four_agents(
+def test_orchestrator_failure_falls_back_to_exactly_seven_agents(
     client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1892,13 +2064,13 @@ def test_orchestrator_failure_falls_back_to_exactly_four_agents(
     assert response.status_code == 200
     assert attempts == 4
     payload = response.json()
-    assert payload["total"] == 4
+    assert payload["total"] == 7
     assert payload["orchestration"]["selection_source"] == "deterministic_fallback"
     assert payload["orchestration"]["selection_error"]
-    assert len({agent["agent_uuid"] for agent in payload["agents"]}) == 4
+    assert len({agent["agent_uuid"] for agent in payload["agents"]}) == 7
 
 
-def test_scenario_orchestration_replaces_agents_with_exactly_four_specialists(
+def test_scenario_orchestration_replaces_agents_with_exactly_seven_specialists(
     client: TestClient,
 ) -> None:
     with SessionLocal() as session:
@@ -1928,13 +2100,14 @@ def test_scenario_orchestration_replaces_agents_with_exactly_four_specialists(
     assert first.status_code == 200
     first_payload = first.json()
     first_agents = first_payload["agents"]
-    assert len(first_agents) == 4
-    assert len({item["agent_uuid"] for item in first_agents}) == 4
+    assert len(first_agents) == 7
+    assert len({item["agent_uuid"] for item in first_agents}) == 7
     assert first_payload["created"] == len(first_agents)
     assert first_payload["total"] == len(first_agents)
     assert first_payload["scenario_id"] == scenario_id
     assert {item["scenario_id"] for item in first_agents} == {scenario_id}
     assert all(item["rar_dai_weight_mode"] == "auto" for item in first_agents)
+    assert all("Simulation & RPC Tool Agent" not in item["name"] for item in first_agents)
     assert {item["specialist_domain"] for item in first_agents} == set(
         first_payload["orchestration"]["selected_domains"]
     )
@@ -1957,8 +2130,8 @@ def test_scenario_orchestration_replaces_agents_with_exactly_four_specialists(
     assert second.status_code == 200
     second_payload = second.json()
     second_agents = second_payload["agents"]
-    assert len(second_agents) == 4
-    assert len({item["agent_uuid"] for item in second_agents}) == 4
+    assert len(second_agents) == 7
+    assert len({item["agent_uuid"] for item in second_agents}) == 7
     second_ids = {item["id"] for item in second_agents}
     assert first_ids.isdisjoint(second_ids)
     if "revenue" in second_payload["orchestration"]["selected_domains"]:
@@ -2017,10 +2190,10 @@ def test_scenario_orchestration_sets_are_isolated_and_reload_replaces_only_targe
     second_agents = second_load.json()["agents"]
     first_ids = {item["id"] for item in first_agents}
     second_ids = {item["id"] for item in second_agents}
-    assert len(first_agents) == 4
-    assert len({item["agent_uuid"] for item in first_agents}) == 4
-    assert len(second_agents) == 4
-    assert len({item["agent_uuid"] for item in second_agents}) == 4
+    assert len(first_agents) == 7
+    assert len({item["agent_uuid"] for item in first_agents}) == 7
+    assert len(second_agents) == 7
+    assert len({item["agent_uuid"] for item in second_agents}) == 7
     assert first_ids.isdisjoint(second_ids)
     assert {item["scenario_id"] for item in first_agents} == {first_scenario["id"]}
     assert {item["scenario_id"] for item in second_agents} == {second_scenario["id"]}
@@ -2042,25 +2215,13 @@ def test_scenario_orchestration_sets_are_isolated_and_reload_replaces_only_targe
 def test_run_submission_and_status(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
     with SessionLocal() as session:
         scenario = Scenario(description=f"Run test {uuid.uuid4()}")
-        agents = [
-            Agent(
-                name=f"run-agent-{uuid.uuid4()}",
-                role="Fiscal",
-                llm_base_url="https://fiscal.example/v1",
-                llm_api_key="fiscal-secret",
-                llm_model="fiscal-model",
-            ),
-            Agent(
-                name=f"run-agent-{uuid.uuid4()}",
-                role="Risk",
-                llm_base_url="https://risk.example/v1",
-                llm_api_key="risk-secret",
-                llm_model="risk-model",
-            ),
-        ]
         session.add(scenario)
-        session.add_all(agents)
         session.flush()
+        agents, _ = ensure_phase_one_specialists(session, scenario)
+        for agent in agents:
+            agent.llm_base_url = "https://fiscal.example/v1"
+            agent.llm_api_key = "fiscal-secret"
+            agent.llm_model = "fiscal-model"
         revision = agent_revision(agents, scenario)
         session.add(
             ScenarioMandateSnapshot(
@@ -2126,7 +2287,7 @@ def test_run_submission_and_status(client: TestClient, monkeypatch: pytest.Monke
         "stage:quorum",
         "consensus:final",
     }
-    assert len([node for node in graph_payload["nodes"] if node["kind"] == "agent"]) == 2
+    assert len([node for node in graph_payload["nodes"] if node["kind"] == "agent"]) == 7
     assert not any(node["kind"] == "simulation" for node in graph_payload["nodes"])
 
     with SessionLocal() as session:
@@ -2164,30 +2325,19 @@ def test_run_submission_refreshes_stale_mandate_snapshot(
         scenario = Scenario(
             description=f"Stale run test {uuid.uuid4()}",
         )
-        agents = [
-            Agent(
-                name=f"stale-run-{uuid.uuid4()}",
-                role="Fiscal",
-                llm_base_url="https://fiscal.example/v1",
-                llm_api_key="fiscal-secret",
-                llm_model="fiscal-model",
-            ),
-            Agent(
-                name=f"stale-run-{uuid.uuid4()}",
-                role="Risk",
-                llm_base_url="https://risk.example/v1",
-                llm_api_key="risk-secret",
-                llm_model="risk-model",
-            ),
-        ]
-        session.add_all([scenario, *agents])
+        session.add(scenario)
         session.flush()
+        agents, _ = ensure_phase_one_specialists(session, scenario)
+        for agent in agents:
+            agent.llm_base_url = "https://fiscal.example/v1"
+            agent.llm_api_key = "fiscal-secret"
+            agent.llm_model = "fiscal-model"
         stale_revision = agent_revision(agents, scenario)
         stale_snapshot = ScenarioMandateSnapshot(
             scenario_id=scenario.id,
             revision=stale_revision,
             generated=True,
-            agent_count=2,
+            agent_count=len(agents),
             rules={},
             agent_rules=[
                 {
@@ -2200,7 +2350,7 @@ def test_run_submission_refreshes_stale_mandate_snapshot(
                 for agent in agents
             ],
             status="success",
-            generated_count=2,
+            generated_count=len(agents),
             failure_count=0,
         )
         session.add(stale_snapshot)
