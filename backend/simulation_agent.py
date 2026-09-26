@@ -114,21 +114,14 @@ def build_simulation_system_prompt() -> str:
 
 def build_simulation_prompt(
     scenario_description: str,
-    program_cost: float | None,
-    max_deficit_constraint: float,
+    simulation_payload: Mapping[str, Any],
     conflicts: Sequence[Mapping[str, Any]],
     peer_outputs: Sequence[Mapping[str, Any]],
 ) -> str:
-    effective_ceiling = min(
-        max_deficit_constraint,
-        STATUTORY_DEFICIT_CEILING_PERCENT_GDP,
-    )
     sandbox_inputs = {
         "policy_goal": scenario_description,
-        "program_cost": program_cost if program_cost is not None else "UNKNOWN",
+        **dict(simulation_payload),
         "statutory_deficit_ceiling_percent": STATUTORY_DEFICIT_CEILING_PERCENT_GDP,
-        "scenario_policy_ceiling_percent": max_deficit_constraint,
-        "effective_deficit_ceiling_percent": effective_ceiling,
         "ddr_conflicts": [
             {
                 "agent_i": conflict.get("agent_i"),
@@ -170,7 +163,7 @@ def sanitize_simulation_payload(payload: dict[str, Any]) -> dict[str, Any]:
 
 def build_deterministic_simulation(
     scenario_description: str,
-    max_deficit_constraint: float,
+    simulation_payload: Mapping[str, Any],
     conflicts: Sequence[Mapping[str, Any]],
     peer_outputs: Sequence[Mapping[str, Any]],
 ) -> dict[str, Any]:
@@ -215,10 +208,7 @@ def build_deterministic_simulation(
                     content = item["content"].strip()
                     if content and content not in target:
                         target.append(content)
-    effective_ceiling = min(
-        max_deficit_constraint,
-        STATUTORY_DEFICIT_CEILING_PERCENT_GDP,
-    )
+    effective_ceiling = STATUTORY_DEFICIT_CEILING_PERCENT_GDP
     feasible = [item for item in alternatives if item["deficit"] <= effective_ceiling]
     ranked = sorted(
         feasible,
@@ -271,7 +261,11 @@ def build_deterministic_simulation(
         "recommendation": {"content": resolution, "source_tag": SIMULATION_SOURCE_TAG},
         "confidence": 0.75,
         "material_information_retention_macro_f1": 1.0,
-        "simulation_summary": f"Native arbitration evaluated {len(alternatives)} sectoral alternatives for {scenario_description}",
+        "simulation_summary": (
+            f"Native arbitration evaluated {len(alternatives)} sectoral alternatives for "
+            f"{scenario_description} with scenario inputs "
+            f"{json.dumps(dict(simulation_payload), ensure_ascii=False, sort_keys=True)}"
+        ),
         "conflict_summary": conflict_summary,
         "resolution": resolution,
         "resolution_status": "RESOLVED" if selected is not None else "INFEASIBLE",

@@ -675,10 +675,7 @@ def _collective_reasoning_payload(
             point["agent_pairs"].append(pair)
     divergence_points = list(category_map.values())
 
-    effective_ceiling = min(
-        scenario.max_deficit_constraint,
-        STATUTORY_DEFICIT_CEILING_PERCENT_GDP,
-    )
+    effective_ceiling = STATUTORY_DEFICIT_CEILING_PERCENT_GDP
     valid_claims = [claim for claim in claims if claim.get("schema_valid")]
     feasible_agents = 0
     for agent in agent_breakdown:
@@ -1155,8 +1152,7 @@ def _dashboard_payload(
             "scenario": {
                 "id": scenario.id,
                 "description": scenario.description,
-                "program_cost": scenario.program_cost,
-                "max_deficit_constraint": scenario.max_deficit_constraint,
+                **scenario.simulation_payload(),
             },
             "domain_rules": domain_rules,
             "latest_metric": _metric_payload(snapshots[0]) if snapshots else None,
@@ -1767,8 +1763,10 @@ def reproducibility_manifest(
                     "user": build_agent_user_prompt(
                         agent.role,
                         str(dashboard["scenario"]["description"]),
-                        cast(float | None, dashboard["scenario"]["program_cost"]),
-                        float(dashboard["scenario"]["max_deficit_constraint"]),
+                         float(dashboard["scenario"]["program_cost"])
+                         if isinstance(dashboard["scenario"].get("program_cost"), (int, float))
+                         else None,
+                         cast(dict[str, object], dashboard["scenario"]),
                     ),
                 }
                 for agent in agents

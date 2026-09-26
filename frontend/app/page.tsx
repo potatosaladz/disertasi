@@ -10,6 +10,7 @@ type Agent = {
   display_name?: string;
   role: string;
   template_key: string | null;
+  scenario_id?: number | null;
   theta_x: number;
   theta_q: number;
   theta_h: number;
@@ -44,7 +45,52 @@ type AgentTemplate = {
   theta_s: number;
   theta_u: number;
 };
-type Scenario = { id: number; description: string; program_cost: number | null; max_deficit_constraint: number };
+type ScenarioInputs = {
+  instrument: string | null;
+  targeting: string | null;
+  program_cost: number | null;
+  duration_months: number | null;
+  evaluation_trigger: string | null;
+  program_cost_period: string | null;
+  no_phase0: boolean | null;
+  phase0_only: boolean | null;
+  no_phased: boolean | null;
+  proposed_reallocation: number | null;
+  reallocation_from_education: boolean | null;
+  proposed_additional_revenue: number | null;
+  revenue_measure_type: string | null;
+  proposed_debt_financing: number | null;
+  debt_financing_mode: string | null;
+  proposed_sal_use: number | null;
+  sal_purpose: string | null;
+  proposed_other_financing: number | null;
+  appropriation_available: boolean | null;
+  verified_reallocation_capacity: number | null;
+  verified_revenue_offset_capacity: number | null;
+  verified_debt_financing_headroom: number | null;
+  verified_sal_available: number | null;
+  verified_operational_cash_minimum: number | null;
+  verified_projected_cash_after_policy: number | null;
+  verified_cumulative_borrowing_pct_gdp: number | null;
+  spending_reallocation_authorized: boolean | null;
+  dpr_spending_adjustment_recommendation: boolean | null;
+  finance_minister_sal_authorized: boolean | null;
+  dpr_sal_approval_obtained: boolean | null;
+  dpr_additional_sbn_approval_obtained: boolean | null;
+  tax_measure_has_enacted_law: boolean | null;
+  pnbp_measure_has_valid_tariff_instrument: boolean | null;
+  output_outcome_documented: boolean | null;
+  domestic_product_compliance_documented: boolean | null;
+  growth_outlook: number | null;
+  inflation_outlook: number | null;
+  fx_outlook: number | null;
+  sbn10y_yield_outlook: number | null;
+  icp_outlook: number | null;
+  oil_lifting_outlook: number | null;
+  gas_lifting_outlook: number | null;
+  tax_revenue_forecast: number | null;
+};
+type Scenario = ScenarioInputs & { id: number; description: string };
 type Metric = {
   id: number;
   hard_constraint_violation_rate: number;
@@ -87,7 +133,7 @@ type Influence = { agent: string; proposition: string; normalized_weight: number
 type SimulationConflict = { agent_i?: string; agent_j?: string; components?: string[]; route?: string };
 type SimulationAlternative = { name?: string; deficit?: number; utility?: number; source_tag?: string; evidence_status?: string };
 type SimulationOutput = { agent_name?: string; resolution?: string; simulation_summary?: string; evidence_status?: string; follow_up_consensus_status?: string; remaining_prediction_conflicts?: number; fallback_reason?: string; limitations?: string[]; conflict_summary?: string[]; modelled_variables?: string[]; alternatives?: SimulationAlternative[]; risks?: { content?: string }[]; uncertainties?: { content?: string }[]; message?: string };
-type SimulationArtifact = { id: number; session_id: string; scenario_id: number; trigger: string; round_number: number; status: string; simulation_version: string; input?: { conflicts?: SimulationConflict[]; sectoral_inputs?: { agent?: string; role?: string; predictions?: { content?: string }[]; alternatives?: SimulationAlternative[]; recommendation?: unknown }[]; scenario?: { description?: string; program_cost?: number | null; max_deficit_constraint?: number } }; output: SimulationOutput; latency_ms: number; token_usage: number; created_at: string };
+type SimulationArtifact = { id: number; session_id: string; scenario_id: number; trigger: string; round_number: number; status: string; simulation_version: string; input?: { conflicts?: SimulationConflict[]; sectoral_inputs?: { agent?: string; role?: string; predictions?: { content?: string }[]; alternatives?: SimulationAlternative[]; recommendation?: unknown }[]; scenario?: Partial<ScenarioInputs> & { description?: string; statutory_deficit_ceiling_percent?: number } }; output: SimulationOutput; latency_ms: number; token_usage: number; created_at: string };
 type DecisionItem = { content?: string; source_tag?: string; name?: string; deficit?: number; utility?: number };
 type FallbackMetadata = { kind?: string; label?: string; label_i18n?: { id?: string; en?: string }; reason?: string; reason_i18n?: { id?: string; en?: string }; decision_status?: "evidence_required" };
 type AgentPosition = { stage: string; round_number: number; agent_opinion: string | null; reasoning_summary: string | null; constraints_considered: DecisionItem[]; statutory_gates: string[]; recommendation: DecisionItem | string | null; confidence: number | null; evidence: DecisionItem[]; assumptions: DecisionItem[]; predictions: DecisionItem[]; risks: DecisionItem[]; uncertainties: DecisionItem[]; objectives: DecisionItem[]; alternatives: DecisionItem[]; fallback_metadata?: FallbackMetadata | null };
@@ -115,7 +161,7 @@ type RunState = { task_id: string | null; session_id: string; scenario_id: numbe
 type AgentDomainRules = { agent_id: number; name: string; display_name?: string; role: string; template_key: string | null; mandate: string | null; primary_sources: string[]; constraints: string[]; owned_checks: string[]; synthesis_status: "generated" | "fallback"; scenario_mandate: string | null; scenario_focus: string[]; priority_questions: string[]; required_evidence: string[]; epistemic_logic_traceability: string[]; structured_consensus_protocol: string[]; regulatory_compliance_alignment: string[]; utility_metadata?: { task?: string; result?: string; why?: string; name_source?: string }; llm_model: string | null; token_usage: number | null; error: { code: string; message: string } | null };
 type DomainRules = { scenario_id: number; revision: string; generated: boolean; stale: boolean; agent_count: number; rules: { hard_constraints?: string[]; owned_checks?: string[]; principles?: string[]; primary_sources?: string[]; automatic_deficit_ceiling?: number }; agent_rules: AgentDomainRules[]; status: "success" | "partial" | "failed" | "stale" | "missing"; generated_count: number; failure_count: number; detail: string | null };
 type AgentForm = Omit<Agent, "id" | "display_name" | "has_llm_api_key" | "template_key" | "system_prompt"> & { llm_api_key: string };
-type ScenarioForm = Omit<Scenario, "id" | "max_deficit_constraint">;
+type ScenarioForm = Omit<Scenario, "id">;
 type UtilityMetadata = { task?: string; result?: string; why?: string; name_source?: string };
 type HardConstraint = { code?: string; formula?: string; status?: string; reason?: string; ceiling_percent_gdp?: number; requested_ceiling_percent_gdp?: number; source_tags?: string[]; calculation_status?: string };
 type RejectedAlternative = { name?: string; projected_deficit_percent_gdp?: number | null; ceiling_percent_gdp?: number; excess_percent_gdp?: number | null; violated_constraints?: string[]; reason?: string };
@@ -125,6 +171,24 @@ type GlobalConfigForm = { llm_base_url: string; llm_api_key: string; llm_model: 
 const initialGlobalConfig: GlobalConfigForm = { llm_base_url: "", llm_api_key: "", llm_model: "", temperature: 0.2, max_tokens: 4000, apply_to_all: false };
 
 const apiUrl = "";
+const scenarioLabels: Record<"id" | "en", { edit: string; save: string; deleted: string; updated: string; deleteFailed: string; confirmDelete: (id: number) => string }> = {
+  id: {
+    edit: "Ubah",
+    save: "Perbarui Skenario",
+    deleted: "Skenario {id} dihapus.",
+    updated: "Skenario {id} diperbarui; aturan lama ditandai kedaluwarsa.",
+    deleteFailed: "Skenario tidak dapat dihapus.",
+    confirmDelete: (id: number) => `Hapus skenario ${id} beserta seluruh agen dan riwayat prosesnya?`,
+  },
+  en: {
+    edit: "Edit",
+    save: "Update Scenario",
+    deleted: "Scenario {id} deleted.",
+    updated: "Scenario {id} updated; previous mandates are now marked stale.",
+    deleteFailed: "Scenario could not be deleted.",
+    confirmDelete: (id: number) => `Delete scenario ${id} with all of its agents and runs?`,
+  },
+};
 const components = ["dE", "dA", "dP", "dR", "dU", "dO", "dC", "dREC"] as const;
 const componentLabels: Record<(typeof components)[number], { id: string; en: string }> = { dE: { id: "Bukti", en: "Evidence" }, dA: { id: "Asumsi", en: "Assumption" }, dP: { id: "Prediksi", en: "Prediction" }, dR: { id: "Risiko", en: "Risk" }, dU: { id: "Ketidakpastian", en: "Uncertainty" }, dO: { id: "Tujuan", en: "Objective" }, dC: { id: "Constraint", en: "Constraint" }, dREC: { id: "Rekomendasi", en: "Recommendation" } };
 const initialAgent: AgentForm = {
@@ -141,10 +205,80 @@ const initialAgent: AgentForm = {
   temperature: 0.2,
   max_tokens: 4000,
 };
-const initialScenario: ScenarioForm = { description: "", program_cost: null };
+const initialScenario: ScenarioForm = {
+  description: "",
+  instrument: null,
+  targeting: null,
+  program_cost: null,
+  duration_months: null,
+  evaluation_trigger: null,
+  program_cost_period: null,
+  no_phase0: null,
+  phase0_only: null,
+  no_phased: null,
+  proposed_reallocation: null,
+  reallocation_from_education: null,
+  proposed_additional_revenue: null,
+  revenue_measure_type: null,
+  proposed_debt_financing: null,
+  debt_financing_mode: null,
+  proposed_sal_use: null,
+  sal_purpose: null,
+  proposed_other_financing: null,
+  appropriation_available: null,
+  verified_reallocation_capacity: null,
+  verified_revenue_offset_capacity: null,
+  verified_debt_financing_headroom: null,
+  verified_sal_available: null,
+  verified_operational_cash_minimum: null,
+  verified_projected_cash_after_policy: null,
+  verified_cumulative_borrowing_pct_gdp: null,
+  spending_reallocation_authorized: null,
+  dpr_spending_adjustment_recommendation: null,
+  finance_minister_sal_authorized: null,
+  dpr_sal_approval_obtained: null,
+  dpr_additional_sbn_approval_obtained: null,
+  tax_measure_has_enacted_law: null,
+  pnbp_measure_has_valid_tariff_instrument: null,
+  output_outcome_documented: null,
+  domestic_product_compliance_documented: null,
+  growth_outlook: null,
+  inflation_outlook: null,
+  fx_outlook: null,
+  sbn10y_yield_outlook: null,
+  icp_outlook: null,
+  oil_lifting_outlook: null,
+  gas_lifting_outlook: null,
+  tax_revenue_forecast: null,
+};
 
 function NumericField({ label, value, onChange, hint }: { label: string; value: number; onChange: (value: number) => void; hint: string }) {
   return <label className="form-field"><strong>{label}</strong><input type="number" min="0" step="0.01" value={value} onChange={(event) => onChange(Number(event.target.value))} required /><small>{hint}</small></label>;
+}
+
+function OptionalTextField({ label, value, onChange, multiline = false }: { label: string; value: string | null; onChange: (value: string | null) => void; multiline?: boolean }) {
+  const control = multiline
+    ? <textarea value={value ?? ""} onChange={(event) => onChange(event.target.value || null)} rows={2} />
+    : <input value={value ?? ""} onChange={(event) => onChange(event.target.value || null)} />;
+  return <label className="form-field"><strong>{label}</strong>{control}</label>;
+}
+
+function OptionalNumberField({ label, value, onChange, min, step = "any" }: { label: string; value: number | null; onChange: (value: number | null) => void; min?: number; step?: number | "any" }) {
+  return <label className="form-field"><strong>{label}</strong><input type="number" min={min} step={step} value={value ?? ""} onChange={(event) => onChange(event.target.value === "" ? null : Number(event.target.value))} /></label>;
+}
+
+function ScenarioParameterSections({ value, onChange, lang }: { value: ScenarioForm; onChange: (value: ScenarioForm) => void; lang: "id" | "en" }) {
+  const set = <K extends keyof ScenarioForm>(field: K, next: ScenarioForm[K]) => onChange({ ...value, [field]: next });
+  const section = lang === "id"
+    ? { policy: "Ruang Lingkup Kebijakan", proposals: "Usulan Pembiayaan", evidence: "Bukti Terverifikasi", macro: "Prognosis Makro", yes: "Ya", no: "Tidak", unknown: "Belum diketahui" }
+    : { policy: "Policy Scope", proposals: "Financing Proposals", evidence: "Verified Evidence", macro: "Macro Outlook", yes: "Yes", no: "No", unknown: "Unknown" };
+  const booleanField = (field: keyof ScenarioInputs, label: string) => <label className="form-field" key={field}><strong>{label}</strong><select value={value[field] === null ? "" : String(value[field])} onChange={(event) => set(field, (event.target.value === "" ? null : event.target.value === "true") as never)}><option value="">{section.unknown}</option><option value="true">{section.yes}</option><option value="false">{section.no}</option></select></label>;
+  return <div className="scenario-parameter-sections">
+    <details open><summary>{section.policy}</summary><div className="form-grid two-column"><OptionalTextField label="Instrument" value={value.instrument} onChange={(next) => set("instrument", next)} /><OptionalTextField label="Targeting" value={value.targeting} onChange={(next) => set("targeting", next)} multiline /><OptionalNumberField label="Program Cost" value={value.program_cost} onChange={(next) => set("program_cost", next)} min={0} /><OptionalNumberField label="Duration (months)" value={value.duration_months} onChange={(next) => set("duration_months", next)} min={1} step={1} /><OptionalTextField label="Evaluation Trigger" value={value.evaluation_trigger} onChange={(next) => set("evaluation_trigger", next)} multiline /><OptionalTextField label="Program Cost Period" value={value.program_cost_period} onChange={(next) => set("program_cost_period", next)} />{booleanField("no_phase0", "No Phase 0")}{booleanField("phase0_only", "Phase 0 Only")}{booleanField("no_phased", "No Phased Implementation")}</div></details>
+    <details><summary>{section.proposals}</summary><div className="form-grid two-column"><OptionalNumberField label="Proposed Reallocation" value={value.proposed_reallocation} onChange={(next) => set("proposed_reallocation", next)} min={0} />{booleanField("reallocation_from_education", "Reallocation From Education") }<OptionalNumberField label="Proposed Additional Revenue" value={value.proposed_additional_revenue} onChange={(next) => set("proposed_additional_revenue", next)} min={0} /><OptionalTextField label="Revenue Measure Type" value={value.revenue_measure_type} onChange={(next) => set("revenue_measure_type", next)} /><OptionalNumberField label="Proposed Debt Financing" value={value.proposed_debt_financing} onChange={(next) => set("proposed_debt_financing", next)} min={0} /><OptionalTextField label="Debt Financing Mode" value={value.debt_financing_mode} onChange={(next) => set("debt_financing_mode", next)} /><OptionalNumberField label="Proposed SAL Use" value={value.proposed_sal_use} onChange={(next) => set("proposed_sal_use", next)} min={0} /><OptionalTextField label="SAL Purpose" value={value.sal_purpose} onChange={(next) => set("sal_purpose", next)} multiline /><OptionalNumberField label="Proposed Other Financing" value={value.proposed_other_financing} onChange={(next) => set("proposed_other_financing", next)} min={0} /></div></details>
+    <details><summary>{section.evidence}</summary><div className="form-grid two-column">{booleanField("appropriation_available", "Appropriation Available")}<OptionalNumberField label="Verified Reallocation Capacity" value={value.verified_reallocation_capacity} onChange={(next) => set("verified_reallocation_capacity", next)} min={0} /><OptionalNumberField label="Verified Revenue Offset Capacity" value={value.verified_revenue_offset_capacity} onChange={(next) => set("verified_revenue_offset_capacity", next)} min={0} /><OptionalNumberField label="Verified Debt Financing Headroom" value={value.verified_debt_financing_headroom} onChange={(next) => set("verified_debt_financing_headroom", next)} min={0} /><OptionalNumberField label="Verified SAL Available" value={value.verified_sal_available} onChange={(next) => set("verified_sal_available", next)} min={0} /><OptionalNumberField label="Verified Operational Cash Minimum" value={value.verified_operational_cash_minimum} onChange={(next) => set("verified_operational_cash_minimum", next)} min={0} /><OptionalNumberField label="Verified Projected Cash After Policy" value={value.verified_projected_cash_after_policy} onChange={(next) => set("verified_projected_cash_after_policy", next)} min={0} /><OptionalNumberField label="Verified Cumulative Borrowing (% GDP)" value={value.verified_cumulative_borrowing_pct_gdp} onChange={(next) => set("verified_cumulative_borrowing_pct_gdp", next)} min={0} />{booleanField("spending_reallocation_authorized", "Spending Reallocation Authorized")}{booleanField("dpr_spending_adjustment_recommendation", "DPR Spending Adjustment Recommendation")}{booleanField("finance_minister_sal_authorized", "Finance Minister SAL Authorization")}{booleanField("dpr_sal_approval_obtained", "DPR SAL Approval")}{booleanField("dpr_additional_sbn_approval_obtained", "DPR Additional SBN Approval")}{booleanField("tax_measure_has_enacted_law", "Tax Measure Has Enacted Law")}{booleanField("pnbp_measure_has_valid_tariff_instrument", "PNBP Measure Has Valid Tariff")}{booleanField("output_outcome_documented", "Output/Outcome Documented")}{booleanField("domestic_product_compliance_documented", "Domestic Product Compliance Documented")}</div></details>
+    <details><summary>{section.macro}</summary><div className="form-grid two-column"><OptionalNumberField label="Growth Outlook (%)" value={value.growth_outlook} onChange={(next) => set("growth_outlook", next)} /><OptionalNumberField label="Inflation Outlook (%)" value={value.inflation_outlook} onChange={(next) => set("inflation_outlook", next)} /><OptionalNumberField label="FX Outlook" value={value.fx_outlook} onChange={(next) => set("fx_outlook", next)} min={0} /><OptionalNumberField label="SBN 10Y Yield Outlook (%)" value={value.sbn10y_yield_outlook} onChange={(next) => set("sbn10y_yield_outlook", next)} min={0} /><OptionalNumberField label="ICP Outlook" value={value.icp_outlook} onChange={(next) => set("icp_outlook", next)} min={0} /><OptionalNumberField label="Oil Lifting Outlook" value={value.oil_lifting_outlook} onChange={(next) => set("oil_lifting_outlook", next)} min={0} /><OptionalNumberField label="Gas Lifting Outlook" value={value.gas_lifting_outlook} onChange={(next) => set("gas_lifting_outlook", next)} min={0} /><OptionalNumberField label="Tax Revenue Forecast" value={value.tax_revenue_forecast} onChange={(next) => set("tax_revenue_forecast", next)} min={0} /></div></details>
+  </div>;
 }
 
 function MetricCard({ label, value, unit, tone }: { label: string; value: string; unit?: string; tone?: string }) {
@@ -355,11 +489,14 @@ export default function Home() {
   const [selectedTemplate, setSelectedTemplate] = useState("");
   const [scenarios, setScenarios] = useState<Scenario[]>([]);
   const [selectedScenario, setSelectedScenario] = useState<number | null>(null);
+  const [editingScenarioId, setEditingScenarioId] = useState<number | null>(null);
+  const [scenarioBusy, setScenarioBusy] = useState(false);
   const [dashboard, setDashboard] = useState<Dashboard | null>(null);
   const [graph, setGraph] = useState<RunGraphPayload | null>(null);
   const [run, setRun] = useState<RunState | null>(null);
   const [notice, setNotice] = useState("");
   const [domainRules, setDomainRules] = useState<DomainRules | null>(null);
+  const [mandateReadyScenarioId, setMandateReadyScenarioId] = useState<number | null>(null);
   const [rulesBusy, setRulesBusy] = useState(false);
   const [busyAgentId, setBusyAgentId] = useState<number | null>(null);
   const [busy, setBusy] = useState(false);
@@ -405,13 +542,23 @@ export default function Home() {
     setTemplates(payload);
   }
 
+  async function loadAgents(scenarioId?: number | null) {
+    const endpoint = scenarioId === null || scenarioId === undefined
+      ? `${apiUrl}/api/agents`
+      : `${apiUrl}/api/agents?scenario_id=${scenarioId}`;
+    const response = await apiFetch(endpoint, { cache: "no-store" });
+    if (!response.ok) throw new Error(t("error.apiUnavailable"));
+    const payload: Agent[] = await response.json();
+    setAgents(payload);
+    return payload;
+  }
+
   async function loadSetup() {
-    const [agentResponse, scenarioResponse] = await Promise.all([
-      apiFetch(`${apiUrl}/api/agents`),
+    const [nextAgents, scenarioResponse] = await Promise.all([
+      loadAgents(selectedScenario),
       apiFetch(`${apiUrl}/api/scenarios`),
     ]);
-    if (!agentResponse.ok || !scenarioResponse.ok) throw new Error(t("error.apiUnavailable"));
-    const nextAgents: Agent[] = await agentResponse.json();
+    if (!scenarioResponse.ok) throw new Error(t("error.apiUnavailable"));
     const nextScenarios: Scenario[] = await scenarioResponse.json();
     setAgents(nextAgents);
     setScenarios(nextScenarios);
@@ -454,6 +601,9 @@ export default function Home() {
     const payload: Dashboard = await response.json();
     setDashboard(payload);
     setDomainRules(payload.domain_rules);
+    setMandateReadyScenarioId(
+      payload.domain_rules.generated && !payload.domain_rules.stale ? id : null
+    );
   }
 
   async function loadRunGraph(taskId: string | null, scenarioId: number, sessionId: string) {
@@ -510,6 +660,7 @@ export default function Home() {
     }
     const payload: DomainRules = await response.json();
     setDomainRules(payload);
+    setMandateReadyScenarioId(payload.generated && !payload.stale ? id : null);
     return payload;
   }
 
@@ -518,6 +669,7 @@ export default function Home() {
     if (results.every((result) => result.status === "rejected")) {
       throw new Error(t("error.mandateRefresh"));
     }
+    return results;
   }
   useEffect(() => {
     loadTemplates().catch((error) => setNotice(t("notice.templatesFailed", { message: error.message })));
@@ -526,7 +678,11 @@ export default function Home() {
   }, []);
   useEffect(() => {
     if (selectedScenario !== null) {
-      Promise.all([loadDashboard(selectedScenario), loadLatestRun(selectedScenario)]).catch(() => setNotice(t("notice.noDashboard")));
+      Promise.all([
+        loadAgents(selectedScenario),
+        loadDashboard(selectedScenario),
+        loadLatestRun(selectedScenario),
+      ]).catch(() => setNotice(t("notice.noDashboard")));
     }
   }, [selectedScenario, lang]);
   useEffect(() => {
@@ -655,13 +811,20 @@ export default function Home() {
   }
 
   async function loadAllTemplates() {
+    if (selectedScenario === null) {
+      setNotice(t("notice.selectRun"));
+      return;
+    }
     setBusy(true);
     try {
       const configs = Object.fromEntries(Object.entries(templateConfigs).map(([key, value]) => [key, { ...value, llm_base_url: value.llm_base_url || null, llm_api_key: value.llm_api_key || null, llm_model: value.llm_model || null }]));
-      const response = await apiFetch(`${apiUrl}/api/agents/load-templates`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ configs }) });
+      const response = await apiFetch(`${apiUrl}/api/scenarios/${selectedScenario}/load-templates`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ configs }) });
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.detail ?? t("error.templatesLoad"));
-      await Promise.all([loadSetup(), loadTemplates()]); setDomainRules(null); closeTemplateModal();
+      setAgents(payload.agents as Agent[]);
+      setDomainRules(null);
+      setMandateReadyScenarioId(null);
+      closeTemplateModal();
       setNotice(t("notice.templatesLoaded", { created: formatNumber(payload.created), total: formatNumber(payload.total) }));
     } catch (error) {
       setNotice(error instanceof Error ? error.message : t("error.templatesLoad"));
@@ -697,7 +860,7 @@ export default function Home() {
       }));
       setGlobalConfigMeta((current) => ({ revision: typeof result.revision === "number" ? result.revision : current.revision, has_llm_api_key: typeof result.has_llm_api_key === "boolean" ? result.has_llm_api_key : current.has_llm_api_key || Boolean(globalConfig.llm_api_key) }));
       if (globalConfig.apply_to_all) await loadSetup();
-      setDomainRules(null);
+      setDomainRules(null); setMandateReadyScenarioId(null);
       setNotice(t("notice.globalConfigSaved"));
     } catch (error) {
       setNotice(error instanceof Error ? error.message : t("error.globalConfigSave"));
@@ -711,6 +874,7 @@ export default function Home() {
     try {
       const agentPayload = {
         ...agent,
+        ...(editingAgentId === null ? { scenario_id: selectedScenario } : {}),
         template_key: selectedTemplate || null,
         llm_base_url: agent.llm_base_url || null,
         llm_api_key: agent.llm_api_key || undefined,
@@ -719,7 +883,7 @@ export default function Home() {
       const endpoint = editingAgentId ? `${apiUrl}/api/agents/${editingAgentId}` : `${apiUrl}/api/agents`;
       const response = await apiFetch(endpoint, { method: editingAgentId ? "PUT" : "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(agentPayload) });
       const payload = await response.json(); if (!response.ok) throw new Error(payload.detail ?? t("error.agentSave"));
-      setAgent(initialAgent); setSelectedTemplate(""); setEditingAgentId(null); setDomainRules(null); await loadSetup(); setNotice(t("notice.agentSaved", { name: payload.name }));
+      setAgent(initialAgent); setSelectedTemplate(""); setEditingAgentId(null); setDomainRules(null); setMandateReadyScenarioId(null); await loadSetup(); setNotice(t("notice.agentSaved", { name: payload.name }));
     } catch (error) { setNotice(error instanceof Error ? error.message : t("error.agentSave")); } finally { setBusy(false); }
   }
 
@@ -733,9 +897,19 @@ export default function Home() {
 
   async function deleteAgent(item: Agent) {
     if (!window.confirm(t("confirm.deleteAgent", { name: item.name }))) return;
-    const response = await apiFetch(`${apiUrl}/api/agents/${item.id}`, { method: "DELETE" });
-    if (!response.ok) { const payload = await response.json(); setNotice(payload.detail ?? t("notice.agentDeleteFailed")); return; }
-    setDomainRules(null); await loadSetup(); setNotice(t("notice.agentDeleted", { name: item.name }));
+    try {
+      const response = await apiFetch(`${apiUrl}/api/agents/${item.id}`, { method: "DELETE" });
+      if (!response.ok) {
+        const payload = await response.json().catch(() => ({})) as { detail?: string };
+        throw new Error(payload.detail ?? t("notice.agentDeleteFailed"));
+      }
+      setAgents((prev) => prev.filter((agentRow) => agentRow.id !== item.id));
+      setDomainRules(null); setMandateReadyScenarioId(null);
+      if (editingAgentId === item.id) { setEditingAgentId(null); setAgent(initialAgent); setSelectedTemplate(""); }
+      setNotice(t("notice.agentDeleted", { name: item.name }));
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : t("notice.agentDeleteFailed"));
+    }
   }
 
   async function testConnection(item: Agent) {
@@ -773,12 +947,16 @@ export default function Home() {
         throw new Error(rawPayload || t("error.mandateInvalid"));
       }
       if (!payload.generated) throw new Error(payload.detail ?? t("error.mandateNotGenerated"));
-      setDomainRules({ ...payload, generated: true, stale: false });
+      const freshRules: DomainRules = { ...payload, scenario_id: scenarioId, generated: true, stale: false };
+      setDomainRules(freshRules);
+      setMandateReadyScenarioId(scenarioId);
       try {
         await refreshMandateData(scenarioId);
       } catch (refreshError) {
         setNotice(refreshError instanceof Error ? refreshError.message : t("error.refreshDelayed"));
       }
+      setDomainRules(freshRules);
+      setMandateReadyScenarioId(scenarioId);
       setMandateLogs((current) => [...current, { stage: "MANDATE", level: payload.status === "partial" ? "WARNING" : "SUCCESS", message: payload.detail ?? t("notice.mandateGenerated", { count: formatNumber(payload.generated_count ?? 0) }) }]);
       setNotice(payload.detail ?? t("notice.mandateReady"));
     } catch (error) {
@@ -825,12 +1003,85 @@ export default function Home() {
   }
 
   async function submitScenario(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault(); setBusy(true);
+    event.preventDefault();
+    setBusy(true);
+    setScenarioBusy(true);
     try {
-      const response = await apiFetch(`${apiUrl}/api/scenarios`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(scenario) });
-      const payload = await response.json(); if (!response.ok) throw new Error(payload.detail ?? t("notice.scenarioSaveFailed"));
-      setScenario(initialScenario); await loadSetup(); setDomainRules(null); setDashboard(null); setGraph(null); setRun(null); setTrackerHistory([]); setSelectedScenario(payload.id); setNotice(t("notice.scenarioSaved", { id: payload.id }));
-    } catch (error) { setNotice(error instanceof Error ? error.message : t("notice.scenarioSaveFailed")); } finally { setBusy(false); }
+      const scenarioPayload = { ...scenario };
+      const endpoint = editingScenarioId !== null ? `${apiUrl}/api/scenarios/${editingScenarioId}` : `${apiUrl}/api/scenarios`;
+      const response = await apiFetch(endpoint, {
+        method: editingScenarioId !== null ? "PATCH" : "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(scenarioPayload),
+      });
+      const payload = await response.json().catch(() => ({})) as Scenario & { detail?: string };
+      if (!response.ok) throw new Error(payload.detail ?? t("notice.scenarioSaveFailed"));
+      const saved: Scenario = payload;
+      setScenarios((current) => {
+        const exists = current.some((item) => item.id === saved.id);
+        return exists
+          ? current.map((item) => (item.id === saved.id ? saved : item))
+          : [...current, saved];
+      });
+      const wasEditing = editingScenarioId !== null;
+      setScenario(initialScenario);
+      setEditingScenarioId(null);
+      setSelectedScenario(saved.id);
+      setDomainRules(null); setMandateReadyScenarioId(null);
+      setDashboard(null);
+      setGraph(null);
+      setRun(null);
+      setTrackerHistory([]);
+      setMandateLogs([]);
+      if (wasEditing) {
+        setNotice(scenarioLabels[lang].updated.replace("{id}", String(saved.id)));
+        return;
+      }
+      setNotice(t("notice.scenarioSaved", { id: saved.id }));
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : t("notice.scenarioSaveFailed"));
+    } finally {
+      setBusy(false);
+      setScenarioBusy(false);
+    }
+  }
+
+  function editScenario(item: Scenario) {
+    setEditingScenarioId(item.id);
+    const fields = structuredClone(item) as ScenarioForm & { id?: number };
+    delete fields.id;
+    setScenario(fields);
+    selectTab(0);
+    window.requestAnimationFrame(() => document.getElementById("wizard-panel-0")?.scrollIntoView({ behavior: "smooth" }));
+  }
+
+  async function deleteScenario(item: Scenario) {
+    if (!window.confirm(scenarioLabels[lang].confirmDelete(item.id))) return;
+    setScenarioBusy(true);
+    try {
+      const response = await apiFetch(`${apiUrl}/api/scenarios/${item.id}`, { method: "DELETE" });
+      if (!response.ok) {
+        const payload = await response.json().catch(() => ({})) as { detail?: string };
+        throw new Error(payload.detail ?? scenarioLabels[lang].deleteFailed);
+      }
+      setScenarios((current) => current.filter((row) => row.id !== item.id));
+      if (editingScenarioId === item.id) { setEditingScenarioId(null); setScenario(initialScenario); }
+      if (selectedScenario === item.id) {
+        setDomainRules(null); setMandateReadyScenarioId(null);
+        setDashboard(null);
+        setGraph(null);
+        setRun(null);
+        setTrackerHistory([]);
+        setMandateLogs([]);
+        setAgents([]);
+        setSelectedScenario(null);
+      }
+      setNotice(scenarioLabels[lang].deleted.replace("{id}", String(item.id)));
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : scenarioLabels[lang].deleteFailed);
+    } finally {
+      setScenarioBusy(false);
+    }
   }
 
   async function refetchRunStatus() {
@@ -912,7 +1163,8 @@ export default function Home() {
   const activeLogs = trackerHistory.length ? trackerHistory : [{ stage: "IDLE", level: "INFO", message: t("notice.idle") }];
   const selectedTemplateData = templates.find((item) => item.key === selectedTemplate);
   const canGenerateRules = selectedScenario !== null && agents.length > 0;
-  const rulesAreStale = canGenerateRules && (!domainRules || domainRules.scenario_id !== selectedScenario || !domainRules.generated || domainRules.stale);
+  const canStartDiscussion = canGenerateRules && mandateReadyScenarioId === selectedScenario && domainRules?.scenario_id === selectedScenario && domainRules.generated && !domainRules.stale;
+  const rulesAreStale = canGenerateRules && !canStartDiscussion;
   const activeInfluence = useMemo(() => {
     return [...(runDashboard?.influence_observations ?? [])].sort(
       (a, b) => (b.normalized_weight ?? 0) - (a.normalized_weight ?? 0)
@@ -943,7 +1195,7 @@ export default function Home() {
     <section className="dashboard-hero"><div><div className="eyebrow">{t("hero.eyebrow")}</div><h1>{t("hero.title")}<br /><em>{t("hero.emphasis")}</em></h1><p>{t("hero.description")}</p></div><div className="hero-orbit"><span>DDR</span><b>→</b><span>CAR</span><b>→</b><span>SHCR</span></div></section>
     <div className="notice" role="status" aria-live="polite"><span className="notice-label">{t("notice.label")}</span><span>{notice || t("notice.ready")}</span></div>
 
-    <section className="control-strip"><div className="scenario-overview"><span>{t("scenario.active")}</span><strong>{selectedScenario ? t("scenario.number", { id: selectedScenario }) : t("scenario.none")}</strong><p className={scenarioExpanded ? "expanded" : "collapsed"}>{scenarios.find((item) => item.id === selectedScenario)?.description ?? t("scenario.prompt")}</p><button type="button" onClick={() => setScenarioExpanded((value) => !value)}>{scenarioExpanded ? t("scenario.hide") : t("scenario.show")}</button><select aria-label={t("scenario.select")} value={selectedScenario ?? ""} onChange={(event) => { setSelectedScenario(Number(event.target.value)); setDomainRules(null); setDashboard(null); setGraph(null); setRun(null); setTrackerHistory([]); setMandateLogs([]); }}><option value="" disabled>{t("scenario.select")}</option>{scenarios.map((item) => <option key={item.id} value={item.id}>#{item.id} — {item.description.slice(0, 72)}</option>)}</select></div><button className="primary-button run-button" onClick={startRun} disabled={run?.status === "RUNNING" || run?.status === "QUEUED" || rulesAreStale}>{run?.status === "RUNNING" ? t("run.running") : run?.status === "QUEUED" ? t("run.queued") : t("run.start")}<span>↗</span></button></section>
+    <section className="control-strip"><div className="scenario-overview"><span>{t("scenario.active")}</span><strong>{selectedScenario ? t("scenario.number", { id: selectedScenario }) : t("scenario.none")}</strong><p className={scenarioExpanded ? "expanded" : "collapsed"}>{scenarios.find((item) => item.id === selectedScenario)?.description ?? t("scenario.prompt")}</p><button type="button" onClick={() => setScenarioExpanded((value) => !value)}>{scenarioExpanded ? t("scenario.hide") : t("scenario.show")}</button><select aria-label={t("scenario.select")} value={selectedScenario ?? ""} onChange={(event) => { setSelectedScenario(Number(event.target.value)); setDomainRules(null); setMandateReadyScenarioId(null); setDashboard(null); setGraph(null); setRun(null); setTrackerHistory([]); setMandateLogs([]); }}><option value="" disabled>{t("scenario.select")}</option>{scenarios.map((item) => <option key={item.id} value={item.id}>#{item.id} — {item.description.slice(0, 72)}</option>)}</select></div><button className="primary-button run-button" onClick={startRun} disabled={run?.status === "RUNNING" || run?.status === "QUEUED" || !canStartDiscussion}>{run?.status === "RUNNING" ? t("run.running") : run?.status === "QUEUED" ? t("run.queued") : t("run.start")}<span>↗</span></button></section>
 
     <nav className="wizard-tabs" role="tablist" aria-label={t("wizard.label")}>{tabs.map((label, index) => <button ref={(element) => { tabRefs.current[index] = element; }} id={`wizard-tab-${index}`} type="button" role="tab" aria-selected={activeTab === index} aria-controls={`wizard-panel-${index}`} tabIndex={activeTab === index ? 0 : -1} className={activeTab === index ? "active" : ""} onClick={() => selectTab(index)} onKeyDown={(event) => handleTabKeyDown(event, index)} key={label}><span>{String(index + 1).padStart(2, "0")}</span><strong>{label}</strong></button>)}</nav>
 
@@ -957,7 +1209,7 @@ export default function Home() {
     <section id="wizard-panel-4" role="tabpanel" aria-labelledby="wizard-tab-4" tabIndex={0} hidden={activeTab !== 4} className="final-panel"><section id="analytics" className="analytics-section"><div className="section-header"><div><span className="section-number">07</span><h2>{t("analytics.title")}</h2></div><button className="export-button" onClick={exportManifest}>{t("analytics.export")}</button></div><CollectiveReasoningPanel analysis={collectiveReasoning} /><InfluencePanel observations={activeInfluence} /><InfeasiblePanel metric={currentMetric} hardStop={hardStop} message={finalResultMessage} rejectedAlternatives={rejectedAlternatives} hardConstraints={hardConstraints} /><section className="panel graph-panel"><div className="section-header"><div><span className="section-number">GRAPH</span><h2>{t("graph.title")}</h2></div><div className="graph-legend"><span><i className="pending" /> {t("status.pending")}</span><span><i className="running" /> {t("status.active")}</span><span><i className="succeeded" /> {t("status.complete")}</span><span><i className="warning" /> {t("status.dissent")}</span><span><i className="failed" /> {t("status.failed")}</span></div></div><RunGraph graph={currentGraph} /></section><div className="convergence-banner"><div><span>{t("analytics.final")}</span><strong>{currentMetric?.convergence_status ?? t("analytics.awaiting")}</strong></div><div className="convergence-meta"><span>{t("analytics.feasible")}</span><b>{currentMetric?.feasible_alternatives_count === undefined || currentMetric?.feasible_alternatives_count === null ? "—" : formatNumber(currentMetric.feasible_alternatives_count)}</b></div></div><div className="metric-grid"><MetricCard label={t("analytics.metrics.constraint")} value={currentMetric ? formatNumber(currentMetric.hard_constraint_violation_rate, { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : "—"} unit="%" tone="rust" /><MetricCard label={t("analytics.metrics.provenance")} value={currentMetric ? formatNumber(currentMetric.provenance_completeness_percent, { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : "—"} unit="%" /><MetricCard label={t("analytics.metrics.schema")} value={dashboard ? formatNumber(dashboard.schema_validity_percent, { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : "—"} unit="%" tone="mint" /><MetricCard label={t("analytics.metrics.latency")} value={latest ? formatNumber(latest.latency_ms, { maximumFractionDigits: 0 }) : "—"} unit={latest ? `ms · ${formatNumber(latest.token_usage)} tok` : ""} /></div><div className="analytics-lower"><div className="history-block"><div className="subhead"><span>{t("analytics.metricHistory")}</span><b>{formatNumber(dashboard?.metric_history?.length ?? 0)} {t("common.runs")}</b></div>{dashboard?.metric_history?.length ? dashboard.metric_history.slice(0, 5).map((metric) => <div className="history-row" key={metric.id}><span>#{metric.id}</span><strong>{metric.convergence_status}</strong><i>{formatNumber(metric.provenance_completeness_percent, { minimumFractionDigits: 1, maximumFractionDigits: 1 })}% {t("analytics.provenance")}</i><b>{formatDateTime(metric.created_at)}</b></div>) : <p className="empty">{t("analytics.noHistory")}</p>}</div><div className="influence-block"><div className="subhead"><span>{t("analytics.influence")}</span><b>{formatNumber(activeInfluence.length)} {t("common.observations")}</b></div>{activeInfluence.length ? activeInfluence.map((item, index) => <div className="weight-row" key={`${item.agent}-${item.proposition}`}><span>{String(index + 1).padStart(2, "0")}</span><div><strong>{item.agent}</strong><small>{item.proposition}</small></div><b>{item.normalized_weight === null ? "—" : `${formatNumber(item.normalized_weight * 100, { minimumFractionDigits: 1, maximumFractionDigits: 1 })}%`}</b></div>) : <p className="empty">{t("analytics.noInfluence")}</p>}</div></div></section><WizardControls current={activeTab} onChange={selectTab} /></section>
 
     <section id="wizard-panel-0" role="tabpanel" aria-labelledby="wizard-tab-0" tabIndex={0} hidden={activeTab !== 0} className="setup-section">
-      <div className="section-header"><div><span className="section-number">01 / 02</span><h2>{t("setup.title")}</h2></div><button ref={templateButtonRef} type="button" className="template-load-button" onClick={openTemplateModal} disabled={busy}>{t("setup.loadTemplates")}</button></div>
+      <div className="section-header"><div><span className="section-number">01 / 02</span><h2>{t("setup.title")}</h2></div><button ref={templateButtonRef} type="button" className="template-load-button" onClick={openTemplateModal} disabled={busy || selectedScenario === null}>{t("setup.loadTemplates")}</button></div>
       <p className="setup-intro">{t("setup.intro")}</p>
       <form className="global-config-form" aria-busy={globalConfigLoading || globalConfigBusy} onSubmit={submitGlobalConfig}><fieldset className="global-config-fieldset" disabled={globalConfigLoading || globalConfigBusy || globalConfigLoadError}><div className="global-config-heading"><div><span className="section-number">GLOBAL / LLM</span><h3>{t("global.title")}</h3><p>{t("global.description")}</p></div><div className={`config-indicator ${globalConfigMeta.has_llm_api_key ? "configured" : "unconfigured"}`}><i aria-hidden="true" /><strong>{globalConfigMeta.has_llm_api_key ? t("global.configured") : t("global.notConfigured")}</strong><small>{t("global.revision", { revision: globalConfigMeta.revision })}</small></div></div><div className="global-config-grid"><label className="form-field"><strong>{t("form.apiBase")}</strong><input type="url" value={globalConfig.llm_base_url} onChange={(event) => setGlobalConfig({ ...globalConfig, llm_base_url: event.target.value })} /><small>{t("global.baseHint")}</small></label><label className="form-field"><strong>{t("form.apiKey")}</strong><input type="password" autoComplete="new-password" value={globalConfig.llm_api_key} placeholder={globalConfigMeta.has_llm_api_key ? t("global.keyPlaceholder") : ""} onChange={(event) => setGlobalConfig({ ...globalConfig, llm_api_key: event.target.value })} /><small>{t("global.keyHint")}</small></label><label className="form-field"><strong>{t("form.model")}</strong><input value={globalConfig.llm_model} onChange={(event) => setGlobalConfig({ ...globalConfig, llm_model: event.target.value })} /></label><label className="form-field"><strong>{t("form.maxTokens")}</strong><input type="number" min="1" step="1" required value={globalConfig.max_tokens} onChange={(event) => setGlobalConfig({ ...globalConfig, max_tokens: Number(event.target.value) })} /></label><label className="form-field"><strong>{t("form.temperature")}</strong><input type="number" min="0" max="2" step="0.01" required value={globalConfig.temperature} onChange={(event) => setGlobalConfig({ ...globalConfig, temperature: Number(event.target.value) })} /></label><label className="toggle-field"><input type="checkbox" checked={globalConfig.apply_to_all} onChange={(event) => setGlobalConfig({ ...globalConfig, apply_to_all: event.target.checked })} /><span aria-hidden="true" /><strong>{t("global.applyAll")}</strong><small>{t("global.applyAllHint")}</small></label></div><button className="primary-button global-config-submit" disabled={globalConfigBusy}>{globalConfigBusy ? t("setup.saving") : globalConfigLoading ? t("global.loading") : t("global.save")}<span>↗</span></button></fieldset></form>{globalConfigLoadError && <div className="config-load-error" role="alert"><span>{t("notice.globalConfigPending")}</span><button type="button" onClick={() => loadGlobalConfig().catch(() => setNotice(t("notice.globalConfigPending")))}>{t("notice.refetch")}</button></div>}
       <form className="agent-config-form" onSubmit={submitAgent}>
@@ -1002,9 +1254,11 @@ export default function Home() {
 
       <div className="agent-register"><div className="subhead"><span>{t("setup.savedAgents")}</span><b>{formatNumber(agents.length)} {t("common.agents")}</b></div>{agents.length ? agents.map((item) => <div className="agent-register-row" key={item.id}><div><strong>{item.display_name ?? item.name}</strong><small>{item.role}</small></div><span>{item.template_key ? t("setup.templateTag") : t("setup.customTag")}</span><b>{item.llm_model ?? t("setup.envDefault")}</b><div className="agent-actions"><button type="button" onClick={() => generateAgentMandate(item.id)} disabled={rulesBusy || busyAgentId !== null || busyAgentId === item.id}>{busyAgentId === item.id ? t("common.generating") : t("common.generateMandate")}</button><button type="button" onClick={() => testConnection(item)} disabled={connectionTests[item.id]?.pending === true}>{connectionTests[item.id]?.pending ? t("notice.testing") : t("action.test")}</button><button type="button" onClick={() => editAgent(item)}>{t("action.edit")}</button><button type="button" className="danger" onClick={() => deleteAgent(item)}>{t("action.delete")}</button>{connectionTests[item.id] && <small role="status" aria-live="polite" className={connectionTests[item.id].ok ? "test-ok" : "test-error"}>{connectionTests[item.id].message}</small>}</div></div>) : <p className="empty">{t("setup.noAgents")}</p>}</div>
 
-      <form className="scenario-config-form" onSubmit={submitScenario}><div><span className="section-number">{t("scenario.section")}</span><h3>{t("setup.scenario")}</h3><small>{t("form.scenarioHint")}</small></div><label className="form-field"><strong>{t("form.goal")}</strong><textarea value={scenario.description} onChange={(event) => setScenario({ ...scenario, description: event.target.value })} rows={4} required /><small>{t("form.goalHint")}</small></label><label className="form-field"><strong>{t("form.programCost")}</strong><input type="number" min="0" step="0.01" value={scenario.program_cost ?? ""} onChange={(event) => setScenario({ ...scenario, program_cost: event.target.value === "" ? null : Number(event.target.value) })} /><small>{t("form.costHint")}</small></label><button className="secondary-button" disabled={busy}>{t("action.saveScenario")}</button></form><WizardControls current={activeTab} onChange={selectTab} />
+      <div className="agent-register"><div className="subhead"><span>{t("scenario.section")}</span><b>{formatNumber(scenarios.length)}</b></div>{scenarios.length ? scenarios.map((item) => <div className={`agent-register-row ${selectedScenario === item.id ? "active" : ""}`} key={item.id}><div><strong>#{item.id}</strong><small>{item.description}</small></div><span>{item.instrument ?? "APBN"}</span><div className="agent-actions"><button type="button" onClick={() => { setSelectedScenario(item.id); setDomainRules(null); setMandateReadyScenarioId(null); setDashboard(null); setGraph(null); setRun(null); setTrackerHistory([]); setMandateLogs([]); }}>{t("scenario.select")}</button><button type="button" onClick={() => editScenario(item)} disabled={scenarioBusy}>{scenarioLabels[lang].edit}</button><button type="button" className="danger" onClick={() => deleteScenario(item)} disabled={scenarioBusy}>{t("action.delete")}</button></div></div>) : <p className="empty">{t("scenario.none")}</p>}</div>
+
+      <form className="scenario-config-form" onSubmit={submitScenario}><div><span className="section-number">{t("scenario.section")}</span><h3>{t("setup.scenario")}</h3><small>{t("form.scenarioHint")}</small>{editingScenarioId !== null && <strong className="scenario-editing">{t("scenario.active")} #{editingScenarioId}</strong>}</div><label className="form-field"><strong>{t("form.goal")}</strong><textarea value={scenario.description} onChange={(event) => setScenario({ ...scenario, description: event.target.value })} rows={4} required /><small>{t("form.goalHint")}</small></label><ScenarioParameterSections value={scenario} onChange={setScenario} lang={lang} /><div className="scenario-form-actions"><button className="secondary-button" disabled={busy || scenarioBusy}>{editingScenarioId !== null ? scenarioLabels[lang].save : t("action.saveScenario")}</button>{editingScenarioId !== null && <button type="button" className="secondary-button" disabled={scenarioBusy} onClick={() => { setEditingScenarioId(null); setScenario(initialScenario); }}>{t("action.cancel")}</button>}</div></form><WizardControls current={activeTab} onChange={selectTab} />
     </section>
-    {templateModalOpen && <div className="modal-backdrop" role="presentation"><div ref={templateModalRef} className="template-modal" role="dialog" aria-modal="true" aria-labelledby="template-modal-title"><div className="section-header"><div><span className="section-number">LLM</span><h2 id="template-modal-title">{t("setup.modalTitle")}</h2></div><button type="button" className="modal-close" aria-label={t("modal.close")} onClick={closeTemplateModal}>×</button></div><p>{t("setup.modalDescription")}</p><div className="template-config-list">{templates.map((item) => { const config = templateConfigs[item.key]; if (!config) return null; return <fieldset className="template-config-card" key={item.key}><legend>{item.name}</legend><label><span>{t("form.apiBase")}</span><input value={config.llm_base_url} onChange={(event) => setTemplateConfigs({ ...templateConfigs, [item.key]: { ...config, llm_base_url: event.target.value } })} /></label><label><span>{t("form.apiKey")}</span><input type="password" value={config.llm_api_key} onChange={(event) => setTemplateConfigs({ ...templateConfigs, [item.key]: { ...config, llm_api_key: event.target.value } })} /></label><label><span>{t("form.model")}</span><input value={config.llm_model} onChange={(event) => setTemplateConfigs({ ...templateConfigs, [item.key]: { ...config, llm_model: event.target.value } })} /></label><label><span>{t("form.temperature")}</span><input type="number" min="0" max="2" step="0.01" value={config.temperature} onChange={(event) => setTemplateConfigs({ ...templateConfigs, [item.key]: { ...config, temperature: Number(event.target.value) } })} /></label><label><span>{t("form.maxTokens")}</span><input type="number" min="1" value={config.max_tokens} onChange={(event) => setTemplateConfigs({ ...templateConfigs, [item.key]: { ...config, max_tokens: Number(event.target.value) } })} /></label></fieldset>; })}</div><button type="button" className="primary-button" onClick={loadAllTemplates} disabled={busy}>{busy ? t("setup.saving") : t("setup.modalSave")}<span>↗</span></button></div></div>}
+    {templateModalOpen && <div className="modal-backdrop" role="presentation"><div ref={templateModalRef} className="template-modal" role="dialog" aria-modal="true" aria-labelledby="template-modal-title"><div className="section-header"><div><span className="section-number">LLM</span><h2 id="template-modal-title">{t("setup.modalTitle")}</h2></div><button type="button" className="modal-close" aria-label={t("modal.close")} onClick={closeTemplateModal}>×</button></div><p>{t("setup.modalDescription")}</p><div className="template-config-list">{templates.map((item) => { const config = templateConfigs[item.key]; if (!config) return null; return <fieldset className="template-config-card" key={item.key}><legend>{item.name}</legend><label><span>{t("form.apiBase")}</span><input value={config.llm_base_url} onChange={(event) => setTemplateConfigs({ ...templateConfigs, [item.key]: { ...config, llm_base_url: event.target.value } })} /></label><label><span>{t("form.apiKey")}</span><input type="password" value={config.llm_api_key} onChange={(event) => setTemplateConfigs({ ...templateConfigs, [item.key]: { ...config, llm_api_key: event.target.value } })} /></label><label><span>{t("form.model")}</span><input value={config.llm_model} onChange={(event) => setTemplateConfigs({ ...templateConfigs, [item.key]: { ...config, llm_model: event.target.value } })} /></label><label><span>{t("form.temperature")}</span><input type="number" min="0" max="2" step="0.01" value={config.temperature} onChange={(event) => setTemplateConfigs({ ...templateConfigs, [item.key]: { ...config, temperature: Number(event.target.value) } })} /></label><label><span>{t("form.maxTokens")}</span><input type="number" min="1" value={config.max_tokens} onChange={(event) => setTemplateConfigs({ ...templateConfigs, [item.key]: { ...config, max_tokens: Number(event.target.value) } })} /></label></fieldset>; })}</div><button type="button" className="primary-button" onClick={loadAllTemplates} disabled={busy || selectedScenario === null}>{busy ? t("setup.saving") : t("setup.modalSave")}<span>↗</span></button></div></div>}
     <footer><span>{t("footer.instrument")}</span><span>SRR + (RAR → DAI) + DDR + CAR</span></footer>
   </main>;
 }

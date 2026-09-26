@@ -285,14 +285,16 @@ def build_agent_user_prompt(
     role: str,
     policy_goal: str,
     program_cost: float | None,
-    max_deficit: float,
+    simulation_payload: Mapping[str, object] | None = None,
 ) -> str:
-    effective_ceiling = min(max_deficit, STATUTORY_DEFICIT_CEILING_PERCENT_GDP)
+    policy_inputs = dict(simulation_payload or {})
+    policy_inputs.setdefault("program_cost", program_cost)
     return (
         f"Agent role: {role}\n"
         f"Policy goal: {policy_goal}\n"
         f"Program cost: {program_cost if program_cost is not None else 'UNKNOWN'}\n"
-        f"Automatic legal deficit ceiling: {effective_ceiling}%\n\n"
+        f"Scenario inputs: {json.dumps(policy_inputs, ensure_ascii=False, sort_keys=True)}\n"
+        f"Automatic legal deficit ceiling: {STATUTORY_DEFICIT_CEILING_PERCENT_GDP}%\n\n"
         "Produce a decision-complete SRR JSON response with all mandatory decision artifacts: "
         "non-empty evidence, predictions, risks, uncertainties, and alternatives arrays, plus "
         "a recommendation object and numeric confidence between 0 and 1. State evidence-backed impact "
@@ -321,16 +323,14 @@ def build_mandate_synthesis_prompt(
     primary_sources: Sequence[str] = (),
     constraints: Sequence[str] = (),
     owned_checks: Sequence[str] = (),
-    max_deficit_constraint: float = 3.0,
+    simulation_payload: Mapping[str, object] | None = None,
 ) -> str:
     domain_contract = {
         "primary_sources": list(primary_sources),
         "constraints": list(constraints),
         "owned_checks": list(owned_checks),
-        "automatic_deficit_ceiling_percent_gdp": min(
-            max_deficit_constraint,
-            STATUTORY_DEFICIT_CEILING_PERCENT_GDP,
-        ),
+        "automatic_deficit_ceiling_percent_gdp": STATUTORY_DEFICIT_CEILING_PERCENT_GDP,
+        "scenario_inputs": dict(simulation_payload or {}),
     }
     return (
         f"Act autonomously as the expert {role} named {agent_name}. Generate a practical, "

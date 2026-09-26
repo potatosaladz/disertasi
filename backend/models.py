@@ -19,8 +19,55 @@ from sqlalchemy import (
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
+from pydantic import BaseModel, ConfigDict, Field
 
 from .database import Base
+
+SCENARIO_PARAMETER_FIELDS = (
+    "instrument",
+    "targeting",
+    "program_cost",
+    "duration_months",
+    "evaluation_trigger",
+    "program_cost_period",
+    "no_phase0",
+    "phase0_only",
+    "no_phased",
+    "proposed_reallocation",
+    "reallocation_from_education",
+    "proposed_additional_revenue",
+    "revenue_measure_type",
+    "proposed_debt_financing",
+    "debt_financing_mode",
+    "proposed_sal_use",
+    "sal_purpose",
+    "proposed_other_financing",
+    "appropriation_available",
+    "verified_reallocation_capacity",
+    "verified_revenue_offset_capacity",
+    "verified_debt_financing_headroom",
+    "verified_sal_available",
+    "verified_operational_cash_minimum",
+    "verified_projected_cash_after_policy",
+    "verified_cumulative_borrowing_pct_gdp",
+    "spending_reallocation_authorized",
+    "dpr_spending_adjustment_recommendation",
+    "finance_minister_sal_authorized",
+    "dpr_sal_approval_obtained",
+    "dpr_additional_sbn_approval_obtained",
+    "tax_measure_has_enacted_law",
+    "pnbp_measure_has_valid_tariff_instrument",
+    "output_outcome_documented",
+    "domestic_product_compliance_documented",
+    "growth_outlook",
+    "inflation_outlook",
+    "fx_outlook",
+    "sbn10y_yield_outlook",
+    "icp_outlook",
+    "oil_lifting_outlook",
+    "gas_lifting_outlook",
+    "tax_revenue_forecast",
+)
 
 
 class ConvergenceStatus(str, enum.Enum):
@@ -42,6 +89,36 @@ class Agent(Base):
         ),
         CheckConstraint("max_tokens > 0", name="ck_agent_max_tokens_positive"),
         Index(
+            "uq_agent_global_name",
+            "name",
+            unique=True,
+            postgresql_where=text("scenario_id IS NULL"),
+        ),
+        Index(
+            "uq_agent_scenario_name",
+            "scenario_id",
+            "name",
+            unique=True,
+            postgresql_where=text("scenario_id IS NOT NULL"),
+        ),
+        Index(
+            "uq_agent_global_template_key",
+            "template_key",
+            unique=True,
+            postgresql_where=text(
+                "scenario_id IS NULL AND template_key IS NOT NULL"
+            ),
+        ),
+        Index(
+            "uq_agent_scenario_template_key",
+            "scenario_id",
+            "template_key",
+            unique=True,
+            postgresql_where=text(
+                "scenario_id IS NOT NULL AND template_key IS NOT NULL"
+            ),
+        ),
+        Index(
             "uq_agent_singleton_orchestrator",
             "is_orchestrator",
             unique=True,
@@ -59,9 +136,9 @@ class Agent(Base):
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    name: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
     role: Mapped[str] = mapped_column(String(255), nullable=False)
-    template_key: Mapped[str | None] = mapped_column(String(100), unique=True)
+    template_key: Mapped[str | None] = mapped_column(String(100))
     scenario_id: Mapped[int | None] = mapped_column(
         ForeignKey("scenarios.id", ondelete="CASCADE"), nullable=True, index=True
     )
@@ -151,21 +228,191 @@ class AgentInfluenceObservation(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+class SimulationPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid", from_attributes=True)
+
+    instrument: str | None = Field(default=None, max_length=255)
+    targeting: str | None = None
+    program_cost: float | None = Field(default=None, ge=0.0, allow_inf_nan=False)
+    duration_months: int | None = Field(default=None, gt=0)
+    evaluation_trigger: str | None = None
+    program_cost_period: str | None = Field(default=None, max_length=100)
+    no_phase0: bool | None = None
+    phase0_only: bool | None = None
+    no_phased: bool | None = None
+    proposed_reallocation: float | None = Field(default=None, ge=0.0, allow_inf_nan=False)
+    reallocation_from_education: bool | None = None
+    proposed_additional_revenue: float | None = Field(default=None, ge=0.0, allow_inf_nan=False)
+    revenue_measure_type: str | None = Field(default=None, max_length=255)
+    proposed_debt_financing: float | None = Field(default=None, ge=0.0, allow_inf_nan=False)
+    debt_financing_mode: str | None = Field(default=None, max_length=255)
+    proposed_sal_use: float | None = Field(default=None, ge=0.0, allow_inf_nan=False)
+    sal_purpose: str | None = None
+    proposed_other_financing: float | None = Field(default=None, ge=0.0, allow_inf_nan=False)
+    appropriation_available: bool | None = None
+    verified_reallocation_capacity: float | None = Field(default=None, ge=0.0, allow_inf_nan=False)
+    verified_revenue_offset_capacity: float | None = Field(default=None, ge=0.0, allow_inf_nan=False)
+    verified_debt_financing_headroom: float | None = Field(default=None, ge=0.0, allow_inf_nan=False)
+    verified_sal_available: float | None = Field(default=None, ge=0.0, allow_inf_nan=False)
+    verified_operational_cash_minimum: float | None = Field(default=None, ge=0.0, allow_inf_nan=False)
+    verified_projected_cash_after_policy: float | None = Field(default=None, ge=0.0, allow_inf_nan=False)
+    verified_cumulative_borrowing_pct_gdp: float | None = Field(default=None, ge=0.0, allow_inf_nan=False)
+    spending_reallocation_authorized: bool | None = None
+    dpr_spending_adjustment_recommendation: bool | None = None
+    finance_minister_sal_authorized: bool | None = None
+    dpr_sal_approval_obtained: bool | None = None
+    dpr_additional_sbn_approval_obtained: bool | None = None
+    tax_measure_has_enacted_law: bool | None = None
+    pnbp_measure_has_valid_tariff_instrument: bool | None = None
+    output_outcome_documented: bool | None = None
+    domestic_product_compliance_documented: bool | None = None
+    growth_outlook: float | None = Field(default=None, allow_inf_nan=False)
+    inflation_outlook: float | None = Field(default=None, allow_inf_nan=False)
+    fx_outlook: float | None = Field(default=None, gt=0.0, allow_inf_nan=False)
+    sbn10y_yield_outlook: float | None = Field(default=None, ge=0.0, allow_inf_nan=False)
+    icp_outlook: float | None = Field(default=None, ge=0.0, allow_inf_nan=False)
+    oil_lifting_outlook: float | None = Field(default=None, ge=0.0, allow_inf_nan=False)
+    gas_lifting_outlook: float | None = Field(default=None, ge=0.0, allow_inf_nan=False)
+    tax_revenue_forecast: float | None = Field(default=None, ge=0.0, allow_inf_nan=False)
+
+    def simulation_payload(self) -> dict[str, Any]:
+        return self.model_dump(exclude_none=True)
+
+
 class Scenario(Base):
     __tablename__ = "scenarios"
     __table_args__ = (
-        CheckConstraint("max_deficit_constraint >= 0", name="ck_scenario_max_deficit_nonnegative"),
         CheckConstraint(
             "program_cost IS NULL OR program_cost >= 0",
             name="ck_scenario_program_cost_nonnegative",
+        ),
+        CheckConstraint(
+            "duration_months IS NULL OR duration_months > 0",
+            name="ck_scenario_duration_positive",
+        ),
+        CheckConstraint(
+            "proposed_reallocation IS NULL OR proposed_reallocation >= 0",
+            name="ck_scenario_reallocation_nonnegative",
+        ),
+        CheckConstraint(
+            "proposed_additional_revenue IS NULL OR proposed_additional_revenue >= 0",
+            name="ck_scenario_revenue_nonnegative",
+        ),
+        CheckConstraint(
+            "proposed_debt_financing IS NULL OR proposed_debt_financing >= 0",
+            name="ck_scenario_debt_nonnegative",
+        ),
+        CheckConstraint(
+            "proposed_sal_use IS NULL OR proposed_sal_use >= 0",
+            name="ck_scenario_sal_use_nonnegative",
+        ),
+        CheckConstraint(
+            "proposed_other_financing IS NULL OR proposed_other_financing >= 0",
+            name="ck_scenario_other_financing_nonnegative",
+        ),
+        CheckConstraint(
+            "verified_reallocation_capacity IS NULL OR verified_reallocation_capacity >= 0",
+            name="ck_scenario_verified_reallocation_nonnegative",
+        ),
+        CheckConstraint(
+            "verified_revenue_offset_capacity IS NULL OR verified_revenue_offset_capacity >= 0",
+            name="ck_scenario_verified_revenue_nonnegative",
+        ),
+        CheckConstraint(
+            "verified_debt_financing_headroom IS NULL OR verified_debt_financing_headroom >= 0",
+            name="ck_scenario_verified_debt_nonnegative",
+        ),
+        CheckConstraint(
+            "verified_sal_available IS NULL OR verified_sal_available >= 0",
+            name="ck_scenario_verified_sal_nonnegative",
+        ),
+        CheckConstraint(
+            "verified_operational_cash_minimum IS NULL OR verified_operational_cash_minimum >= 0",
+            name="ck_scenario_verified_cash_minimum_nonnegative",
+        ),
+        CheckConstraint(
+            "verified_projected_cash_after_policy IS NULL OR verified_projected_cash_after_policy >= 0",
+            name="ck_scenario_verified_cash_after_nonnegative",
+        ),
+        CheckConstraint(
+            "verified_cumulative_borrowing_pct_gdp IS NULL OR verified_cumulative_borrowing_pct_gdp >= 0",
+            name="ck_scenario_verified_borrowing_nonnegative",
+        ),
+        CheckConstraint(
+            "fx_outlook IS NULL OR fx_outlook > 0",
+            name="ck_scenario_fx_positive",
+        ),
+        CheckConstraint(
+            "sbn10y_yield_outlook IS NULL OR sbn10y_yield_outlook >= 0",
+            name="ck_scenario_sbn_yield_nonnegative",
+        ),
+        CheckConstraint(
+            "icp_outlook IS NULL OR icp_outlook >= 0",
+            name="ck_scenario_icp_nonnegative",
+        ),
+        CheckConstraint(
+            "oil_lifting_outlook IS NULL OR oil_lifting_outlook >= 0",
+            name="ck_scenario_oil_lifting_nonnegative",
+        ),
+        CheckConstraint(
+            "gas_lifting_outlook IS NULL OR gas_lifting_outlook >= 0",
+            name="ck_scenario_gas_lifting_nonnegative",
+        ),
+        CheckConstraint(
+            "tax_revenue_forecast IS NULL OR tax_revenue_forecast >= 0",
+            name="ck_scenario_tax_forecast_nonnegative",
         ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     description: Mapped[str] = mapped_column(Text, nullable=False)
+    instrument: Mapped[str | None] = mapped_column(String(255))
+    targeting: Mapped[str | None] = mapped_column(Text)
     program_cost: Mapped[float | None] = mapped_column(Float)
-    max_deficit_constraint: Mapped[float] = mapped_column(Float, nullable=False, default=3.0, server_default="3.0")
+    duration_months: Mapped[int | None] = mapped_column(Integer)
+    evaluation_trigger: Mapped[str | None] = mapped_column(Text)
+    program_cost_period: Mapped[str | None] = mapped_column(String(100))
+    no_phase0: Mapped[bool | None] = mapped_column(Boolean)
+    phase0_only: Mapped[bool | None] = mapped_column(Boolean)
+    no_phased: Mapped[bool | None] = mapped_column(Boolean)
+    proposed_reallocation: Mapped[float | None] = mapped_column(Float)
+    reallocation_from_education: Mapped[bool | None] = mapped_column(Boolean)
+    proposed_additional_revenue: Mapped[float | None] = mapped_column(Float)
+    revenue_measure_type: Mapped[str | None] = mapped_column(String(255))
+    proposed_debt_financing: Mapped[float | None] = mapped_column(Float)
+    debt_financing_mode: Mapped[str | None] = mapped_column(String(255))
+    proposed_sal_use: Mapped[float | None] = mapped_column(Float)
+    sal_purpose: Mapped[str | None] = mapped_column(Text)
+    proposed_other_financing: Mapped[float | None] = mapped_column(Float)
+    appropriation_available: Mapped[bool | None] = mapped_column(Boolean)
+    verified_reallocation_capacity: Mapped[float | None] = mapped_column(Float)
+    verified_revenue_offset_capacity: Mapped[float | None] = mapped_column(Float)
+    verified_debt_financing_headroom: Mapped[float | None] = mapped_column(Float)
+    verified_sal_available: Mapped[float | None] = mapped_column(Float)
+    verified_operational_cash_minimum: Mapped[float | None] = mapped_column(Float)
+    verified_projected_cash_after_policy: Mapped[float | None] = mapped_column(Float)
+    verified_cumulative_borrowing_pct_gdp: Mapped[float | None] = mapped_column(Float)
+    spending_reallocation_authorized: Mapped[bool | None] = mapped_column(Boolean)
+    dpr_spending_adjustment_recommendation: Mapped[bool | None] = mapped_column(Boolean)
+    finance_minister_sal_authorized: Mapped[bool | None] = mapped_column(Boolean)
+    dpr_sal_approval_obtained: Mapped[bool | None] = mapped_column(Boolean)
+    dpr_additional_sbn_approval_obtained: Mapped[bool | None] = mapped_column(Boolean)
+    tax_measure_has_enacted_law: Mapped[bool | None] = mapped_column(Boolean)
+    pnbp_measure_has_valid_tariff_instrument: Mapped[bool | None] = mapped_column(Boolean)
+    output_outcome_documented: Mapped[bool | None] = mapped_column(Boolean)
+    domestic_product_compliance_documented: Mapped[bool | None] = mapped_column(Boolean)
+    growth_outlook: Mapped[float | None] = mapped_column(Float)
+    inflation_outlook: Mapped[float | None] = mapped_column(Float)
+    fx_outlook: Mapped[float | None] = mapped_column(Float)
+    sbn10y_yield_outlook: Mapped[float | None] = mapped_column(Float)
+    icp_outlook: Mapped[float | None] = mapped_column(Float)
+    oil_lifting_outlook: Mapped[float | None] = mapped_column(Float)
+    gas_lifting_outlook: Mapped[float | None] = mapped_column(Float)
+    tax_revenue_forecast: Mapped[float | None] = mapped_column(Float)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    def simulation_payload(self) -> dict[str, Any]:
+        return SimulationPayload.model_validate(self).simulation_payload()
 
 
 class ScenarioMandateSnapshot(Base):

@@ -13,7 +13,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from openai import APIConnectionError, APITimeoutError, OpenAI
 from pydantic import BaseModel, ConfigDict, Field, field_validator
-from sqlalchemy import select, text
+from sqlalchemy import delete, select, text
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
 from .agent_templates import (
@@ -21,13 +22,16 @@ from .agent_templates import (
     agent_revision,
     agent_utility_metadata,
     find_agent_by_mandate,
+    find_agent_by_name_and_scenario,
     get_agent_spec,
     global_deliberative_agents,
     is_generated_agent_name,
     is_master_orchestrator,
     load_standard_agent_templates,
     mandate_seed,
+    replace_scenario_agent_templates,
     scenario_deliberative_agents,
+    scenario_scoped_agents,
     semantic_agent_name,
     template_catalog,
 )
@@ -53,11 +57,15 @@ from .init_db import initialize_database
 from .models import (
     Agent,
     AgentInfluenceObservation,
+    ConsensusSession,
     GlobalLLMConfig,
     DisagreementLog,
+    MetricSnapshot,
     ReasoningLog,
     Scenario,
     ScenarioMandateSnapshot,
+    SimulationArtifact,
+    SimulationPayload,
 )
 
 
@@ -111,6 +119,7 @@ class AgentCreate(BaseModel):
     name: str = Field(min_length=1, max_length=255)
     role: str = Field(min_length=1, max_length=255)
     template_key: str | None = Field(default=None, max_length=100)
+    scenario_id: int | None = Field(default=None, gt=0)
     theta_x: float = Field(default=1.0, ge=0.0, allow_inf_nan=False)
     theta_q: float = Field(default=1.0, ge=0.0, allow_inf_nan=False)
     theta_h: float = Field(default=1.0, ge=0.0, allow_inf_nan=False)
@@ -150,6 +159,7 @@ class AgentResponse(BaseModel):
     reused: bool = False
     role: str
     template_key: str | None
+    scenario_id: int | None
     theta_x: float
     theta_q: float
     theta_h: float
@@ -221,19 +231,21 @@ class DomainRulesResponse(BaseModel):
     detail: str | None = None
 
 
-class ScenarioCreate(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+class ScenarioCreate(SimulationPayload):
+    model_config = ConfigDict(extra="forbid", from_attributes=True)
 
     description: str = Field(min_length=1)
-    program_cost: float | None = Field(default=None, ge=0.0, allow_inf_nan=False)
-    max_deficit_constraint: float = Field(default=3.0, ge=0.0, le=3.0, allow_inf_nan=False)
 
 
-class ScenarioResponse(BaseModel):
+class ScenarioUpdate(SimulationPayload):
+    model_config = ConfigDict(extra="forbid", from_attributes=True)
+
+    description: str | None = Field(default=None, min_length=1)
+
+
+class ScenarioResponse(SimulationPayload):
     id: int
     description: str
-    program_cost: float | None = None
-    max_deficit_constraint: float
 
 
 def agent_response(agent: Agent, *, reused: bool = False) -> AgentResponse:
@@ -244,6 +256,7 @@ def agent_response(agent: Agent, *, reused: bool = False) -> AgentResponse:
         reused=reused,
         role=agent.role,
         template_key=agent.template_key,
+        scenario_id=agent.scenario_id,
         theta_x=agent.theta_x,
         theta_q=agent.theta_q,
         theta_h=agent.theta_h,
@@ -259,12 +272,7 @@ def agent_response(agent: Agent, *, reused: bool = False) -> AgentResponse:
 
 
 def scenario_response(scenario: Scenario) -> ScenarioResponse:
-    return ScenarioResponse(
-        id=scenario.id,
-        description=scenario.description,
-        program_cost=scenario.program_cost,
-        max_deficit_constraint=scenario.max_deficit_constraint,
-    )
+    return ScenarioResponse.model_validate(scenario)
 
 
 @asynccontextmanager
@@ -343,6 +351,36 @@ def load_agent_templates(payload: LoadTemplatesRequest | None = None) -> dict[st
         }
 
 
+@app.post("/api/scenarios/{scenario_id}/load-templates")
+@app.post("/scenarios/{scenario_id}/load-templates")
+def load_scenario_agent_templates(
+    scenario_id: int,
+    payload: LoadTemplatesRequest | None = None,
+) -> dict[str, object]:
+    configs = {
+        key: config.model_dump()
+        for key, config in (payload.configs if payload else {}).items()
+    }
+    unknown = set(configs) - {item["key"] for item in template_catalog()}
+    if unknown:
+        raise HTTPException(status_code=422, detail=f"Unknown templates: {sorted(unknown)}")
+    with SessionLocal() as session:
+        scenario = session.get(Scenario, scenario_id)
+        if scenario is None:
+            raise HTTPException(status_code=404, detail="Scenario not found")
+        _clear_scenario_execution_data(session, scenario_id)
+        agents = replace_scenario_agent_templates(session, scenario_id, configs)
+        session.commit()
+        for agent in agents:
+            session.refresh(agent)
+        return {
+            "created": len(agents),
+            "total": len(agents),
+            "scenario_id": scenario_id,
+            "agents": [agent_response(agent).model_dump() for agent in agents],
+        }
+
+
 @app.post("/api/agents", response_model=AgentResponse, status_code=status.HTTP_201_CREATED)
 @app.post("/agents", response_model=AgentResponse, status_code=status.HTTP_201_CREATED)
 def create_agent(payload: AgentCreate, response: Response) -> AgentResponse:
@@ -353,10 +391,26 @@ def create_agent(payload: AgentCreate, response: Response) -> AgentResponse:
             raise HTTPException(status_code=422, detail="Unknown agent template")
         if template is not None:
             values["system_prompt"] = template.system_prompt
-        existing_named_agent = session.scalar(
-            select(Agent).where(Agent.name == payload.name)
+        if payload.scenario_id is not None and session.get(Scenario, payload.scenario_id) is None:
+            raise HTTPException(status_code=404, detail="Scenario not found")
+        idempotent = find_agent_by_name_and_scenario(
+            session,
+            name=payload.name,
+            scenario_id=payload.scenario_id,
         )
-        if is_generated_agent_name(payload.name):
+        if idempotent is not None:
+            response.status_code = status.HTTP_200_OK
+            return agent_response(idempotent, reused=True)
+        existing_named_agent = (
+            find_agent_by_name_and_scenario(
+                session,
+                name=payload.name,
+                scenario_id=None,
+            )
+            if payload.scenario_id is None
+            else None
+        )
+        if is_generated_agent_name(payload.name) and payload.scenario_id is None:
             if existing_named_agent is not None and (
                 existing_named_agent.scenario_id is not None
                 or existing_named_agent.is_orchestrator
@@ -414,10 +468,29 @@ def create_agent(payload: AgentCreate, response: Response) -> AgentResponse:
             values["name"] = candidate
         elif existing_named_agent is not None:
             raise HTTPException(status_code=409, detail="Agent name already exists")
-        agent = Agent(**values)
-        session.add(agent)
+        inserted_id = session.scalar(
+            insert(Agent)
+            .values(**values)
+            .on_conflict_do_nothing()
+            .returning(Agent.id)
+        )
+        if inserted_id is None:
+            agent = find_agent_by_name_and_scenario(
+                session,
+                name=str(values["name"]),
+                scenario_id=payload.scenario_id,
+            )
+            if agent is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Agent name already exists in another scenario",
+                )
+            response.status_code = status.HTTP_200_OK
+            return agent_response(agent, reused=True)
         session.commit()
-        session.refresh(agent)
+        agent = session.get(Agent, inserted_id)
+        if agent is None:
+            raise HTTPException(status_code=500, detail="Agent creation failed")
         return agent_response(agent)
 
 
@@ -430,7 +503,11 @@ def update_agent(agent_id: int, payload: AgentUpdate) -> AgentResponse:
             raise HTTPException(status_code=404, detail="Agent not found")
         existing = (
             session.scalar(
-                select(Agent).where(Agent.name == payload.name, Agent.id != agent_id)
+                select(Agent).where(
+                    Agent.name == payload.name,
+                    Agent.scenario_id == agent.scenario_id,
+                    Agent.id != agent_id,
+                )
             )
             if payload.name is not None
             else None
@@ -454,12 +531,14 @@ def update_agent(agent_id: int, payload: AgentUpdate) -> AgentResponse:
 
 
 @app.get("/api/agents", response_model=list[AgentResponse])
-def list_agents() -> list[AgentResponse]:
+def list_agents(scenario_id: int | None = None) -> list[AgentResponse]:
     with SessionLocal() as session:
-        return [
-            agent_response(agent)
-            for agent in global_deliberative_agents(session)
-        ]
+        agents = (
+            scenario_scoped_agents(session, scenario_id)
+            if scenario_id is not None
+            else global_deliberative_agents(session)
+        )
+        return [agent_response(agent) for agent in agents]
 
 
 @app.get("/api/agents/{agent_id}", response_model=AgentResponse)
@@ -541,10 +620,7 @@ def _combined_domain_rules(agents: list[Agent], scenario: Scenario) -> dict[str,
         "owned_checks": sorted({item for spec in specs for item in spec.owned_checks}),
         "principles": sorted({item for spec in specs for item in spec.decision_principles}),
         "primary_sources": sorted({item for spec in specs for item in spec.primary_sources}),
-        "automatic_deficit_ceiling": min(
-            scenario.max_deficit_constraint,
-            STATUTORY_DEFICIT_CEILING_PERCENT_GDP,
-        ),
+        "automatic_deficit_ceiling": STATUTORY_DEFICIT_CEILING_PERCENT_GDP,
     }
 
 
@@ -773,7 +849,7 @@ def _synthesis_fallbacks(agent: Agent, scenario: Scenario) -> MandateSynthesisFa
             "Classify disagreements, preserve valid dissent, and escalate unresolved conflicts through DDR and CAR"
         ],
         regulatory_compliance_alignment=[
-            f"Enforce the {min(scenario.max_deficit_constraint, STATUTORY_DEFICIT_CEILING_PERCENT_GDP)}% GDP deficit ceiling and reject unverified fiscal offsets"
+            f"Enforce the {STATUTORY_DEFICIT_CEILING_PERCENT_GDP}% GDP deficit ceiling and reject unverified fiscal offsets"
         ],
     )
 
@@ -850,7 +926,7 @@ def _synthesize_agent_domain_rules(agent: Agent, scenario: Scenario) -> AgentDom
                         primary_sources=base.primary_sources,
                         constraints=base.constraints,
                         owned_checks=base.owned_checks,
-                        max_deficit_constraint=scenario.max_deficit_constraint,
+                        simulation_payload=scenario.simulation_payload(),
                     ),
                 },
             ],
@@ -1280,6 +1356,7 @@ def generate_agent_domain_rules(scenario_id: int, agent_id: int) -> AgentDomainR
 
 
 @app.delete("/api/agents/{agent_id}", status_code=status.HTTP_204_NO_CONTENT)
+@app.delete("/agents/{agent_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_agent(agent_id: int) -> Response:
     with SessionLocal() as session:
         agent = session.get(Agent, agent_id)
@@ -1331,6 +1408,72 @@ def get_domain_rules(scenario_id: int) -> DomainRulesResponse:
                 detail="Generate scenario-specific mandates before starting deliberation.",
             )
         return _domain_rules_from_snapshot(snapshot, current_revision, len(agents))
+
+
+def _clear_scenario_execution_data(session: Session, scenario_id: int) -> None:
+    run_ids = list(
+        session.scalars(
+            select(ConsensusSession.id).where(ConsensusSession.scenario_id == scenario_id)
+        )
+    )
+    if run_ids:
+        for model, column in (
+            (ReasoningLog, ReasoningLog.run_id),
+            (DisagreementLog, DisagreementLog.run_id),
+            (MetricSnapshot, MetricSnapshot.run_id),
+            (AgentInfluenceObservation, AgentInfluenceObservation.run_id),
+        ):
+            session.execute(delete(model).where(column.in_(run_ids)))
+    session.execute(delete(ReasoningLog).where(ReasoningLog.scenario_id == scenario_id))
+    session.execute(delete(DisagreementLog).where(DisagreementLog.scenario_id == scenario_id))
+    session.execute(delete(MetricSnapshot).where(MetricSnapshot.scenario_id == scenario_id))
+    session.execute(
+        delete(AgentInfluenceObservation).where(
+            AgentInfluenceObservation.scenario_id == scenario_id
+        )
+    )
+    session.execute(
+        delete(SimulationArtifact).where(SimulationArtifact.scenario_id == scenario_id)
+    )
+    session.execute(
+        delete(ConsensusSession).where(ConsensusSession.scenario_id == scenario_id)
+    )
+    session.execute(
+        delete(ScenarioMandateSnapshot).where(
+            ScenarioMandateSnapshot.scenario_id == scenario_id
+        )
+    )
+
+
+@app.patch("/api/scenarios/{scenario_id}", response_model=ScenarioResponse)
+@app.patch("/scenarios/{scenario_id}", response_model=ScenarioResponse)
+def update_scenario(scenario_id: int, payload: ScenarioUpdate) -> ScenarioResponse:
+    with SessionLocal() as session:
+        scenario = session.get(Scenario, scenario_id)
+        if scenario is None:
+            raise HTTPException(status_code=404, detail="Scenario not found")
+        updates = payload.model_dump(exclude_unset=True)
+        if "description" in updates and updates["description"] is None:
+            raise HTTPException(status_code=422, detail="Description cannot be null")
+        for field, value in updates.items():
+            setattr(scenario, field, value)
+        session.commit()
+        session.refresh(scenario)
+        return scenario_response(scenario)
+
+
+@app.delete("/api/scenarios/{scenario_id}", status_code=status.HTTP_204_NO_CONTENT)
+@app.delete("/scenarios/{scenario_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_scenario(scenario_id: int) -> Response:
+    with SessionLocal() as session:
+        scenario = session.get(Scenario, scenario_id)
+        if scenario is None:
+            raise HTTPException(status_code=404, detail="Scenario not found")
+        _clear_scenario_execution_data(session, scenario_id)
+        session.execute(delete(Agent).where(Agent.scenario_id == scenario_id))
+        session.delete(scenario)
+        session.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @app.post("/api/scenarios", response_model=ScenarioResponse, status_code=status.HTTP_201_CREATED)

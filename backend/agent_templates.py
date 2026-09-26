@@ -4,7 +4,7 @@ import re
 from dataclasses import asdict, dataclass
 from typing import Any
 
-from sqlalchemy import or_, select
+from sqlalchemy import delete, or_, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
@@ -455,7 +455,11 @@ def agent_revision(agents: list[Agent], scenario: object | None = None) -> str:
                 "id": getattr(scenario, "id"),
                 "description": getattr(scenario, "description"),
                 "program_cost": getattr(scenario, "program_cost"),
-                "max_deficit_constraint": getattr(scenario, "max_deficit_constraint"),
+                "simulation_payload": (
+                    scenario.simulation_payload()
+                    if isinstance(scenario, Scenario)
+                    else {}
+                ),
             }
             if scenario is not None
             else None
@@ -500,6 +504,25 @@ def resolve_agent_system_prompt(agent: Agent) -> str | None:
 
 def template_catalog() -> list[dict[str, Any]]:
     return [template.as_payload() for template in AGENTS]
+
+
+def find_agent_by_name_and_scenario(
+    session: Session,
+    *,
+    name: str,
+    scenario_id: int | None,
+) -> Agent | None:
+    scenario_filter = (
+        Agent.scenario_id.is_(None)
+        if scenario_id is None
+        else Agent.scenario_id == scenario_id
+    )
+    return session.scalar(
+        select(Agent).where(
+            Agent.name == name,
+            scenario_filter,
+        )
+    )
 
 
 def find_agent_by_mandate(
@@ -561,7 +584,7 @@ def global_deliberative_agents(session: Session) -> list[Agent]:
     )
 
 
-def scenario_deliberative_agents(
+def scenario_scoped_agents(
     session: Session,
     scenario_id: int,
 ) -> list[Agent]:
@@ -570,11 +593,25 @@ def scenario_deliberative_agents(
             select(Agent)
             .where(
                 Agent.is_orchestrator.is_(False),
-                or_(Agent.scenario_id.is_(None), Agent.scenario_id == scenario_id),
+                Agent.scenario_id == scenario_id,
             )
             .order_by(Agent.id)
         )
     )
+
+
+def scenario_deliberative_agents(
+    session: Session,
+    scenario_id: int,
+) -> list[Agent]:
+    scoped_agents = scenario_scoped_agents(session, scenario_id)
+    has_scoped_template_set = any(
+        agent.template_key is not None for agent in scoped_agents
+    )
+    if has_scoped_template_set:
+        return scoped_agents
+    global_agents = global_deliberative_agents(session)
+    return [*global_agents, *scoped_agents]
 
 
 def get_or_create_master_orchestrator(session: Session) -> tuple[Agent, bool]:
@@ -639,11 +676,17 @@ def ensure_phase_one_specialists(
     scenario: Scenario,
 ) -> tuple[list[Agent], dict[str, Any]]:
     orchestrator, orchestrator_created = get_or_create_master_orchestrator(session)
+    scoped_agents = scenario_scoped_agents(session, scenario.id)
     global_agents = global_deliberative_agents(session)
+    coverage_agents = (
+        scoped_agents
+        if any(agent.template_key is not None for agent in scoped_agents)
+        else global_agents
+    )
     existing_by_key = {
-        agent.template_key: agent
-        for agent in global_agents
-        if agent.template_key is not None
+        agent_domain_key(agent): agent
+        for agent in coverage_agents
+        if agent_domain_key(agent) is not None
     }
     detected_domains = detected_scenario_domains(scenario)
     created_specialists: list[Agent] = []
@@ -651,7 +694,14 @@ def ensure_phase_one_specialists(
     global_config = get_global_llm_config(session)
     for key in detected_domains:
         spec = _AGENT_SPECS_BY_KEY[key]
+        specialist_name = f"Dynamic_{key.title()}_Reviewer_S{scenario.id}"
         specialist = existing_by_key.get(key)
+        if specialist is None:
+            specialist = find_agent_by_name_and_scenario(
+                session,
+                name=specialist_name,
+                scenario_id=scenario.id,
+            )
         if specialist is None:
             specialist = session.scalar(
                 select(Agent).where(
@@ -664,7 +714,7 @@ def ensure_phase_one_specialists(
             values = {
                 **spec.as_agent_values(),
                 "template_key": None,
-                "name": f"Dynamic_{key.title()}_Reviewer_S{scenario.id}",
+                "name": specialist_name,
                 "scenario_id": scenario.id,
                 "specialist_domain": key,
             }
@@ -712,6 +762,32 @@ def ensure_phase_one_specialists(
     }
 
 
+def replace_scenario_agent_templates(
+    session: Session,
+    scenario_id: int,
+    configs: dict[str, dict[str, Any]] | None = None,
+) -> list[Agent]:
+    session.execute(delete(Agent).where(Agent.scenario_id == scenario_id))
+    session.flush()
+    configurations = configs or {}
+    global_config = get_global_llm_config(session)
+    agents: list[Agent] = []
+    for template in STANDARD_APBN_AGENT_TEMPLATES:
+        values = {
+            **apply_global_values(template.as_agent_values(), global_config),
+            "scenario_id": scenario_id,
+            "specialist_domain": template.key,
+        }
+        for field, value in configurations.get(template.key, {}).items():
+            if value not in (None, "") and not global_config.apply_to_all:
+                values[field] = value
+        agent = Agent(**values)
+        session.add(agent)
+        agents.append(agent)
+    session.flush()
+    return agents
+
+
 def load_standard_agent_templates(
     session: Session,
     configs: dict[str, dict[str, Any]] | None = None,
@@ -719,13 +795,19 @@ def load_standard_agent_templates(
     existing_by_key = {
         agent.template_key: agent
         for agent in session.scalars(
-            select(Agent).where(Agent.template_key.in_([template.key for template in AGENTS]))
+            select(Agent).where(
+                Agent.scenario_id.is_(None),
+                Agent.template_key.in_([template.key for template in AGENTS]),
+            )
         )
     }
     existing_by_name = {
         agent.name: agent
         for agent in session.scalars(
-            select(Agent).where(Agent.name.in_([template.name for template in AGENTS]))
+            select(Agent).where(
+                Agent.scenario_id.is_(None),
+                Agent.name.in_([template.name for template in AGENTS]),
+            )
         )
     }
     created = 0

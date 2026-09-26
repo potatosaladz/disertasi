@@ -94,7 +94,7 @@ def test_mandate_synthesis_prompt_contains_seed_and_scenario() -> None:
         primary_sources=["UU17_2003_P12"],
         constraints=["Projected deficit must remain <= 3% GDP."],
         owned_checks=["DEFICIT_3PCT"],
-        max_deficit_constraint=3.0,
+        simulation_payload={"instrument": "targeted subsidy"},
     )
     assert "Act autonomously as the expert Revenue" in prompt
     assert "targeted support programme" in prompt
@@ -134,7 +134,7 @@ def test_reasoning_prompts_require_decision_artifacts_and_peer_review() -> None:
         "Fiscal Reviewer",
         "Evaluate policy",
         10.0,
-        3.0,
+        {"instrument": "cash transfer", "duration_months": 6},
     )
     consensus_prompt = build_consensus_prompt(
         "Revenue Agent",
@@ -170,7 +170,7 @@ def test_native_simulation_agent_is_hardcoded_and_prompted_for_safe_arbitration(
 def test_deterministic_simulation_filters_hard_constraint_and_tags_outputs() -> None:
     simulation = build_deterministic_simulation(
         "Evaluate a fiscal programme",
-        3.0,
+        {"instrument": "fiscal programme"},
         [
             {
                 "agent_i": "Fiscal",
@@ -205,7 +205,7 @@ def test_deterministic_simulation_filters_hard_constraint_and_tags_outputs() -> 
 def test_deterministic_simulation_marks_all_infeasible_without_placeholder() -> None:
     simulation = build_deterministic_simulation(
         "Evaluate an infeasible fiscal programme",
-        3.0,
+        {"instrument": "infeasible programme"},
         [{"agent_i": "Fiscal", "agent_j": "Risk", "components": ["dP"]}],
         [
             {

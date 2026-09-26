@@ -231,8 +231,7 @@ def run_graph_payload(
             subtitle=f"Scenario #{scenario.id}",
             details={
                 "description": scenario.description,
-                "program_cost": scenario.program_cost,
-                "max_deficit_constraint": scenario.max_deficit_constraint,
+                **scenario.simulation_payload(),
                 "session_id": run.id,
                 "task_id": run.celery_task_id,
                 "created_at": run.created_at.isoformat() if run.created_at else None,

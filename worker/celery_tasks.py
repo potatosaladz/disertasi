@@ -442,7 +442,7 @@ def _default_llm_call(
                     agent.role,
                     scenario.description,
                     scenario.program_cost,
-                    scenario.max_deficit_constraint,
+                    scenario.simulation_payload(),
                 ),
             },
         ],
@@ -479,7 +479,7 @@ def _default_consensus_call(
                     agent.role,
                     scenario.description,
                     scenario.program_cost,
-                    scenario.max_deficit_constraint,
+                    scenario.simulation_payload(),
                 ),
             },
         ],
@@ -502,8 +502,7 @@ def _default_simulation_call(
                 "role": "user",
                 "content": build_simulation_prompt(
                     scenario.description,
-                    scenario.program_cost,
-                    scenario.max_deficit_constraint,
+                    scenario.simulation_payload(),
                     conflicts,
                     peer_outputs,
                 ),
@@ -544,7 +543,7 @@ def _default_simulation_consensus_call(
                     agent.role,
                     scenario.description,
                     scenario.program_cost,
-                    scenario.max_deficit_constraint,
+                    scenario.simulation_payload(),
                 ),
             },
         ],
@@ -670,8 +669,8 @@ def _run_native_simulation(
             id_message=f"{SIMULATION_AGENT_NAME} dipanggil otomatis untuk {len(conflicts)} konflik DDR.",
             round_number=round_number,
             metric={"name": "ddr_conflict_count", "value": len(conflicts), "unit": "pairs", "status": "calculated"},
-            statutory={"status": "pending-car", "constraint": "DEFICIT_3PCT", "ceiling_percent_gdp": STATUTORY_DEFICIT_CEILING_PERCENT_GDP, "scenario_policy_ceiling_percent_gdp": scenario.max_deficit_constraint, "source_tags": ["UU17_2003_P12"]},
-            economic={"status": "modelled", "inputs": {"program_cost": scenario.program_cost}, "outputs": {}, "reason": "Simulation uses structured sectoral alternatives; unsupported coefficients remain not-calculated."},
+            statutory={"status": "pending-car", "constraint": "DEFICIT_3PCT", "ceiling_percent_gdp": STATUTORY_DEFICIT_CEILING_PERCENT_GDP, "source_tags": ["UU17_2003_P12"]},
+            economic={"status": "modelled", "inputs": scenario.simulation_payload(), "outputs": {}, "reason": "Simulation uses structured sectoral alternatives; unsupported coefficients remain not-calculated."},
             metadata={"resolution_path": SIMULATION_TRIGGER},
         )
     )
@@ -705,8 +704,8 @@ def _run_native_simulation(
         ],
         "scenario": {
             "description": scenario.description,
-            "program_cost": scenario.program_cost,
-            "max_deficit_constraint": scenario.max_deficit_constraint,
+            **scenario.simulation_payload(),
+            "statutory_deficit_ceiling_percent": STATUTORY_DEFICIT_CEILING_PERCENT_GDP,
         },
     }
     _persist_simulation_artifact(
@@ -753,7 +752,7 @@ def _run_native_simulation(
             fallback_reason = type(provider_error).__name__
             raw_payload = build_deterministic_simulation(
                 scenario.description,
-                scenario.max_deficit_constraint,
+                scenario.simulation_payload(),
                 conflicts,
                 peer_outputs,
             )
@@ -798,7 +797,7 @@ def _run_native_simulation(
                 ),
                 round_number=round_number,
                 metric={"name": "modelled_alternative_count", "value": len(output_payload.get("alternatives", [])), "unit": "alternatives", "status": "calculated"},
-                statutory={"status": "pending-car", "constraint": "DEFICIT_3PCT", "ceiling_percent_gdp": STATUTORY_DEFICIT_CEILING_PERCENT_GDP, "scenario_policy_ceiling_percent_gdp": scenario.max_deficit_constraint, "source_tags": ["UU17_2003_P12"]},
+                statutory={"status": "pending-car", "constraint": "DEFICIT_3PCT", "ceiling_percent_gdp": STATUTORY_DEFICIT_CEILING_PERCENT_GDP, "source_tags": ["UU17_2003_P12"]},
                 economic={"status": output_payload.get("calculation_status", "modelled"), "inputs": {"sectoral_input_count": len(peer_outputs)}, "outputs": {"resolution_status": output_payload.get("resolution_status")}, "impact": "Result remains modelled evidence and must pass CAR."},
                 fallback=output_payload["fallback"],
                 metadata={"resolution_path": SIMULATION_TRIGGER},
@@ -1006,16 +1005,9 @@ def _ensure_influence_observations(
     return observations
 
 
-def _has_effective_deficit_violation(
-    scenario: Scenario,
-    response: SRRResponse,
-) -> bool:
-    effective_ceiling = min(
-        scenario.max_deficit_constraint,
-        STATUTORY_DEFICIT_CEILING_PERCENT_GDP,
-    )
+def _has_effective_deficit_violation(response: SRRResponse) -> bool:
     return any(
-        alternative.deficit > effective_ceiling
+        alternative.deficit > STATUTORY_DEFICIT_CEILING_PERCENT_GDP
         for alternative in response.decision_alternatives()
     )
 
@@ -1032,8 +1024,8 @@ def _classify_conflict(
         response_i.divergence_object(),
         response_j.divergence_object(),
     )
-    violation_i = _has_effective_deficit_violation(scenario, response_i)
-    violation_j = _has_effective_deficit_violation(scenario, response_j)
+    violation_i = _has_effective_deficit_violation(response_i)
+    violation_j = _has_effective_deficit_violation(response_j)
     vector["dC"] = bool(vector["dC"] or violation_i != violation_j)
     components = [key for key, value in vector.items() if value]
     route = resolve_disagreement_route(vector) if components else None
@@ -1223,7 +1215,6 @@ def _vector_metadata(
                     "agent_i_projected_deficits": deficits_i,
                     "agent_j_projected_deficits": deficits_j,
                     "statutory_ceiling_percent_gdp": STATUTORY_DEFICIT_CEILING_PERCENT_GDP,
-                    "scenario_policy_ceiling_percent_gdp": scenario.max_deficit_constraint,
                 }
             )
         else:
@@ -1275,10 +1266,7 @@ def _vector_metadata(
         deficits_i = _deficit_values(artifacts_i)
         deficits_j = _deficit_values(artifacts_j)
         all_deficits = [*deficits_i, *deficits_j]
-        effective_ceiling = min(
-            scenario.max_deficit_constraint,
-            STATUTORY_DEFICIT_CEILING_PERCENT_GDP,
-        )
+        effective_ceiling = STATUTORY_DEFICIT_CEILING_PERCENT_GDP
         statutory_violations_i = [
             item > STATUTORY_DEFICIT_CEILING_PERCENT_GDP for item in deficits_i
         ]
@@ -1290,12 +1278,7 @@ def _vector_metadata(
         statutory_violation = any(
             [*statutory_violations_i, *statutory_violations_j]
         )
-        scenario_policy_violation = any(
-            item > scenario.max_deficit_constraint for item in all_deficits
-        )
-        effective_violation = any(
-            [*effective_violations_i, *effective_violations_j]
-        )
+        effective_violation = statutory_violation
         gate_difference = any(effective_violations_i) != any(effective_violations_j)
         calculation.update(
             {
@@ -1304,12 +1287,10 @@ def _vector_metadata(
                 "constraint_text_distance": jaccard,
                 "hard_constraint": "EFFECTIVE_DEFICIT_CEILING",
                 "statutory_ceiling_percent_gdp": STATUTORY_DEFICIT_CEILING_PERCENT_GDP,
-                "scenario_policy_ceiling_percent_gdp": scenario.max_deficit_constraint,
                 "effective_ceiling_percent_gdp": effective_ceiling,
                 "maximum_projected_deficit_percent_gdp": max(all_deficits) if all_deficits else None,
                 "violation": effective_violation,
                 "statutory_violation": statutory_violation,
-                "scenario_policy_violation": scenario_policy_violation,
                 "agent_i_effective_violations": effective_violations_i,
                 "agent_j_effective_violations": effective_violations_j,
                 "agent_i_statutory_violations": statutory_violations_i,
@@ -1355,12 +1336,8 @@ def _vector_metadata(
 
 def _fiscal_alternative_payload(
     response: SRRResponse,
-    scenario_policy_ceiling: float,
 ) -> list[dict[str, Any]]:
-    effective_ceiling = min(
-        scenario_policy_ceiling,
-        STATUTORY_DEFICIT_CEILING_PERCENT_GDP,
-    )
+    effective_ceiling = STATUTORY_DEFICIT_CEILING_PERCENT_GDP
     return [
         {
             "name": alternative.name,
@@ -1369,9 +1346,6 @@ def _fiscal_alternative_payload(
             "headroom_percent": round(effective_ceiling - alternative.deficit, 4),
             "within_statutory_ceiling": (
                 alternative.deficit <= STATUTORY_DEFICIT_CEILING_PERCENT_GDP
-            ),
-            "within_scenario_policy_ceiling": (
-                alternative.deficit <= scenario_policy_ceiling
             ),
             "within_effective_ceiling": alternative.deficit <= effective_ceiling,
             "source_tag": alternative.source_tag,
@@ -1471,12 +1445,8 @@ def _conflict_detail_payload(
             )
     observation_i = influence_by_agent.get(agent_i.id)
     observation_j = influence_by_agent.get(agent_j.id)
-    alternatives_i = _fiscal_alternative_payload(
-        response_i, scenario.max_deficit_constraint
-    )
-    alternatives_j = _fiscal_alternative_payload(
-        response_j, scenario.max_deficit_constraint
-    )
+    alternatives_i = _fiscal_alternative_payload(response_i)
+    alternatives_j = _fiscal_alternative_payload(response_j)
     return sanitize_simulation_payload(
         {
             "active_components": [key for key, value in vector.items() if value],
@@ -1485,12 +1455,8 @@ def _conflict_detail_payload(
             "fiscal_calculation": {
                 "formula": "headroom_percent = effective_deficit_ceiling_percent - agent_reported_projected_deficit_percent",
                 "statutory_deficit_ceiling_percent": STATUTORY_DEFICIT_CEILING_PERCENT_GDP,
-                "scenario_policy_ceiling_percent": scenario.max_deficit_constraint,
-                "effective_deficit_ceiling_percent": min(
-                    scenario.max_deficit_constraint,
-                    STATUTORY_DEFICIT_CEILING_PERCENT_GDP,
-                ),
-                "program_cost": scenario.program_cost,
+                "effective_deficit_ceiling_percent": STATUTORY_DEFICIT_CEILING_PERCENT_GDP,
+                **scenario.simulation_payload(),
                 "program_cost_to_gdp_ratio": None,
                 "calculation_note": "Rasio biaya program terhadap PDB tidak dihitung tanpa denominator PDB terverifikasi; angka defisit berasal dari alternatif terstruktur agen.",
                 "agent_i_alternatives": alternatives_i,
@@ -2365,10 +2331,7 @@ def execute_full_shcr_cycle(
         final_provenance = [_provenance_counts(response) for _, response in parsed_by_agent]
         tagged_items = sum(tagged for tagged, _ in final_provenance)
         total_items = sum(total for _, total in final_provenance)
-        effective_ceiling = min(
-            scenario.max_deficit_constraint,
-            STATUTORY_DEFICIT_CEILING_PERCENT_GDP,
-        )
+        effective_ceiling = STATUTORY_DEFICIT_CEILING_PERCENT_GDP
         logs.append(
             _log(
                 "CAR",
@@ -2401,7 +2364,7 @@ def execute_full_shcr_cycle(
         ]
         car_evaluation = evaluate_car_constraints(
             alternatives,
-            scenario.max_deficit_constraint,
+            STATUTORY_DEFICIT_CEILING_PERCENT_GDP,
             hard_stop_reason=(
                 "Verified dC conflict violates a non-overridable hard constraint."
                 if hard_constraint_conflicts

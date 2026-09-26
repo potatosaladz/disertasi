@@ -39,7 +39,6 @@ def scenario_id() -> Iterator[int]:
     with SessionLocal() as session:
         scenario = Scenario(
             description="Phase 3 mocked fiscal scenario",
-            max_deficit_constraint=3.0,
         )
         suffix = uuid4().hex
         agents = [
@@ -619,7 +618,6 @@ def test_default_llm_call_uses_canonical_template_mandate(
     scenario = Scenario(
         description="Evaluate revenue reform",
         program_cost=25.0,
-        max_deficit_constraint=3.0,
     )
 
     _default_llm_call(agent, scenario, "Evaluate the current revenue reform scenario.")
@@ -661,7 +659,7 @@ def test_default_llm_call_uses_agent_configuration(monkeypatch: pytest.MonkeyPat
         temperature=0.35,
         max_tokens=1800,
     )
-    scenario = Scenario(description="Evaluate subsidy reform", max_deficit_constraint=3.0)
+    scenario = Scenario(description="Evaluate subsidy reform")
 
     content, tokens = _default_llm_call(agent, scenario)
 
@@ -708,7 +706,6 @@ def test_worker_session_excludes_specialists_from_other_scenarios(
     with SessionLocal() as session:
         foreign_scenario = Scenario(
             description="Foreign revenue specialist scope",
-            max_deficit_constraint=3.0,
         )
         session.add(foreign_scenario)
         session.flush()
@@ -901,6 +898,15 @@ def test_ddr_invokes_native_simulation_and_feeds_follow_up_round(
     scenario_id: int,
 ) -> None:
     result_session_id = _create_isolated_session(scenario_id)
+    with SessionLocal() as session:
+        scenario = session.get(Scenario, scenario_id)
+        assert scenario is not None
+        scenario.instrument = "Targeted transfer"
+        scenario.duration_months = 6
+        scenario.appropriation_available = True
+        scenario.verified_sal_available = 15.0
+        scenario.growth_outlook = 5.2
+        session.commit()
     first_round = iter(
         [
             (response_payload(prediction="Growth 2%", utility=0.8, recommendation="Adopt A"), 10),
@@ -1009,6 +1015,14 @@ def test_ddr_invokes_native_simulation_and_feeds_follow_up_round(
         assert artifacts[-1].output_payload["evidence_status"] == "modelled"
         assert artifacts[-1].output_payload["alternatives"][0]["source_tag"] == "SIMULATION_MODELLED"
         assert artifacts[-1].output_payload["remaining_prediction_conflicts"] == 0
+        artifact_inputs = [artifact.input_payload for artifact in artifacts]
+        assert all("max_deficit_constraint" not in item["scenario"] for item in artifact_inputs)
+        assert all(item["scenario"]["instrument"] == "Targeted transfer" for item in artifact_inputs)
+        assert all(item["scenario"]["duration_months"] == 6 for item in artifact_inputs)
+        assert all(item["scenario"]["appropriation_available"] is True for item in artifact_inputs)
+        assert all(item["scenario"]["verified_sal_available"] == 15.0 for item in artifact_inputs)
+        assert all(item["scenario"]["growth_outlook"] == 5.2 for item in artifact_inputs)
+        assert all(item["scenario"]["statutory_deficit_ceiling_percent"] == 3.0 for item in artifact_inputs)
         native_agent = session.scalar(
             select(Agent).where(Agent.name == SIMULATION_AGENT_NAME)
         )
@@ -1183,31 +1197,26 @@ def test_verified_dc_bypasses_simulation_and_forces_car_hard_stop(
         assert "Jalur: Constraint Arbitration Required" in narrative["id"]
 
 
-def test_stricter_scenario_ceiling_triggers_dc_hard_stop(
+def test_scenario_cannot_override_statutory_deficit_ceiling(
     scenario_id: int,
 ) -> None:
-    with SessionLocal() as session:
-        scenario = session.get(Scenario, scenario_id)
-        assert scenario is not None
-        scenario.max_deficit_constraint = 2.5
-        session.commit()
     responses = iter(
         [
             (
                 fiscal_payload(
-                    name="Within policy ceiling",
-                    prediction="Growth rises",
-                    deficit=2.4,
-                    constraint="Scenario ceiling is binding",
+                    name="Within statutory ceiling A",
+                    prediction="Growth remains stable",
+                    deficit=2.7,
+                    constraint="Statutory ceiling is binding",
                 ),
                 10,
             ),
             (
                 fiscal_payload(
-                    name="Policy breach",
-                    prediction="Growth falls",
-                    deficit=2.7,
-                    constraint="Scenario ceiling may be relaxed",
+                    name="Within statutory ceiling B",
+                    prediction="Growth remains stable",
+                    deficit=2.8,
+                    constraint="Statutory ceiling is binding",
                 ),
                 11,
             ),
@@ -1217,11 +1226,12 @@ def test_stricter_scenario_ceiling_triggers_dc_hard_stop(
     result = execute_full_shcr_cycle(
         scenario_id,
         lambda _agent, _scenario: next(responses),
+        enable_simulation=False,
     )
 
-    assert result["simulation_rounds"] == 0
-    assert result["car"]["hard_stop"]["triggered"] is True
-    assert result["car"]["solver_status"] == "unsat"
+    assert result["car"]["hard_stop"]["triggered"] is False
+    assert result["car"]["solver_status"] == "sat"
+    assert result["feasible_alternatives_count"] == 2
     with SessionLocal() as session:
         disagreement = session.scalar(
             select(DisagreementLog).where(
@@ -1233,8 +1243,8 @@ def test_stricter_scenario_ceiling_triggers_dc_hard_stop(
             "calculation"
         ]
         assert calculation["statutory_violation"] is False
-        assert calculation["scenario_policy_violation"] is True
-        assert calculation["violation"] is True
+        assert "scenario_policy_violation" not in calculation
+        assert calculation["violation"] is False
 
 
 def test_post_simulation_dc_stops_additional_rounds(
@@ -1377,7 +1387,6 @@ def test_three_agent_batch_preserves_every_pairwise_audit_row() -> None:
     with SessionLocal() as session:
         scenario = Scenario(
             description=f"Three-agent audit {uuid4()}",
-            max_deficit_constraint=3.0,
         )
         agents = [
             Agent(name=f"audit-agent-{index}-{uuid4()}", role=f"Audit {index}")

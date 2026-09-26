@@ -1,15 +1,57 @@
-from sqlalchemy import inspect, text
+from sqlalchemy import Connection, inspect, text
 
 from .database import engine
 from .models import Agent
 
 _SCENARIO_COLUMNS: dict[str, str] = {
+    "instrument": "VARCHAR(255)",
+    "targeting": "TEXT",
     "program_cost": "DOUBLE PRECISION",
+    "duration_months": "INTEGER",
+    "evaluation_trigger": "TEXT",
+    "program_cost_period": "VARCHAR(100)",
+    "no_phase0": "BOOLEAN",
+    "phase0_only": "BOOLEAN",
+    "no_phased": "BOOLEAN",
+    "proposed_reallocation": "DOUBLE PRECISION",
+    "reallocation_from_education": "BOOLEAN",
+    "proposed_additional_revenue": "DOUBLE PRECISION",
+    "revenue_measure_type": "VARCHAR(255)",
+    "proposed_debt_financing": "DOUBLE PRECISION",
+    "debt_financing_mode": "VARCHAR(255)",
+    "proposed_sal_use": "DOUBLE PRECISION",
+    "sal_purpose": "TEXT",
+    "proposed_other_financing": "DOUBLE PRECISION",
+    "appropriation_available": "BOOLEAN",
+    "verified_reallocation_capacity": "DOUBLE PRECISION",
+    "verified_revenue_offset_capacity": "DOUBLE PRECISION",
+    "verified_debt_financing_headroom": "DOUBLE PRECISION",
+    "verified_sal_available": "DOUBLE PRECISION",
+    "verified_operational_cash_minimum": "DOUBLE PRECISION",
+    "verified_projected_cash_after_policy": "DOUBLE PRECISION",
+    "verified_cumulative_borrowing_pct_gdp": "DOUBLE PRECISION",
+    "spending_reallocation_authorized": "BOOLEAN",
+    "dpr_spending_adjustment_recommendation": "BOOLEAN",
+    "finance_minister_sal_authorized": "BOOLEAN",
+    "dpr_sal_approval_obtained": "BOOLEAN",
+    "dpr_additional_sbn_approval_obtained": "BOOLEAN",
+    "tax_measure_has_enacted_law": "BOOLEAN",
+    "pnbp_measure_has_valid_tariff_instrument": "BOOLEAN",
+    "output_outcome_documented": "BOOLEAN",
+    "domestic_product_compliance_documented": "BOOLEAN",
+    "growth_outlook": "DOUBLE PRECISION",
+    "inflation_outlook": "DOUBLE PRECISION",
+    "fx_outlook": "DOUBLE PRECISION",
+    "sbn10y_yield_outlook": "DOUBLE PRECISION",
+    "icp_outlook": "DOUBLE PRECISION",
+    "oil_lifting_outlook": "DOUBLE PRECISION",
+    "gas_lifting_outlook": "DOUBLE PRECISION",
+    "tax_revenue_forecast": "DOUBLE PRECISION",
 }
 
 _AGENT_COLUMNS: dict[str, str] = {
     "llm_base_url": "VARCHAR(2048)",
-    "template_key": "VARCHAR(100) UNIQUE",
+    "template_key": "VARCHAR(100)",
     "scenario_id": "INTEGER REFERENCES scenarios(id) ON DELETE CASCADE",
     "specialist_domain": "VARCHAR(100)",
     "is_orchestrator": "BOOLEAN NOT NULL DEFAULT FALSE",
@@ -159,6 +201,31 @@ def _upgrade_agents_table() -> None:
         for name, definition in _AGENT_COLUMNS.items():
             if name not in existing:
                 connection.execute(text(f'ALTER TABLE agents ADD COLUMN "{name}" {definition}'))
+        connection.execute(text("ALTER TABLE agents DROP CONSTRAINT IF EXISTS agents_name_key"))
+        connection.execute(text("ALTER TABLE agents DROP CONSTRAINT IF EXISTS agents_template_key_key"))
+        connection.execute(text("DROP INDEX IF EXISTS uq_agent_singleton_orchestrator"))
+        connection.execute(text("DROP INDEX IF EXISTS ix_agents_template_key"))
+        connection.execute(text("DROP INDEX IF EXISTS uq_agent_global_name"))
+        connection.execute(text("DROP INDEX IF EXISTS uq_agent_scenario_name"))
+        connection.execute(text("DROP INDEX IF EXISTS uq_agent_global_template_key"))
+        connection.execute(text("DROP INDEX IF EXISTS uq_agent_scenario_template_key"))
+        connection.execute(text(
+            "CREATE UNIQUE INDEX uq_agent_global_name ON agents (name) "
+            "WHERE scenario_id IS NULL"
+        ))
+        connection.execute(text(
+            "CREATE UNIQUE INDEX uq_agent_scenario_name ON agents (scenario_id, name) "
+            "WHERE scenario_id IS NOT NULL"
+        ))
+        connection.execute(text(
+            "CREATE UNIQUE INDEX uq_agent_global_template_key ON agents (template_key) "
+            "WHERE scenario_id IS NULL AND template_key IS NOT NULL"
+        ))
+        connection.execute(text(
+            "CREATE UNIQUE INDEX uq_agent_scenario_template_key "
+            "ON agents (scenario_id, template_key) "
+            "WHERE scenario_id IS NOT NULL AND template_key IS NOT NULL"
+        ))
         connection.execute(text(
             "CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_singleton_orchestrator "
             "ON agents (is_orchestrator) WHERE is_orchestrator IS TRUE"
@@ -171,10 +238,6 @@ def _upgrade_agents_table() -> None:
         connection.execute(text(
             "CREATE INDEX IF NOT EXISTS ix_agents_scenario_id "
             "ON agents (scenario_id)"
-        ))
-        connection.execute(text(
-            "CREATE UNIQUE INDEX IF NOT EXISTS ix_agents_template_key "
-            "ON agents (template_key) WHERE template_key IS NOT NULL"
         ))
         connection.execute(
             text(
@@ -211,7 +274,13 @@ def _upgrade_scenarios_table() -> None:
             if name not in existing:
                 connection.execute(text(f'ALTER TABLE scenarios ADD COLUMN "{name}" {definition}'))
         connection.execute(
-            text("ALTER TABLE scenarios ALTER COLUMN max_deficit_constraint SET DEFAULT 3.0")
+            text(
+                "ALTER TABLE scenarios DROP CONSTRAINT IF EXISTS "
+                "ck_scenario_max_deficit_nonnegative"
+            )
+        )
+        connection.execute(
+            text("ALTER TABLE scenarios DROP COLUMN IF EXISTS max_deficit_constraint")
         )
         connection.execute(
             text(
@@ -225,6 +294,123 @@ def _upgrade_scenarios_table() -> None:
                 "CHECK (program_cost IS NULL OR program_cost >= 0)"
             )
         )
+        _add_scenario_check_constraint(
+            connection,
+            "ck_scenario_duration_positive",
+            "duration_months > 0",
+        )
+        _add_scenario_check_constraint(
+            connection,
+            "ck_scenario_reallocation_nonnegative",
+            "proposed_reallocation >= 0",
+        )
+        _add_scenario_check_constraint(
+            connection,
+            "ck_scenario_revenue_nonnegative",
+            "proposed_additional_revenue >= 0",
+        )
+        _add_scenario_check_constraint(
+            connection,
+            "ck_scenario_debt_nonnegative",
+            "proposed_debt_financing >= 0",
+        )
+        _add_scenario_check_constraint(
+            connection,
+            "ck_scenario_sal_use_nonnegative",
+            "proposed_sal_use >= 0",
+        )
+        _add_scenario_check_constraint(
+            connection,
+            "ck_scenario_other_financing_nonnegative",
+            "proposed_other_financing >= 0",
+        )
+        _add_scenario_check_constraint(
+            connection,
+            "ck_scenario_verified_reallocation_nonnegative",
+            "verified_reallocation_capacity >= 0",
+        )
+        _add_scenario_check_constraint(
+            connection,
+            "ck_scenario_verified_revenue_nonnegative",
+            "verified_revenue_offset_capacity >= 0",
+        )
+        _add_scenario_check_constraint(
+            connection,
+            "ck_scenario_verified_debt_nonnegative",
+            "verified_debt_financing_headroom >= 0",
+        )
+        _add_scenario_check_constraint(
+            connection,
+            "ck_scenario_verified_sal_nonnegative",
+            "verified_sal_available >= 0",
+        )
+        _add_scenario_check_constraint(
+            connection,
+            "ck_scenario_verified_cash_minimum_nonnegative",
+            "verified_operational_cash_minimum >= 0",
+        )
+        _add_scenario_check_constraint(
+            connection,
+            "ck_scenario_verified_cash_after_nonnegative",
+            "verified_projected_cash_after_policy >= 0",
+        )
+        _add_scenario_check_constraint(
+            connection,
+            "ck_scenario_verified_borrowing_nonnegative",
+            "verified_cumulative_borrowing_pct_gdp >= 0",
+        )
+        _add_scenario_check_constraint(
+            connection,
+            "ck_scenario_fx_positive",
+            "fx_outlook > 0",
+        )
+        _add_scenario_check_constraint(
+            connection,
+            "ck_scenario_sbn_yield_nonnegative",
+            "sbn10y_yield_outlook >= 0",
+        )
+        _add_scenario_check_constraint(
+            connection,
+            "ck_scenario_icp_nonnegative",
+            "icp_outlook >= 0",
+        )
+        _add_scenario_check_constraint(
+            connection,
+            "ck_scenario_oil_lifting_nonnegative",
+            "oil_lifting_outlook >= 0",
+        )
+        _add_scenario_check_constraint(
+            connection,
+            "ck_scenario_gas_lifting_nonnegative",
+            "gas_lifting_outlook >= 0",
+        )
+        _add_scenario_check_constraint(
+            connection,
+            "ck_scenario_tax_forecast_nonnegative",
+            "tax_revenue_forecast >= 0",
+        )
+
+
+def _add_scenario_check_constraint(
+    connection: Connection,
+    name: str,
+    expression: str,
+) -> None:
+    connection.execute(
+        text(
+            f"""
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM pg_constraint WHERE conname = '{name}'
+                ) THEN
+                    ALTER TABLE scenarios ADD CONSTRAINT {name}
+                        CHECK ({expression});
+                END IF;
+            END $$;
+            """
+        )
+    )
 
 
 def _initialize_global_llm_config() -> None:

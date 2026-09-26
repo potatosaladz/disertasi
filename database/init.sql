@@ -1,10 +1,53 @@
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
 ALTER TABLE IF EXISTS scenarios
-    ADD COLUMN IF NOT EXISTS program_cost DOUBLE PRECISION;
+    ADD COLUMN IF NOT EXISTS instrument VARCHAR(255),
+    ADD COLUMN IF NOT EXISTS targeting TEXT,
+    ADD COLUMN IF NOT EXISTS program_cost DOUBLE PRECISION,
+    ADD COLUMN IF NOT EXISTS duration_months INTEGER,
+    ADD COLUMN IF NOT EXISTS evaluation_trigger TEXT,
+    ADD COLUMN IF NOT EXISTS program_cost_period VARCHAR(100),
+    ADD COLUMN IF NOT EXISTS no_phase0 BOOLEAN,
+    ADD COLUMN IF NOT EXISTS phase0_only BOOLEAN,
+    ADD COLUMN IF NOT EXISTS no_phased BOOLEAN,
+    ADD COLUMN IF NOT EXISTS proposed_reallocation DOUBLE PRECISION,
+    ADD COLUMN IF NOT EXISTS reallocation_from_education BOOLEAN,
+    ADD COLUMN IF NOT EXISTS proposed_additional_revenue DOUBLE PRECISION,
+    ADD COLUMN IF NOT EXISTS revenue_measure_type VARCHAR(255),
+    ADD COLUMN IF NOT EXISTS proposed_debt_financing DOUBLE PRECISION,
+    ADD COLUMN IF NOT EXISTS debt_financing_mode VARCHAR(255),
+    ADD COLUMN IF NOT EXISTS proposed_sal_use DOUBLE PRECISION,
+    ADD COLUMN IF NOT EXISTS sal_purpose TEXT,
+    ADD COLUMN IF NOT EXISTS proposed_other_financing DOUBLE PRECISION,
+    ADD COLUMN IF NOT EXISTS appropriation_available BOOLEAN,
+    ADD COLUMN IF NOT EXISTS verified_reallocation_capacity DOUBLE PRECISION,
+    ADD COLUMN IF NOT EXISTS verified_revenue_offset_capacity DOUBLE PRECISION,
+    ADD COLUMN IF NOT EXISTS verified_debt_financing_headroom DOUBLE PRECISION,
+    ADD COLUMN IF NOT EXISTS verified_sal_available DOUBLE PRECISION,
+    ADD COLUMN IF NOT EXISTS verified_operational_cash_minimum DOUBLE PRECISION,
+    ADD COLUMN IF NOT EXISTS verified_projected_cash_after_policy DOUBLE PRECISION,
+    ADD COLUMN IF NOT EXISTS verified_cumulative_borrowing_pct_gdp DOUBLE PRECISION,
+    ADD COLUMN IF NOT EXISTS spending_reallocation_authorized BOOLEAN,
+    ADD COLUMN IF NOT EXISTS dpr_spending_adjustment_recommendation BOOLEAN,
+    ADD COLUMN IF NOT EXISTS finance_minister_sal_authorized BOOLEAN,
+    ADD COLUMN IF NOT EXISTS dpr_sal_approval_obtained BOOLEAN,
+    ADD COLUMN IF NOT EXISTS dpr_additional_sbn_approval_obtained BOOLEAN,
+    ADD COLUMN IF NOT EXISTS tax_measure_has_enacted_law BOOLEAN,
+    ADD COLUMN IF NOT EXISTS pnbp_measure_has_valid_tariff_instrument BOOLEAN,
+    ADD COLUMN IF NOT EXISTS output_outcome_documented BOOLEAN,
+    ADD COLUMN IF NOT EXISTS domestic_product_compliance_documented BOOLEAN,
+    ADD COLUMN IF NOT EXISTS growth_outlook DOUBLE PRECISION,
+    ADD COLUMN IF NOT EXISTS inflation_outlook DOUBLE PRECISION,
+    ADD COLUMN IF NOT EXISTS fx_outlook DOUBLE PRECISION,
+    ADD COLUMN IF NOT EXISTS sbn10y_yield_outlook DOUBLE PRECISION,
+    ADD COLUMN IF NOT EXISTS icp_outlook DOUBLE PRECISION,
+    ADD COLUMN IF NOT EXISTS oil_lifting_outlook DOUBLE PRECISION,
+    ADD COLUMN IF NOT EXISTS gas_lifting_outlook DOUBLE PRECISION,
+    ADD COLUMN IF NOT EXISTS tax_revenue_forecast DOUBLE PRECISION;
 
 ALTER TABLE IF EXISTS scenarios
-    ALTER COLUMN max_deficit_constraint SET DEFAULT 3.0;
+    DROP CONSTRAINT IF EXISTS ck_scenario_max_deficit_nonnegative,
+    DROP COLUMN IF EXISTS max_deficit_constraint;
 
 ALTER TABLE IF EXISTS agents
     ADD COLUMN IF NOT EXISTS template_key VARCHAR(100),
@@ -35,8 +78,19 @@ INSERT INTO global_llm_config (id) VALUES (1) ON CONFLICT (id) DO NOTHING;
 DO $$
 BEGIN
     IF to_regclass('public.agents') IS NOT NULL THEN
-        CREATE UNIQUE INDEX IF NOT EXISTS ix_agents_template_key
-            ON agents (template_key) WHERE template_key IS NOT NULL;
+        ALTER TABLE agents DROP CONSTRAINT IF EXISTS agents_name_key;
+        ALTER TABLE agents DROP CONSTRAINT IF EXISTS agents_template_key_key;
+        DROP INDEX IF EXISTS ix_agents_template_key;
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_global_name
+            ON agents (name) WHERE scenario_id IS NULL;
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_scenario_name
+            ON agents (scenario_id, name) WHERE scenario_id IS NOT NULL;
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_global_template_key
+            ON agents (template_key)
+            WHERE scenario_id IS NULL AND template_key IS NOT NULL;
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_scenario_template_key
+            ON agents (scenario_id, template_key)
+            WHERE scenario_id IS NOT NULL AND template_key IS NOT NULL;
         CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_singleton_orchestrator
             ON agents (is_orchestrator) WHERE is_orchestrator IS TRUE;
         CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_scenario_specialist_domain

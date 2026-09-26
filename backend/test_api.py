@@ -24,6 +24,7 @@ from backend.models import (
     Agent,
     AgentInfluenceObservation,
     ConsensusSession,
+    ConvergenceStatus,
     DisagreementLog,
     GlobalLLMConfig,
     MetricSnapshot,
@@ -169,12 +170,9 @@ def test_car_dashboard_headroom_uses_effective_scenario_ceiling() -> None:
     ] == pytest.approx(0.1)
 
 
-def test_legacy_scenario_ceiling_remains_serializable(client: TestClient) -> None:
+def test_scenario_ceiling_is_internal_and_not_serialized(client: TestClient) -> None:
     with SessionLocal() as session:
-        scenario = Scenario(
-            description=f"Legacy ceiling {uuid.uuid4()}",
-            max_deficit_constraint=4.0,
-        )
+        scenario = Scenario(description=f"Statutory ceiling {uuid.uuid4()}")
         session.add(scenario)
         session.flush()
         agent = Agent(name=f"legacy-agent-{uuid.uuid4()}", role="Fiscal")
@@ -223,9 +221,11 @@ def test_legacy_scenario_ceiling_remains_serializable(client: TestClient) -> Non
     response = client.get("/api/scenarios")
 
     assert response.status_code == 200
-    assert next(item for item in response.json() if item["id"] == scenario_id)[
-        "max_deficit_constraint"
-    ] == 4.0
+    serialized = next(
+        item for item in response.json() if item["id"] == scenario_id
+    )
+    assert "max_deficit_constraint" not in serialized
+    assert serialized["program_cost"] is None
     manifest = client.get(f"/api/scenarios/{scenario_id}/manifest?session_id={run_id}")
     assert manifest.status_code == 200
     prompt = next(
@@ -245,7 +245,6 @@ def test_master_orchestrator_is_singleton_and_reuses_gap_specialist() -> None:
     with SessionLocal() as session:
         scenario = Scenario(
             description="Macro-Fiscal Stabilization under inflation pressure",
-            max_deficit_constraint=3.0,
         )
         macro = Agent(
             name="Existing Macro Specialist",
@@ -283,7 +282,6 @@ def test_phase_one_gap_detection_creates_only_missing_specialist() -> None:
     with SessionLocal() as session:
         scenario = Scenario(
             description="Assess PNBP revenue resilience",
-            max_deficit_constraint=3.0,
         )
         existing = Agent(name="Existing Fiscal", role="Fiscal Reviewer")
         session.add_all([scenario, existing])
@@ -308,7 +306,6 @@ def test_phase_one_gap_detection_creates_only_missing_specialist() -> None:
 
         unrelated = Scenario(
             description="Evaluate a universal policy proposal",
-            max_deficit_constraint=3.0,
         )
         session.add(unrelated)
         session.flush()
@@ -324,7 +321,6 @@ def test_concurrent_orchestrator_and_specialist_provisioning_is_idempotent() -> 
     with SessionLocal() as session:
         scenario = Scenario(
             description="Evaluate tax revenue resilience",
-            max_deficit_constraint=3.0,
         )
         session.add(scenario)
         session.commit()
@@ -370,7 +366,6 @@ def test_scenario_specialist_rules_are_aggregated_and_not_globally_listed(
     with SessionLocal() as session:
         scenario = Scenario(
             description="Assess tax revenue resilience",
-            max_deficit_constraint=3.0,
         )
         session.add(scenario)
         session.flush()
@@ -419,11 +414,9 @@ def test_foreign_specialist_is_excluded_from_run_surfaces(
     with SessionLocal() as session:
         target = Scenario(
             description="Target scenario without a revenue domain",
-            max_deficit_constraint=3.0,
         )
         foreign = Scenario(
             description="Foreign revenue scenario",
-            max_deficit_constraint=3.0,
         )
         global_agent = Agent(name=f"global-{uuid.uuid4()}", role="Global Reviewer")
         foreign_specialist = Agent(
@@ -1236,23 +1229,35 @@ def test_agent_rejects_invalid_generation_settings(client: TestClient) -> None:
     assert response.status_code == 422
 
 
-def test_scenario_uses_automatic_constraint_and_program_cost(client: TestClient) -> None:
+def test_scenario_persists_granular_simulation_payload(client: TestClient) -> None:
     response = client.post(
         "/api/scenarios",
         json={
             "description": "Evaluate a targeted fiscal support programme",
+            "instrument": "Targeted cash transfer",
+            "targeting": "Bottom income deciles",
             "program_cost": 125.5,
+            "duration_months": 6,
+            "appropriation_available": True,
+            "verified_revenue_offset_capacity": 25.0,
+            "tax_measure_has_enacted_law": False,
+            "growth_outlook": 5.2,
+            "inflation_outlook": 2.7,
         },
     )
     assert response.status_code == 201
     scenario_id = response.json()["id"]
-    assert response.json()["max_deficit_constraint"] == 3.0
-    assert response.json()["program_cost"] == 125.5
+    assert "max_deficit_constraint" not in response.json()
+    assert response.json()["instrument"] == "Targeted cash transfer"
+    assert response.json()["duration_months"] == 6
+    assert response.json()["appropriation_available"] is True
+    assert response.json()["growth_outlook"] == pytest.approx(5.2)
     with SessionLocal() as session:
         saved = session.get(Scenario, scenario_id)
         assert saved is not None
-        assert saved.max_deficit_constraint == 3.0
         assert saved.program_cost == 125.5
+        assert saved.verified_revenue_offset_capacity == 25.0
+        assert saved.tax_measure_has_enacted_law is False
         session.delete(saved)
         session.commit()
 
@@ -1270,7 +1275,7 @@ def test_scenario_rejects_negative_program_cost(client: TestClient) -> None:
     assert response.status_code == 422
 
 
-def test_scenario_cannot_raise_statutory_deficit_ceiling(client: TestClient) -> None:
+def test_scenario_rejects_unknown_fields(client: TestClient) -> None:
     response = client.post(
         "/api/scenarios",
         json={"description": "Invalid ceiling", "max_deficit_constraint": 3.1},
@@ -1278,9 +1283,350 @@ def test_scenario_cannot_raise_statutory_deficit_ceiling(client: TestClient) -> 
     assert response.status_code == 422
 
 
+def test_scenario_patch_persists_granular_fields_and_rejects_invalid_values(
+    client: TestClient,
+) -> None:
+    created = client.post(
+        "/api/scenarios",
+        json={
+            "description": "Patch granular scenario",
+            "targeting": "Initial target",
+            "program_cost": 100.0,
+            "duration_months": 12,
+        },
+    )
+    assert created.status_code == 201
+    scenario_id = created.json()["id"]
+
+    patched = client.patch(
+        f"/api/scenarios/{scenario_id}",
+        json={
+            "instrument": "Targeted transfer",
+            "program_cost": None,
+            "duration_months": 9,
+            "appropriation_available": True,
+            "verified_reallocation_capacity": 42.5,
+            "spending_reallocation_authorized": False,
+            "growth_outlook": 5.3,
+            "fx_outlook": 16350.0,
+        },
+    )
+
+    assert patched.status_code == 200
+    payload = patched.json()
+    assert payload["description"] == "Patch granular scenario"
+    assert payload["targeting"] == "Initial target"
+    assert payload["instrument"] == "Targeted transfer"
+    assert payload["program_cost"] is None
+    assert payload["duration_months"] == 9
+    assert payload["appropriation_available"] is True
+    assert payload["spending_reallocation_authorized"] is False
+    assert payload["verified_reallocation_capacity"] == pytest.approx(42.5)
+    assert payload["growth_outlook"] == pytest.approx(5.3)
+    assert payload["fx_outlook"] == pytest.approx(16350.0)
+    assert "max_deficit_constraint" not in payload
+
+    invalid = client.patch(
+        f"/api/scenarios/{scenario_id}",
+        json={"duration_months": 0, "verified_sal_available": -1.0},
+    )
+    assert invalid.status_code == 422
+
+    listed = client.get("/api/scenarios")
+    assert listed.status_code == 200
+    listed_payload = next(
+        item for item in listed.json() if item["id"] == scenario_id
+    )
+    assert listed_payload["instrument"] == "Targeted transfer"
+    assert listed_payload["targeting"] == "Initial target"
+    with SessionLocal() as session:
+        saved = session.get(Scenario, scenario_id)
+        assert saved is not None
+        assert saved.duration_months == 9
+        assert saved.appropriation_available is True
+        assert saved.verified_sal_available is None
+
+
+def test_force_delete_mocked_scenario_cascades_running_run_and_artifacts(
+    client: TestClient,
+) -> None:
+    with SessionLocal() as session:
+        scenario = Scenario(description="Phase 3 mocked fiscal scenario")
+        agents = [
+            Agent(
+                name=f"mocked-fiscal-{uuid.uuid4()}",
+                role="Fiscal",
+                scenario_id=None,
+            ),
+            Agent(
+                name=f"mocked-risk-{uuid.uuid4()}",
+                role="Risk",
+                scenario_id=None,
+            ),
+        ]
+        session.add_all([scenario, *agents])
+        session.flush()
+        for agent in agents:
+            agent.scenario_id = scenario.id
+        revision = agent_revision(agents, scenario)
+        snapshot = ScenarioMandateSnapshot(
+            scenario_id=scenario.id,
+            revision=revision,
+            generated=True,
+            agent_count=2,
+            rules={},
+            agent_rules=[
+                {"agent_id": agent.id, "scenario_mandate": agent.role}
+                for agent in agents
+            ],
+            status="success",
+            generated_count=2,
+            failure_count=0,
+        )
+        session.add(snapshot)
+        session.flush()
+        run_id = str(uuid.uuid4())
+        run = ConsensusSession(
+            id=run_id,
+            scenario_id=scenario.id,
+            mandate_snapshot_id=snapshot.id,
+            mandate_revision=revision,
+            mandate_payload={"rules": {}, "agent_rules": snapshot.agent_rules},
+            status="RUNNING",
+        )
+        session.add(run)
+        session.flush()
+        session.add_all(
+            [
+                ReasoningLog(
+                    run_id=run_id,
+                    agent_id=agent.id,
+                    scenario_id=scenario.id,
+                    raw_json={"agent": agent.name},
+                    parsed_srr_objects={},
+                    is_schema_valid=True,
+                    provenance_count=0,
+                )
+                for agent in agents
+            ]
+        )
+        session.add(
+            AgentInfluenceObservation(
+                run_id=run_id,
+                agent_id=agents[0].id,
+                scenario_id=scenario.id,
+                proposition="Mocked policy",
+                X=1.0,
+                Q=1.0,
+                H=1.0,
+                S=1.0,
+                U=0.0,
+                gate=1,
+            )
+        )
+        session.add(
+            DisagreementLog(
+                run_id=run_id,
+                scenario_id=scenario.id,
+                agent_i=agents[0].id,
+                agent_j=agents[1].id,
+                dP=True,
+            )
+        )
+        session.add(
+            SimulationArtifact(
+                run_id=run_id,
+                scenario_id=scenario.id,
+                trigger="Mocked trigger",
+                round_number=1,
+                input_payload={},
+                output_payload={},
+                status="RUNNING",
+                simulation_version="mocked-v1",
+                latency_ms=0.0,
+                token_usage=0,
+            )
+        )
+        session.add(
+            MetricSnapshot(
+                run_id=run_id,
+                scenario_id=scenario.id,
+                provenance_completeness_percent=0.0,
+                material_information_retention_macro_f1=0.0,
+                hard_constraint_violation_rate=0.0,
+                feasible_alternatives_count=0,
+                convergence_status=ConvergenceStatus.INSUFFICIENT_EVIDENCE,
+                latency_ms=0.0,
+                token_usage=0,
+            )
+        )
+        session.commit()
+        scenario_id = scenario.id
+        agent_ids = [agent.id for agent in agents]
+        snapshot_id = snapshot.id
+
+    deleted = client.delete(f"/scenarios/{scenario_id}")
+
+    assert deleted.status_code == 204
+    assert client.delete(f"/api/scenarios/{scenario_id}").status_code == 404
+    with SessionLocal() as session:
+        assert session.get(Scenario, scenario_id) is None
+        assert session.get(ScenarioMandateSnapshot, snapshot_id) is None
+        assert session.get(ConsensusSession, run_id) is None
+        assert list(
+            session.scalars(select(Agent).where(Agent.id.in_(agent_ids)))
+        ) == []
+        for model in (
+            ReasoningLog,
+            AgentInfluenceObservation,
+            DisagreementLog,
+            SimulationArtifact,
+            MetricSnapshot,
+        ):
+            assert session.scalar(
+                select(model.id).where(model.scenario_id == scenario_id).limit(1)
+            ) is None
+
+
+def test_scenario_template_loading_replaces_agents_with_exact_standard_set(
+    client: TestClient,
+) -> None:
+    with SessionLocal() as session:
+        scenario = Scenario(description="Scoped template replacement")
+        session.add(scenario)
+        session.flush()
+        old_agents = [
+            Agent(
+                name=f"old-scoped-{index}-{uuid.uuid4()}",
+                role=f"Old {index}",
+                scenario_id=scenario.id,
+            )
+            for index in range(2)
+        ]
+        session.add_all(old_agents)
+        session.commit()
+        scenario_id = scenario.id
+        old_ids = {agent.id for agent in old_agents}
+
+    first = client.post(f"/api/scenarios/{scenario_id}/load-templates")
+
+    assert first.status_code == 200
+    first_payload = first.json()
+    assert first_payload["created"] == 5
+    assert first_payload["total"] == 5
+    assert first_payload["scenario_id"] == scenario_id
+    first_agents = first_payload["agents"]
+    assert len(first_agents) == 5
+    assert {item["template_key"] for item in first_agents} == {
+        template.key for template in STANDARD_APBN_AGENT_TEMPLATES
+    }
+    assert {item["name"] for item in first_agents} == {
+        template.name for template in STANDARD_APBN_AGENT_TEMPLATES
+    }
+    assert {item["scenario_id"] for item in first_agents} == {scenario_id}
+    first_ids = {item["id"] for item in first_agents}
+    assert old_ids.isdisjoint(first_ids)
+
+    second = client.post(
+        f"/scenarios/{scenario_id}/load-templates",
+        json={
+            "configs": {
+                "revenue": {
+                    "llm_model": "scenario-revenue-model",
+                    "temperature": 0.15,
+                    "max_tokens": 2500,
+                }
+            }
+        },
+    )
+
+    assert second.status_code == 200
+    second_agents = second.json()["agents"]
+    assert len(second_agents) == 5
+    second_ids = {item["id"] for item in second_agents}
+    assert first_ids.isdisjoint(second_ids)
+    revenue = next(
+        item for item in second_agents if item["template_key"] == "revenue"
+    )
+    assert revenue["llm_model"] == "scenario-revenue-model"
+    assert revenue["temperature"] == pytest.approx(0.15)
+    assert revenue["max_tokens"] == 2500
+
+    scoped = client.get(f"/api/agents?scenario_id={scenario_id}")
+    assert scoped.status_code == 200
+    assert {item["id"] for item in scoped.json()} == second_ids
+    assert client.get("/api/agents").json() == []
+    with SessionLocal() as session:
+        assert list(
+            session.scalars(
+                select(Agent).where(
+                    Agent.scenario_id == scenario_id,
+                    Agent.id.in_(old_ids | first_ids),
+                )
+            )
+        ) == []
+        persisted = list(
+            session.scalars(
+                select(Agent).where(Agent.scenario_id == scenario_id)
+            )
+        )
+        assert len(persisted) == 5
+        assert {agent.specialist_domain for agent in persisted} == {
+            template.key for template in STANDARD_APBN_AGENT_TEMPLATES
+        }
+
+
+def test_scenario_template_sets_are_isolated_and_reloading_one_preserves_other(
+    client: TestClient,
+) -> None:
+    first_scenario = client.post(
+        "/api/scenarios", json={"description": "Template scope A"}
+    ).json()
+    second_scenario = client.post(
+        "/api/scenarios", json={"description": "Template scope B"}
+    ).json()
+
+    first_load = client.post(
+        f"/api/scenarios/{first_scenario['id']}/load-templates"
+    )
+    second_load = client.post(
+        f"/api/scenarios/{second_scenario['id']}/load-templates"
+    )
+
+    assert first_load.status_code == 200
+    assert second_load.status_code == 200
+    first_agents = first_load.json()["agents"]
+    second_agents = second_load.json()["agents"]
+    assert {item["name"] for item in first_agents} == {
+        item["name"] for item in second_agents
+    }
+    first_ids = {item["id"] for item in first_agents}
+    second_ids = {item["id"] for item in second_agents}
+    assert first_ids.isdisjoint(second_ids)
+    assert {item["scenario_id"] for item in first_agents} == {
+        first_scenario["id"]
+    }
+    assert {item["scenario_id"] for item in second_agents} == {
+        second_scenario["id"]
+    }
+
+    reloaded = client.post(
+        f"/api/scenarios/{first_scenario['id']}/load-templates"
+    )
+    assert reloaded.status_code == 200
+    reloaded_ids = {item["id"] for item in reloaded.json()["agents"]}
+    assert first_ids.isdisjoint(reloaded_ids)
+    second_scoped = client.get(
+        f"/api/agents?scenario_id={second_scenario['id']}"
+    )
+    assert second_scoped.status_code == 200
+    assert {item["id"] for item in second_scoped.json()} == second_ids
+    assert reloaded_ids.isdisjoint(second_ids)
+
+
 def test_run_submission_and_status(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
     with SessionLocal() as session:
-        scenario = Scenario(description=f"Run test {uuid.uuid4()}", max_deficit_constraint=3.0)
+        scenario = Scenario(description=f"Run test {uuid.uuid4()}")
         agents = [
             Agent(
                 name=f"run-agent-{uuid.uuid4()}",
@@ -1402,7 +1748,6 @@ def test_run_submission_refreshes_stale_mandate_snapshot(
     with SessionLocal() as session:
         scenario = Scenario(
             description=f"Stale run test {uuid.uuid4()}",
-            max_deficit_constraint=3.0,
         )
         agents = [
             Agent(
@@ -1484,7 +1829,7 @@ def test_run_submission_refreshes_stale_mandate_snapshot(
 
 def test_dashboard_matrix_and_manifest(client: TestClient) -> None:
     with SessionLocal() as session:
-        scenario = Scenario(description=f"Dashboard test {uuid.uuid4()}", max_deficit_constraint=3.0)
+        scenario = Scenario(description=f"Dashboard test {uuid.uuid4()}")
         agent_i = Agent(name=f"dashboard-i-{uuid.uuid4()}", role="Fiscal")
         agent_j = Agent(name=f"dashboard-j-{uuid.uuid4()}", role="Risk")
         session.add_all([scenario, agent_i, agent_j])
@@ -1841,7 +2186,6 @@ def test_malformed_stored_mandate_is_normalised_for_api_and_dashboard(
     with SessionLocal() as session:
         scenario = Scenario(
             description=f"Stored mandate compatibility {uuid.uuid4()}",
-            max_deficit_constraint=3.0,
         )
         agent = Agent(name=f"stored-mandate-{uuid.uuid4()}", role="Fiscal Reviewer")
         session.add_all([scenario, agent])
@@ -1899,7 +2243,7 @@ def test_malformed_stored_mandate_is_normalised_for_api_and_dashboard(
 
 def test_empty_dashboard(client: TestClient) -> None:
     with SessionLocal() as session:
-        scenario = Scenario(description=f"Empty dashboard {uuid.uuid4()}", max_deficit_constraint=3.0)
+        scenario = Scenario(description=f"Empty dashboard {uuid.uuid4()}")
         session.add(scenario)
         session.commit()
         scenario_id = scenario.id
