@@ -17,6 +17,7 @@ from backend.agent_templates import (
     agent_revision,
     mandate_seed,
     resolve_agent_system_prompt,
+    scenario_agent_weights,
     scenario_deliberative_agents,
     semantic_agent_name,
 )
@@ -1831,6 +1832,15 @@ def execute_full_shcr_cycle(
         persist_run_progress(scenario_id, session_id, current_logs)
         external_emit(current_logs)
 
+    with SessionLocal() as mode_session:
+        mode_scenario = mode_session.get(Scenario, scenario_id)
+        mode_payload = (
+            mode_scenario.simulation_payload() if mode_scenario is not None else {}
+        )
+    skip_formulation_llm = bool(mode_payload.get("skip_llm_formulation"))
+    formulation_dry_run = bool(mode_payload.get("formulation_dry_run_only"))
+    single_year_deployment = bool(mode_payload.get("single_year_deployment"))
+
     logs = [
         _log(
             "INITIALIZE",
@@ -1838,7 +1848,12 @@ def execute_full_shcr_cycle(
             f"Starting SHCR cycle for scenario {scenario_id}, session {session_id}.",
             code="SHCR_CYCLE_STARTED",
             id_message=f"Memulai siklus SHCR untuk skenario {scenario_id}, sesi {session_id}.",
-            metadata={"framework": "SRR + (RAR → DAI) + DDR + CAR"},
+            metadata={
+                "framework": "SRR + (RAR → DAI) + DDR + CAR",
+                "skip_llm_formulation": skip_formulation_llm,
+                "formulation_dry_run_only": formulation_dry_run,
+                "single_year_deployment": single_year_deployment,
+            },
         )
     ]
     emit(logs)
@@ -1982,9 +1997,69 @@ def execute_full_shcr_cycle(
             session.commit()
             raise RuntimeError(failure_message)
 
+        if single_year_deployment:
+            enable_simulation = False
+            logs.append(
+                _log(
+                    "INITIALIZE",
+                    "INFO",
+                    "Single-year full deployment selected: iterative simulation rounds are disabled; the statutory CAR ceiling still applies.",
+                    code="SINGLE_YEAR_DEPLOYMENT_NO_PHASING",
+                    id_message=(
+                        "Deployment satu tahun penuh dipilih: ronde simulasi iteratif dinonaktifkan; "
+                        "batas CAR statutori tetap berlaku."
+                    ),
+                    task={"type": "deployment-scope", "mode": "single_year_deployment"},
+                    result={"status": "applied", "simulation_enabled": False},
+                    why={
+                        "reason": "A single-year deployment has no multi-year phasing to reconcile through bounded simulation.",
+                        "rule": "single_year_deployment -> simulation disabled",
+                        "authority": "CAR/Z3 deficit ceiling remains non-overridable.",
+                    },
+                )
+            )
+            emit(logs)
+
         session.commit()
         if reviewer is None:
             logs.append(_log("CONSENSUS", "INFO", "Consensus review callback not configured; retaining supplied test outputs."))
+            emit(logs)
+        elif formulation_dry_run:
+            logs.append(
+                _log(
+                    "CONSENSUS",
+                    "INFO",
+                    "Formulation dry-run selected: peer consensus was not executed.",
+                    code="FORMULATION_DRY_RUN_CONSENSUS_SKIPPED",
+                    id_message="Dry-run formulasi dipilih: konsensus antaragen tidak dijalankan.",
+                    task={"type": "formulation", "mode": "formulation_dry_run_only"},
+                    result={"status": "skipped"},
+                    why={
+                        "reason": "Dry-run validates initial SRR formulation without entering collective deliberation.",
+                        "rule": "formulation_dry_run_only -> consensus review disabled",
+                    },
+                )
+            )
+            emit(logs)
+        elif skip_formulation_llm:
+            logs.append(
+                _log(
+                    "CONSENSUS",
+                    "INFO",
+                    "Direct execution selected: the LLM peer-review formulation stage was skipped; initial validated SRR artifacts proceed unchanged.",
+                    code="LLM_FORMULATION_SKIPPED",
+                    id_message=(
+                        "Eksekusi langsung dipilih: tahap formulasi peer-review LLM dilewati; "
+                        "artefak SRR awal yang tervalidasi diproses apa adanya."
+                    ),
+                    task={"type": "formulation", "mode": "skip_llm_formulation"},
+                    result={"status": "skipped"},
+                    why={
+                        "reason": "Direct execution bypasses the peer-review reformulation of the initial SRR artifacts.",
+                        "rule": "skip_llm_formulation -> consensus review disabled",
+                    },
+                )
+            )
             emit(logs)
         else:
             peer_outputs = [
@@ -2027,6 +2102,102 @@ def execute_full_shcr_cycle(
             "PRE_ARBITRATION",
             0,
         )
+        if formulation_dry_run:
+            latency_ms = (perf_counter() - started_at) * 1000.0
+            logs.append(
+                _log(
+                    "COMPLETE",
+                    "SUCCESS",
+                    "Formulation dry-run selected: validated SRR artifacts were produced without DDR, simulation, or CAR arbitration.",
+                    code="FORMULATION_DRY_RUN_COMPLETE",
+                    id_message=(
+                        "Dry-run formulasi dipilih: artefak SRR tervalidasi dihasilkan tanpa DDR, "
+                        "simulasi, maupun arbitrase CAR."
+                    ),
+                    task={"type": "formulation", "mode": "formulation_dry_run_only"},
+                    result={"status": "dry-run-complete", "validated_agents": len(parsed_by_agent)},
+                    why={
+                        "reason": "Dry-run mode validates formulation quality before any deliberation is executed.",
+                        "rule": "formulation_dry_run_only -> stop after SRR validation",
+                        "authority": "No CAR feasibility is asserted in dry-run mode.",
+                    },
+                )
+            )
+            snapshot = MetricSnapshot(
+                run_id=session_id,
+                scenario_id=scenario.id,
+                provenance_completeness_percent=(
+                    round((tagged_items / total_items) * 100.0, 2) if total_items else 0.0
+                ),
+                material_information_retention_macro_f1=0.0,
+                hard_constraint_violation_rate=0.0,
+                feasible_alternatives_count=0,
+                convergence_status=ConvergenceStatus.INSUFFICIENT_EVIDENCE,
+                latency_ms=latency_ms,
+                token_usage=total_tokens,
+            )
+            session.add(snapshot)
+            session.flush()
+            final_logs = [normalize_event(log) for log in logs]
+            for event in final_logs:
+                event["run_id"] = session_id
+                event["task_id"] = run.celery_task_id
+                event["scenario_id"] = scenario.id
+            logs[:] = final_logs
+            dry_run_payload = {
+                "metric_snapshot_id": snapshot.id,
+                "session_id": session_id,
+                "scenario_id": scenario.id,
+                "provenance_completeness_percent": snapshot.provenance_completeness_percent,
+                "hard_constraint_violation_rate": 0.0,
+                "feasible_alternatives_count": 0,
+                "convergence_status": ConvergenceStatus.INSUFFICIENT_EVIDENCE.value,
+                "latency_ms": latency_ms,
+                "token_usage": total_tokens,
+                "simulation_artifact_id": None,
+                "simulation_rounds": 0,
+                "simulation_triggered": False,
+                "formulation_dry_run": True,
+                "task": {
+                    "type": "formulation-dry-run",
+                    "scenario_id": scenario.id,
+                    "session_id": session_id,
+                },
+                "result": {
+                    "status": "DRY_RUN",
+                    "feasible_alternatives_count": 0,
+                    "selected_alternative": None,
+                },
+                "why": {
+                    "reason": "Dry-run mode stops after validated formulation; no deliberation or CAR gate was executed.",
+                    "framework": "SRR formulation validation",
+                },
+                "car": {
+                    "solver": "z3",
+                    "solver_status": "not_run",
+                    "hard_stop": {
+                        "triggered": False,
+                        "reason": None,
+                        "simulation_bypassed": False,
+                        "llm_compromise_bypassed": False,
+                        "conflict_count": 0,
+                    },
+                    "hard_constraints": [],
+                    "rejected_alternatives": [],
+                    "selected_alternative": None,
+                    "feasible_alternatives_count": 0,
+                    "rejected_alternatives_count": 0,
+                    "status": "NOT_EVALUATED",
+                },
+            }
+            run.result_payload = dry_run_payload
+            run.logs = _merge_run_logs(run.logs, logs)
+            run.progress_stage = "COMPLETE"
+            run.status = "SUCCEEDED"
+            run.completed_at = datetime.now(timezone.utc)
+            session.commit()
+            external_emit(logs)
+            return {**dry_run_payload, "logs": logs}
         observations = _ensure_influence_observations(
             session,
             scenario,
@@ -2079,13 +2250,53 @@ def execute_full_shcr_cycle(
                 }
             )
         if influence_inputs and any(item["g_i"] == 1 for item in influence_inputs):
+            auto_weighted_ids: list[int] = []
+            for observation, inputs in zip(
+                influence_observations,
+                influence_inputs,
+                strict=True,
+            ):
+                weighted_agent = agents_by_id[observation.agent_id]
+                if weighted_agent.rar_dai_weight_mode != "manual":
+                    derived = scenario_agent_weights(
+                        weighted_agent,
+                        scenario,
+                        (observation.X + observation.Q) / 2.0,
+                    )
+                    inputs.update(derived)
+                    auto_weighted_ids.append(weighted_agent.id)
+            if auto_weighted_ids:
+                logs.append(
+                    _log(
+                        "RAR-DAI",
+                        "INFO",
+                        "Orchestrator recomputed auto RAR-DAI coefficients from the current run for "
+                        f"{len(auto_weighted_ids)} agent(s); manual overrides were preserved.",
+                        code="RAR_DAI_AUTO_WEIGHTS_RECOMPUTED",
+                        id_message=(
+                            "Orchestrator menghitung ulang koefisien RAR-DAI otomatis dari run aktif "
+                            f"untuk {len(auto_weighted_ids)} agen; override manual dipertahankan."
+                        ),
+                        task={"type": "rar-dai", "phase": "pre-ddr", "weight_mode": "auto"},
+                        result={
+                            "status": "recomputed",
+                            "auto_weighted_agent_count": len(auto_weighted_ids),
+                        },
+                        why={
+                            "reason": "Auto mode keeps coefficients synchronized with the current scenario evidence and domain relevance.",
+                            "rule": "auto: theta = f(domain_alignment, evidence_completeness)",
+                        },
+                    )
+                )
+                emit(logs)
             influence_results = calculate_dynamic_influence(
                 influence_inputs,
                 [observation.proposition for observation in influence_observations],
             )
-            for observation, result in zip(
+            for observation, result, inputs in zip(
                 influence_observations,
                 influence_results,
+                influence_inputs,
                 strict=True,
             ):
                 weighted_agent = agents_by_id[observation.agent_id]
@@ -2093,12 +2304,13 @@ def execute_full_shcr_cycle(
                 observation.normalized_weight = float(result["normalized_weight"])
                 observation.calculation_payload = {
                     **dict(observation.calculation_payload or {}),
+                    "weight_mode": weighted_agent.rar_dai_weight_mode,
                     "inputs": {
-                        "theta_x": weighted_agent.theta_x,
-                        "theta_q": weighted_agent.theta_q,
-                        "theta_h": weighted_agent.theta_h,
-                        "theta_s": weighted_agent.theta_s,
-                        "theta_u": weighted_agent.theta_u,
+                        "theta_x": inputs["theta_x"],
+                        "theta_q": inputs["theta_q"],
+                        "theta_h": inputs["theta_h"],
+                        "theta_s": inputs["theta_s"],
+                        "theta_u": inputs["theta_u"],
                         "X": observation.X,
                         "Q": observation.Q,
                         "H": observation.H,

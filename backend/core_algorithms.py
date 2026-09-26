@@ -401,6 +401,23 @@ def _value(item: object, field: str) -> Any:
         raise ValueError(f"Missing required field: {field}") from error
 
 
+def calculate_orchestrator_rar_dai_weights(
+    domain_alignment: float,
+    evidence_completeness: float,
+) -> dict[str, float]:
+    if not math.isfinite(domain_alignment) or not 0.0 <= domain_alignment <= 1.0:
+        raise ValueError("domain_alignment must be finite and within 0..1")
+    if not math.isfinite(evidence_completeness) or not 0.0 <= evidence_completeness <= 1.0:
+        raise ValueError("evidence_completeness must be finite and within 0..1")
+    return {
+        "theta_x": round(0.8 + 0.8 * domain_alignment, 6),
+        "theta_q": round(0.8 + 1.2 * evidence_completeness, 6),
+        "theta_h": round(0.6 + 0.4 * evidence_completeness, 6),
+        "theta_s": round(0.75 + 0.75 * domain_alignment, 6),
+        "theta_u": round(1.0 + 1.0 * (1.0 - evidence_completeness), 6),
+    }
+
+
 def _score(agent: object) -> float:
     theta_x = float(_value(agent, "theta_x"))
     theta_q = float(_value(agent, "theta_q"))

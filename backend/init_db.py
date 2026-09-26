@@ -10,9 +10,9 @@ _SCENARIO_COLUMNS: dict[str, str] = {
     "duration_months": "INTEGER",
     "evaluation_trigger": "TEXT",
     "program_cost_period": "VARCHAR(100)",
-    "no_phase0": "BOOLEAN",
-    "phase0_only": "BOOLEAN",
-    "no_phased": "BOOLEAN",
+    "skip_llm_formulation": "BOOLEAN",
+    "formulation_dry_run_only": "BOOLEAN",
+    "single_year_deployment": "BOOLEAN",
     "proposed_reallocation": "DOUBLE PRECISION",
     "reallocation_from_education": "BOOLEAN",
     "proposed_additional_revenue": "DOUBLE PRECISION",
@@ -55,6 +55,7 @@ _AGENT_COLUMNS: dict[str, str] = {
     "scenario_id": "INTEGER REFERENCES scenarios(id) ON DELETE CASCADE",
     "specialist_domain": "VARCHAR(100)",
     "is_orchestrator": "BOOLEAN NOT NULL DEFAULT FALSE",
+    "rar_dai_weight_mode": "VARCHAR(20) NOT NULL DEFAULT 'auto'",
     "llm_api_key": "VARCHAR(4096)",
     "llm_model": "VARCHAR(255)",
     "system_prompt": "TEXT",
@@ -253,6 +254,13 @@ def _upgrade_agents_table() -> None:
                     END IF;
                     IF NOT EXISTS (
                         SELECT 1 FROM pg_constraint
+                        WHERE conname = 'ck_agent_rar_dai_weight_mode'
+                    ) THEN
+                        ALTER TABLE agents ADD CONSTRAINT ck_agent_rar_dai_weight_mode
+                            CHECK (rar_dai_weight_mode IN ('auto', 'manual'));
+                    END IF;
+                    IF NOT EXISTS (
+                        SELECT 1 FROM pg_constraint
                         WHERE conname = 'ck_agent_max_tokens_positive'
                     ) THEN
                         ALTER TABLE agents ADD CONSTRAINT ck_agent_max_tokens_positive
@@ -264,6 +272,26 @@ def _upgrade_agents_table() -> None:
         )
 
 
+def _rename_legacy_execution_mode_columns(
+    connection: Connection,
+    existing: set[str],
+) -> None:
+    aliases = {
+        "no_phase0": "skip_llm_formulation",
+        "phase0_only": "formulation_dry_run_only",
+        "no_phased": "single_year_deployment",
+    }
+    for legacy, canonical in aliases.items():
+        if legacy not in existing:
+            continue
+        connection.execute(
+            text(
+                f'UPDATE scenarios SET "{canonical}" = COALESCE("{canonical}", "{legacy}")'
+            )
+        )
+        connection.execute(text(f'ALTER TABLE scenarios DROP COLUMN "{legacy}"'))
+
+
 def _upgrade_scenarios_table() -> None:
     inspector = inspect(engine)
     if "scenarios" not in inspector.get_table_names():
@@ -273,6 +301,7 @@ def _upgrade_scenarios_table() -> None:
         for name, definition in _SCENARIO_COLUMNS.items():
             if name not in existing:
                 connection.execute(text(f'ALTER TABLE scenarios ADD COLUMN "{name}" {definition}'))
+        _rename_legacy_execution_mode_columns(connection, existing)
         connection.execute(
             text(
                 "ALTER TABLE scenarios DROP CONSTRAINT IF EXISTS "

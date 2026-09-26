@@ -19,7 +19,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .database import Base
 
@@ -30,9 +30,9 @@ SCENARIO_PARAMETER_FIELDS = (
     "duration_months",
     "evaluation_trigger",
     "program_cost_period",
-    "no_phase0",
-    "phase0_only",
-    "no_phased",
+    "skip_llm_formulation",
+    "formulation_dry_run_only",
+    "single_year_deployment",
     "proposed_reallocation",
     "reallocation_from_education",
     "proposed_additional_revenue",
@@ -88,6 +88,10 @@ class Agent(Base):
             name="ck_agent_temperature_range",
         ),
         CheckConstraint("max_tokens > 0", name="ck_agent_max_tokens_positive"),
+        CheckConstraint(
+            "rar_dai_weight_mode IN ('auto', 'manual')",
+            name="ck_agent_rar_dai_weight_mode",
+        ),
         Index(
             "uq_agent_global_name",
             "name",
@@ -151,6 +155,9 @@ class Agent(Base):
     theta_h: Mapped[float] = mapped_column(Float, nullable=False, default=1.0, server_default="1.0")
     theta_s: Mapped[float] = mapped_column(Float, nullable=False, default=1.0, server_default="1.0")
     theta_u: Mapped[float] = mapped_column(Float, nullable=False, default=1.0, server_default="1.0")
+    rar_dai_weight_mode: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="auto", server_default="auto"
+    )
     llm_base_url: Mapped[str | None] = mapped_column(String(2048))
     llm_api_key: Mapped[str | None] = mapped_column(String(4096))
     llm_model: Mapped[str | None] = mapped_column(String(255))
@@ -237,9 +244,9 @@ class SimulationPayload(BaseModel):
     duration_months: int | None = Field(default=None, gt=0)
     evaluation_trigger: str | None = None
     program_cost_period: str | None = Field(default=None, max_length=100)
-    no_phase0: bool | None = None
-    phase0_only: bool | None = None
-    no_phased: bool | None = None
+    skip_llm_formulation: bool | None = None
+    formulation_dry_run_only: bool | None = None
+    single_year_deployment: bool | None = None
     proposed_reallocation: float | None = Field(default=None, ge=0.0, allow_inf_nan=False)
     reallocation_from_education: bool | None = None
     proposed_additional_revenue: float | None = Field(default=None, ge=0.0, allow_inf_nan=False)
@@ -274,6 +281,21 @@ class SimulationPayload(BaseModel):
     oil_lifting_outlook: float | None = Field(default=None, ge=0.0, allow_inf_nan=False)
     gas_lifting_outlook: float | None = Field(default=None, ge=0.0, allow_inf_nan=False)
     tax_revenue_forecast: float | None = Field(default=None, ge=0.0, allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def validate_execution_mode(self) -> "SimulationPayload":
+        enabled = sum(
+            value is True
+            for value in (
+                self.skip_llm_formulation,
+                self.formulation_dry_run_only,
+            )
+        )
+        if enabled > 1:
+            raise ValueError(
+                "Direct execution and formulation dry-run are mutually exclusive"
+            )
+        return self
 
     def simulation_payload(self) -> dict[str, Any]:
         return self.model_dump(exclude_none=True)
@@ -372,9 +394,9 @@ class Scenario(Base):
     duration_months: Mapped[int | None] = mapped_column(Integer)
     evaluation_trigger: Mapped[str | None] = mapped_column(Text)
     program_cost_period: Mapped[str | None] = mapped_column(String(100))
-    no_phase0: Mapped[bool | None] = mapped_column(Boolean)
-    phase0_only: Mapped[bool | None] = mapped_column(Boolean)
-    no_phased: Mapped[bool | None] = mapped_column(Boolean)
+    skip_llm_formulation: Mapped[bool | None] = mapped_column(Boolean)
+    formulation_dry_run_only: Mapped[bool | None] = mapped_column(Boolean)
+    single_year_deployment: Mapped[bool | None] = mapped_column(Boolean)
     proposed_reallocation: Mapped[float | None] = mapped_column(Float)
     reallocation_from_education: Mapped[bool | None] = mapped_column(Boolean)
     proposed_additional_revenue: Mapped[float | None] = mapped_column(Float)

@@ -7,9 +7,9 @@ ALTER TABLE IF EXISTS scenarios
     ADD COLUMN IF NOT EXISTS duration_months INTEGER,
     ADD COLUMN IF NOT EXISTS evaluation_trigger TEXT,
     ADD COLUMN IF NOT EXISTS program_cost_period VARCHAR(100),
-    ADD COLUMN IF NOT EXISTS no_phase0 BOOLEAN,
-    ADD COLUMN IF NOT EXISTS phase0_only BOOLEAN,
-    ADD COLUMN IF NOT EXISTS no_phased BOOLEAN,
+    ADD COLUMN IF NOT EXISTS skip_llm_formulation BOOLEAN,
+    ADD COLUMN IF NOT EXISTS formulation_dry_run_only BOOLEAN,
+    ADD COLUMN IF NOT EXISTS single_year_deployment BOOLEAN,
     ADD COLUMN IF NOT EXISTS proposed_reallocation DOUBLE PRECISION,
     ADD COLUMN IF NOT EXISTS reallocation_from_education BOOLEAN,
     ADD COLUMN IF NOT EXISTS proposed_additional_revenue DOUBLE PRECISION,
@@ -45,6 +45,33 @@ ALTER TABLE IF EXISTS scenarios
     ADD COLUMN IF NOT EXISTS gas_lifting_outlook DOUBLE PRECISION,
     ADD COLUMN IF NOT EXISTS tax_revenue_forecast DOUBLE PRECISION;
 
+DO $$
+BEGIN
+    IF to_regclass('public.scenarios') IS NOT NULL THEN
+        IF EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = 'scenarios' AND column_name = 'no_phase0'
+        ) THEN
+            UPDATE scenarios SET skip_llm_formulation = COALESCE(skip_llm_formulation, no_phase0);
+            ALTER TABLE scenarios DROP COLUMN no_phase0;
+        END IF;
+        IF EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = 'scenarios' AND column_name = 'phase0_only'
+        ) THEN
+            UPDATE scenarios SET formulation_dry_run_only = COALESCE(formulation_dry_run_only, phase0_only);
+            ALTER TABLE scenarios DROP COLUMN phase0_only;
+        END IF;
+        IF EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = 'scenarios' AND column_name = 'no_phased'
+        ) THEN
+            UPDATE scenarios SET single_year_deployment = COALESCE(single_year_deployment, no_phased);
+            ALTER TABLE scenarios DROP COLUMN no_phased;
+        END IF;
+    END IF;
+END $$;
+
 ALTER TABLE IF EXISTS scenarios
     DROP CONSTRAINT IF EXISTS ck_scenario_max_deficit_nonnegative,
     DROP COLUMN IF EXISTS max_deficit_constraint;
@@ -54,6 +81,7 @@ ALTER TABLE IF EXISTS agents
     ADD COLUMN IF NOT EXISTS scenario_id INTEGER REFERENCES scenarios(id) ON DELETE CASCADE,
     ADD COLUMN IF NOT EXISTS specialist_domain VARCHAR(100),
     ADD COLUMN IF NOT EXISTS is_orchestrator BOOLEAN NOT NULL DEFAULT FALSE,
+    ADD COLUMN IF NOT EXISTS rar_dai_weight_mode VARCHAR(20) NOT NULL DEFAULT 'auto',
     ADD COLUMN IF NOT EXISTS llm_base_url VARCHAR(2048),
     ADD COLUMN IF NOT EXISTS llm_api_key VARCHAR(4096),
     ADD COLUMN IF NOT EXISTS llm_model VARCHAR(255),
@@ -98,6 +126,12 @@ BEGIN
             WHERE scenario_id IS NOT NULL AND specialist_domain IS NOT NULL;
         CREATE INDEX IF NOT EXISTS ix_agents_scenario_id
             ON agents (scenario_id);
+        IF NOT EXISTS (
+            SELECT 1 FROM pg_constraint WHERE conname = 'ck_agent_rar_dai_weight_mode'
+        ) THEN
+            ALTER TABLE agents ADD CONSTRAINT ck_agent_rar_dai_weight_mode
+                CHECK (rar_dai_weight_mode IN ('auto', 'manual'));
+        END IF;
         IF NOT EXISTS (
             SELECT 1 FROM pg_constraint WHERE conname = 'ck_agent_temperature_range'
         ) THEN

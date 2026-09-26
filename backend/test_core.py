@@ -11,6 +11,7 @@ from backend.core_algorithms import (
     build_mandate_synthesis_prompt,
     build_mandate_synthesis_system_prompt,
     calculate_dynamic_influence,
+    calculate_orchestrator_rar_dai_weights,
     calculate_violation_rate,
     detect_divergence_vector,
     extract_json_object,
@@ -302,6 +303,38 @@ def test_public_sanitizer_removes_nested_secret_key_variants() -> None:
         "rationale": "public rationale",
         "nested": {"safe": "visible"},
     }
+
+
+def test_orchestrator_rar_dai_weights_follow_alignment_and_evidence() -> None:
+    low = calculate_orchestrator_rar_dai_weights(0.0, 0.0)
+    high = calculate_orchestrator_rar_dai_weights(1.0, 1.0)
+
+    assert low == {
+        "theta_x": 0.8,
+        "theta_q": 0.8,
+        "theta_h": 0.6,
+        "theta_s": 0.75,
+        "theta_u": 2.0,
+    }
+    assert high == {
+        "theta_x": 1.6,
+        "theta_q": 2.0,
+        "theta_h": 1.0,
+        "theta_s": 1.5,
+        "theta_u": 1.0,
+    }
+
+
+@pytest.mark.parametrize(
+    ("alignment", "completeness"),
+    [(-0.1, 0.5), (1.1, 0.5), (0.5, -0.1), (0.5, 1.1), (math.inf, 0.5)],
+)
+def test_orchestrator_rar_dai_weights_reject_invalid_inputs(
+    alignment: float,
+    completeness: float,
+) -> None:
+    with pytest.raises(ValueError):
+        calculate_orchestrator_rar_dai_weights(alignment, completeness)
 
 
 def test_rar_dai_zero_gate() -> None:

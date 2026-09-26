@@ -1580,6 +1580,200 @@ def test_all_infeasible_cycle_cannot_resurrect_fallback_alternative(
         assert artifacts[0].output_payload["resolution_status"] == "INFEASIBLE"
 
 
+def test_formulation_dry_run_stops_before_deliberation(scenario_id: int) -> None:
+    with SessionLocal() as session:
+        scenario = session.get(Scenario, scenario_id)
+        assert scenario is not None
+        scenario.formulation_dry_run_only = True
+        session.commit()
+
+    responses = iter(
+        [
+            (response_payload(prediction="Growth 2%", utility=0.8, recommendation="Adopt A"), 120),
+            (response_payload(prediction="Growth 1%", utility=0.6, recommendation="Adopt B"), 130),
+        ]
+    )
+
+    def forbidden_consensus(*_args: object, **_kwargs: object) -> tuple[str, int]:
+        raise AssertionError("dry-run must not invoke the LLM consensus stage")
+
+    run_id = _create_isolated_session(scenario_id)
+    result = execute_full_shcr_cycle(
+        scenario_id,
+        run_id,
+        llm_call=lambda _agent, _scenario: next(responses),
+        consensus_call=forbidden_consensus,
+    )
+
+    assert result["formulation_dry_run"] is True
+    assert result["simulation_triggered"] is False
+    assert result["car"]["status"] == "NOT_EVALUATED"
+    assert result["convergence_status"] == ConvergenceStatus.INSUFFICIENT_EVIDENCE.value
+    assert any(log["code"] == "FORMULATION_DRY_RUN_COMPLETE" for log in result["logs"])
+    with SessionLocal() as session:
+        run = session.get(ConsensusSession, result["session_id"])
+        assert run is not None and run.status == "SUCCEEDED"
+        assert list(
+            session.scalars(
+                select(SimulationArtifact).where(
+                    SimulationArtifact.run_id == result["session_id"]
+                )
+            )
+        ) == []
+
+
+def test_direct_execution_skips_peer_review_but_keeps_car(scenario_id: int) -> None:
+    with SessionLocal() as session:
+        scenario = session.get(Scenario, scenario_id)
+        assert scenario is not None
+        scenario.skip_llm_formulation = True
+        session.commit()
+
+    responses = iter(
+        [
+            (response_payload(prediction="Growth 2%", utility=0.8, recommendation="Adopt A"), 120),
+            (response_payload(prediction="Growth 1%", utility=0.6, recommendation="Adopt B"), 130),
+        ]
+    )
+    consensus_calls = 0
+
+    def forbidden_consensus(*_args: object, **_kwargs: object) -> tuple[str, int]:
+        nonlocal consensus_calls
+        consensus_calls += 1
+        raise AssertionError("direct execution must skip LLM peer review")
+
+    run_id = _create_isolated_session(scenario_id)
+    result = execute_full_shcr_cycle(
+        scenario_id,
+        run_id,
+        llm_call=lambda _agent, _scenario: next(responses),
+        consensus_call=forbidden_consensus,
+        enable_simulation=False,
+    )
+
+    assert consensus_calls == 0
+    assert result["car"]["solver_status"] != "not_run"
+    assert any(log["code"] == "LLM_FORMULATION_SKIPPED" for log in result["logs"])
+
+
+def test_single_year_deployment_disables_iterative_simulation(scenario_id: int) -> None:
+    with SessionLocal() as session:
+        scenario = session.get(Scenario, scenario_id)
+        assert scenario is not None
+        scenario.single_year_deployment = True
+        session.commit()
+
+    responses = iter(
+        [
+            (response_payload(prediction="Growth 2%", utility=0.8, recommendation="Adopt A"), 120),
+            (response_payload(prediction="Growth 1%", utility=0.6, recommendation="Adopt B"), 130),
+        ]
+    )
+
+    def simulation_call(*_args: object, **_kwargs: object) -> tuple[str, int]:
+        raise AssertionError("single-year deployment must not run simulation")
+
+    result = execute_full_shcr_cycle(
+        scenario_id,
+        lambda _agent, _scenario: next(responses),
+        simulation_call=simulation_call,
+    )
+
+    assert result["simulation_rounds"] == 0
+    assert result["simulation_triggered"] is False
+    assert any(log["code"] == "SINGLE_YEAR_DEPLOYMENT_NO_PHASING" for log in result["logs"])
+
+
+def test_auto_weight_mode_recomputes_coefficients_per_run(scenario_id: int) -> None:
+    with SessionLocal() as session:
+        scenario = session.get(Scenario, scenario_id)
+        assert scenario is not None
+        scenario.description = "Tax revenue and inflation stabilisation"
+        for agent in session.scalars(select(Agent).where(Agent.name.startswith("phase3_"))):
+            agent.theta_x = 0.0
+            agent.theta_q = 0.0
+            agent.theta_h = 0.0
+            agent.theta_s = 0.0
+            agent.theta_u = 0.0
+            agent.rar_dai_weight_mode = "auto"
+        session.commit()
+
+    responses = iter(
+        [
+            (response_payload(prediction="Growth 2%", utility=0.8, recommendation="Adopt A"), 120),
+            (response_payload(prediction="Growth 1%", utility=0.6, recommendation="Adopt B"), 130),
+        ]
+    )
+
+    result = execute_full_shcr_cycle(
+        scenario_id,
+        lambda _agent, _scenario: next(responses),
+        enable_simulation=False,
+    )
+
+    with SessionLocal() as session:
+        observations = list(
+            session.scalars(
+                select(AgentInfluenceObservation).where(
+                    AgentInfluenceObservation.run_id == result["session_id"]
+                )
+            )
+        )
+        assert observations
+        for observation in observations:
+            assert observation.raw_score is not None
+            assert observation.raw_score > 0.0
+            assert observation.calculation_payload["weight_mode"] == "auto"
+            assert observation.calculation_payload["inputs"]["theta_x"] > 0.0
+    assert any(
+        log["code"] == "RAR_DAI_AUTO_WEIGHTS_RECOMPUTED" for log in result["logs"]
+    )
+
+
+def test_manual_weight_mode_preserves_coefficients(scenario_id: int) -> None:
+    with SessionLocal() as session:
+        scenario = session.get(Scenario, scenario_id)
+        assert scenario is not None
+        for agent in session.scalars(select(Agent).where(Agent.name.startswith("phase3_"))):
+            agent.theta_x = 1.25
+            agent.theta_q = 1.0
+            agent.theta_h = 0.5
+            agent.theta_s = 1.0
+            agent.theta_u = 0.5
+            agent.rar_dai_weight_mode = "manual"
+        session.commit()
+
+    responses = iter(
+        [
+            (response_payload(prediction="Growth 2%", utility=0.8, recommendation="Adopt A"), 120),
+            (response_payload(prediction="Growth 1%", utility=0.6, recommendation="Adopt B"), 130),
+        ]
+    )
+
+    result = execute_full_shcr_cycle(
+        scenario_id,
+        lambda _agent, _scenario: next(responses),
+        enable_simulation=False,
+    )
+
+    with SessionLocal() as session:
+        observations = list(
+            session.scalars(
+                select(AgentInfluenceObservation).where(
+                    AgentInfluenceObservation.run_id == result["session_id"]
+                )
+            )
+        )
+        assert observations
+        for observation in observations:
+            assert observation.calculation_payload["weight_mode"] == "manual"
+            assert observation.calculation_payload["inputs"]["theta_x"] == pytest.approx(1.25)
+            assert observation.calculation_payload["inputs"]["theta_h"] == pytest.approx(0.5)
+    assert not any(
+        log["code"] == "RAR_DAI_AUTO_WEIGHTS_RECOMPUTED" for log in result["logs"]
+    )
+
+
 def test_run_full_shcr_cycle_populates_postgres(scenario_id: int) -> None:
     responses = iter(
         [

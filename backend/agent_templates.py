@@ -8,6 +8,7 @@ from sqlalchemy import delete, or_, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
+from .core_algorithms import calculate_orchestrator_rar_dai_weights
 from .models import Agent, Scenario
 from .global_config import apply_global_values, get_global_llm_config
 
@@ -62,6 +63,7 @@ class AgentSpec:
                 "theta_h": 1.0,
                 "theta_s": 1.0,
                 "theta_u": 1.0,
+                "rar_dai_weight_mode": "auto",
             }
         )
         return payload
@@ -79,6 +81,7 @@ class AgentSpec:
             "theta_h": 1.0,
             "theta_s": 1.0,
             "theta_u": 1.0,
+            "rar_dai_weight_mode": "auto",
         }
 
 
@@ -352,7 +355,96 @@ _DOMAIN_GAP_PATTERNS: dict[str, tuple[re.Pattern[str], ...]] = {
     "treasury": _domain_patterns("treasury", "liquidity", "cash", "sal", "kas", "likuiditas"),
     "macro": _domain_patterns("macro", "inflation", "growth", "exchange rate", "makro", "inflasi", "pertumbuhan", "nilai tukar", "stabilization"),
 }
-_AGENT_SPECS_BY_KEY = {agent.key: agent for agent in AGENTS}
+_AGENT_SPECS_BY_KEY: dict[str, AgentSpec] = {agent.key: agent for agent in AGENTS}
+_DOMAIN_SCENARIO_FIELDS: dict[str, tuple[str, ...]] = {
+    "revenue": (
+        "proposed_additional_revenue",
+        "revenue_measure_type",
+        "verified_revenue_offset_capacity",
+        "tax_measure_has_enacted_law",
+        "pnbp_measure_has_valid_tariff_instrument",
+        "tax_revenue_forecast",
+    ),
+    "expenditure": (
+        "instrument",
+        "targeting",
+        "program_cost",
+        "duration_months",
+        "proposed_reallocation",
+        "reallocation_from_education",
+        "appropriation_available",
+        "verified_reallocation_capacity",
+        "spending_reallocation_authorized",
+        "dpr_spending_adjustment_recommendation",
+        "output_outcome_documented",
+        "domestic_product_compliance_documented",
+    ),
+    "financing": (
+        "proposed_debt_financing",
+        "debt_financing_mode",
+        "proposed_other_financing",
+        "verified_debt_financing_headroom",
+        "verified_cumulative_borrowing_pct_gdp",
+        "dpr_additional_sbn_approval_obtained",
+    ),
+    "treasury": (
+        "proposed_sal_use",
+        "sal_purpose",
+        "verified_sal_available",
+        "verified_operational_cash_minimum",
+        "verified_projected_cash_after_policy",
+        "finance_minister_sal_authorized",
+        "dpr_sal_approval_obtained",
+    ),
+    "macro": (
+        "growth_outlook",
+        "inflation_outlook",
+        "fx_outlook",
+        "sbn10y_yield_outlook",
+        "icp_outlook",
+        "oil_lifting_outlook",
+        "gas_lifting_outlook",
+    ),
+}
+
+_DOMAIN_EVIDENCE_FIELDS: dict[str, tuple[str, ...]] = {
+    "revenue": (
+        "verified_revenue_offset_capacity",
+        "tax_measure_has_enacted_law",
+        "pnbp_measure_has_valid_tariff_instrument",
+        "tax_revenue_forecast",
+    ),
+    "expenditure": (
+        "appropriation_available",
+        "verified_reallocation_capacity",
+        "spending_reallocation_authorized",
+        "dpr_spending_adjustment_recommendation",
+        "output_outcome_documented",
+        "domestic_product_compliance_documented",
+    ),
+    "financing": (
+        "verified_debt_financing_headroom",
+        "verified_cumulative_borrowing_pct_gdp",
+        "dpr_additional_sbn_approval_obtained",
+    ),
+    "treasury": (
+        "verified_sal_available",
+        "verified_operational_cash_minimum",
+        "verified_projected_cash_after_policy",
+        "finance_minister_sal_authorized",
+        "dpr_sal_approval_obtained",
+    ),
+    "macro": (
+        "growth_outlook",
+        "inflation_outlook",
+        "fx_outlook",
+        "sbn10y_yield_outlook",
+        "icp_outlook",
+        "oil_lifting_outlook",
+        "gas_lifting_outlook",
+    ),
+}
+
 _SEMANTIC_AGENT_NAMES = {
     "revenue": "Dynamic_Revenue_Validator",
     "expenditure": "Dynamic_Expenditure_Reviewer",
@@ -484,6 +576,7 @@ def agent_revision(agents: list[Agent], scenario: object | None = None) -> str:
                 "theta_h": agent.theta_h,
                 "theta_s": agent.theta_s,
                 "theta_u": agent.theta_u,
+                "rar_dai_weight_mode": agent.rar_dai_weight_mode,
             }
             for agent in agents
         ],
@@ -671,6 +764,64 @@ def detected_scenario_domains(scenario: Scenario) -> list[str]:
     ]
 
 
+def scenario_agent_weights(
+    agent: Agent,
+    scenario: Scenario,
+    evidence_completeness: float,
+) -> dict[str, float]:
+    domain = agent_domain_key(agent) or agent.specialist_domain
+    if domain not in _DOMAIN_GAP_PATTERNS:
+        return calculate_orchestrator_rar_dai_weights(0.0, evidence_completeness)
+    _, plan = orchestrated_scenario_agent_plan(scenario)
+    alignment = plan["metrics"][domain]["domain_alignment"]
+    return calculate_orchestrator_rar_dai_weights(alignment, evidence_completeness)
+
+
+def orchestrated_scenario_agent_plan(
+    scenario: Scenario,
+) -> tuple[list[str], dict[str, Any]]:
+    description = " ".join(scenario.description.casefold().split())
+    simulation_payload = scenario.simulation_payload()
+    domain_scores: dict[str, float] = {}
+    metrics: dict[str, dict[str, float]] = {}
+    for domain, patterns in _DOMAIN_GAP_PATTERNS.items():
+        token_score = float(sum(bool(pattern.search(description)) for pattern in patterns))
+        relevant_fields = _DOMAIN_SCENARIO_FIELDS[domain]
+        supplied_fields = sum(
+            simulation_payload.get(field) is not None
+            and simulation_payload.get(field) != ""
+            for field in relevant_fields
+        )
+        field_alignment = supplied_fields / len(relevant_fields)
+        evidence_fields = _DOMAIN_EVIDENCE_FIELDS[domain]
+        verified_fields = sum(
+            simulation_payload.get(field) is not None
+            and simulation_payload.get(field) != ""
+            for field in evidence_fields
+        )
+        completeness = verified_fields / len(evidence_fields)
+        token_alignment = min(1.0, token_score / 2.0)
+        alignment = max(token_alignment, field_alignment)
+        score = 0.65 * alignment + 0.35 * completeness
+        domain_scores[domain] = score
+        metrics[domain] = {
+            "domain_alignment": alignment,
+            "verified_evidence_completeness": completeness,
+            "orchestration_score": score,
+        }
+    ordered = sorted(domain_scores, key=lambda key: (-domain_scores[key], key))
+    selected_count = min(5, max(3, sum(score > 0.0 for score in domain_scores.values())))
+    selected_domains = ordered[:selected_count]
+    weights = {
+        domain: calculate_orchestrator_rar_dai_weights(
+            metrics[domain]["domain_alignment"],
+            metrics[domain]["verified_evidence_completeness"],
+        )
+        for domain in selected_domains
+    }
+    return selected_domains, {"metrics": metrics, "weights": weights}
+
+
 def ensure_phase_one_specialists(
     session: Session,
     scenario: Scenario,
@@ -678,21 +829,19 @@ def ensure_phase_one_specialists(
     orchestrator, orchestrator_created = get_or_create_master_orchestrator(session)
     scoped_agents = scenario_scoped_agents(session, scenario.id)
     global_agents = global_deliberative_agents(session)
-    coverage_agents = (
-        scoped_agents
-        if any(agent.template_key is not None for agent in scoped_agents)
-        else global_agents
-    )
+    has_scenario_templates = any(agent.template_key is not None for agent in scoped_agents)
+    coverage_agents = scoped_agents if has_scenario_templates else global_agents
     existing_by_key = {
         agent_domain_key(agent): agent
         for agent in coverage_agents
         if agent_domain_key(agent) is not None
     }
-    detected_domains = detected_scenario_domains(scenario)
+    selected_domains = detected_scenario_domains(scenario)
+    _, orchestration_plan = orchestrated_scenario_agent_plan(scenario)
     created_specialists: list[Agent] = []
     reused_specialists: list[Agent] = []
     global_config = get_global_llm_config(session)
-    for key in detected_domains:
+    for key in selected_domains:
         spec = _AGENT_SPECS_BY_KEY[key]
         specialist_name = f"Dynamic_{key.title()}_Reviewer_S{scenario.id}"
         specialist = existing_by_key.get(key)
@@ -711,8 +860,11 @@ def ensure_phase_one_specialists(
                 )
             )
         if specialist is None:
+            weights = orchestration_plan["weights"][key]
             values = {
                 **spec.as_agent_values(),
+                **weights,
+                "rar_dai_weight_mode": "auto",
                 "template_key": None,
                 "name": specialist_name,
                 "scenario_id": scenario.id,
@@ -740,9 +892,7 @@ def ensure_phase_one_specialists(
                 )
             )
             if specialist is None:
-                raise ValueError(
-                    f"Could not provision scenario specialist for domain '{key}'"
-                )
+                raise ValueError(f"Could not provision scenario specialist for domain '{key}'")
             if inserted_id is not None:
                 created_specialists.append(specialist)
             else:
@@ -755,37 +905,51 @@ def ensure_phase_one_specialists(
         "orchestrator_id": orchestrator.id,
         "orchestrator_name": orchestrator.name,
         "orchestrator_created": orchestrator_created,
-        "detected_domains": detected_domains,
+        "detected_domains": selected_domains,
+        "selected_domains": selected_domains,
         "created_specialist_ids": [agent.id for agent in created_specialists],
         "reused_specialist_ids": [agent.id for agent in reused_specialists],
+        "selection_metrics": orchestration_plan["metrics"],
+        "rar_dai_weights": orchestration_plan["weights"],
+        "weight_mode": "auto",
         "non_voting": True,
     }
 
 
-def replace_scenario_agent_templates(
+def orchestrate_scenario_agents(
     session: Session,
-    scenario_id: int,
+    scenario: Scenario,
     configs: dict[str, dict[str, Any]] | None = None,
-) -> list[Agent]:
-    session.execute(delete(Agent).where(Agent.scenario_id == scenario_id))
+) -> tuple[list[Agent], dict[str, Any]]:
+    session.execute(delete(Agent).where(Agent.scenario_id == scenario.id))
     session.flush()
+    selected_domains, orchestration_plan = orchestrated_scenario_agent_plan(scenario)
     configurations = configs or {}
     global_config = get_global_llm_config(session)
     agents: list[Agent] = []
-    for template in STANDARD_APBN_AGENT_TEMPLATES:
+    for domain in selected_domains:
+        template = _AGENT_SPECS_BY_KEY[domain]
         values = {
             **apply_global_values(template.as_agent_values(), global_config),
-            "scenario_id": scenario_id,
-            "specialist_domain": template.key,
+            **orchestration_plan["weights"][domain],
+            "rar_dai_weight_mode": "auto",
+            "scenario_id": scenario.id,
+            "specialist_domain": domain,
         }
-        for field, value in configurations.get(template.key, {}).items():
+        for field, value in configurations.get(domain, {}).items():
             if value not in (None, "") and not global_config.apply_to_all:
                 values[field] = value
         agent = Agent(**values)
         session.add(agent)
         agents.append(agent)
     session.flush()
-    return agents
+    return agents, {
+        "selected_domains": selected_domains,
+        "selection_metrics": orchestration_plan["metrics"],
+        "rar_dai_weights": orchestration_plan["weights"],
+        "weight_mode": "auto",
+        "agent_count": len(agents),
+    }
 
 
 def load_standard_agent_templates(

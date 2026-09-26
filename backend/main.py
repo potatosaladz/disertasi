@@ -25,11 +25,12 @@ from .agent_templates import (
     find_agent_by_name_and_scenario,
     get_agent_spec,
     global_deliberative_agents,
+    get_or_create_master_orchestrator,
     is_generated_agent_name,
     is_master_orchestrator,
     load_standard_agent_templates,
     mandate_seed,
-    replace_scenario_agent_templates,
+    orchestrate_scenario_agents,
     scenario_deliberative_agents,
     scenario_scoped_agents,
     semantic_agent_name,
@@ -125,6 +126,7 @@ class AgentCreate(BaseModel):
     theta_h: float = Field(default=1.0, ge=0.0, allow_inf_nan=False)
     theta_s: float = Field(default=1.0, ge=0.0, allow_inf_nan=False)
     theta_u: float = Field(default=1.0, ge=0.0, allow_inf_nan=False)
+    rar_dai_weight_mode: Literal["auto", "manual"] = "auto"
     llm_base_url: str | None = Field(default=None, max_length=2048)
     llm_api_key: str | None = Field(default=None, max_length=4096)
     llm_model: str | None = Field(default=None, max_length=255)
@@ -144,6 +146,7 @@ class AgentUpdate(BaseModel):
     theta_h: float | None = Field(default=None, ge=0.0, allow_inf_nan=False)
     theta_s: float | None = Field(default=None, ge=0.0, allow_inf_nan=False)
     theta_u: float | None = Field(default=None, ge=0.0, allow_inf_nan=False)
+    rar_dai_weight_mode: Literal["auto", "manual"] | None = None
     llm_base_url: str | None = Field(default=None, max_length=2048)
     llm_api_key: str | None = Field(default=None, max_length=4096)
     llm_model: str | None = Field(default=None, max_length=255)
@@ -160,11 +163,13 @@ class AgentResponse(BaseModel):
     role: str
     template_key: str | None
     scenario_id: int | None
+    specialist_domain: str | None
     theta_x: float
     theta_q: float
     theta_h: float
     theta_s: float
     theta_u: float
+    rar_dai_weight_mode: Literal["auto", "manual"]
     llm_base_url: str | None
     llm_model: str | None
     system_prompt: str | None
@@ -257,11 +262,13 @@ def agent_response(agent: Agent, *, reused: bool = False) -> AgentResponse:
         role=agent.role,
         template_key=agent.template_key,
         scenario_id=agent.scenario_id,
+        specialist_domain=agent.specialist_domain,
         theta_x=agent.theta_x,
         theta_q=agent.theta_q,
         theta_h=agent.theta_h,
         theta_s=agent.theta_s,
         theta_u=agent.theta_u,
+        rar_dai_weight_mode=cast(Literal["auto", "manual"], agent.rar_dai_weight_mode),
         llm_base_url=agent.llm_base_url,
         llm_model=agent.llm_model,
         system_prompt=agent.system_prompt,
@@ -351,9 +358,9 @@ def load_agent_templates(payload: LoadTemplatesRequest | None = None) -> dict[st
         }
 
 
-@app.post("/api/scenarios/{scenario_id}/load-templates")
-@app.post("/scenarios/{scenario_id}/load-templates")
-def load_scenario_agent_templates(
+@app.post("/api/scenarios/{scenario_id}/orchestrate-agents")
+@app.post("/scenarios/{scenario_id}/orchestrate-agents")
+def orchestrate_scenario_agent_set(
     scenario_id: int,
     payload: LoadTemplatesRequest | None = None,
 ) -> dict[str, object]:
@@ -363,13 +370,14 @@ def load_scenario_agent_templates(
     }
     unknown = set(configs) - {item["key"] for item in template_catalog()}
     if unknown:
-        raise HTTPException(status_code=422, detail=f"Unknown templates: {sorted(unknown)}")
+        raise HTTPException(status_code=422, detail=f"Unknown domain configs: {sorted(unknown)}")
     with SessionLocal() as session:
         scenario = session.get(Scenario, scenario_id)
         if scenario is None:
             raise HTTPException(status_code=404, detail="Scenario not found")
         _clear_scenario_execution_data(session, scenario_id)
-        agents = replace_scenario_agent_templates(session, scenario_id, configs)
+        orchestrator, orchestrator_created = get_or_create_master_orchestrator(session)
+        agents, orchestration = orchestrate_scenario_agents(session, scenario, configs)
         session.commit()
         for agent in agents:
             session.refresh(agent)
@@ -377,6 +385,9 @@ def load_scenario_agent_templates(
             "created": len(agents),
             "total": len(agents),
             "scenario_id": scenario_id,
+            "orchestrator_id": orchestrator.id,
+            "orchestrator_created": orchestrator_created,
+            "orchestration": orchestration,
             "agents": [agent_response(agent).model_dump() for agent in agents],
         }
 
@@ -1455,6 +1466,21 @@ def update_scenario(scenario_id: int, payload: ScenarioUpdate) -> ScenarioRespon
         updates = payload.model_dump(exclude_unset=True)
         if "description" in updates and updates["description"] is None:
             raise HTTPException(status_code=422, detail="Description cannot be null")
+        execution_modes = {
+            "skip_llm_formulation": updates.get(
+                "skip_llm_formulation", scenario.skip_llm_formulation
+            ),
+            "formulation_dry_run_only": updates.get(
+                "formulation_dry_run_only", scenario.formulation_dry_run_only
+            ),
+        }
+        if all(value is True for value in execution_modes.values()):
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "Direct execution and formulation dry-run are mutually exclusive"
+                ),
+            )
         for field, value in updates.items():
             setattr(scenario, field, value)
         session.commit()

@@ -11,11 +11,13 @@ type Agent = {
   role: string;
   template_key: string | null;
   scenario_id?: number | null;
+  specialist_domain?: string | null;
   theta_x: number;
   theta_q: number;
   theta_h: number;
   theta_s: number;
   theta_u: number;
+  rar_dai_weight_mode: "auto" | "manual";
   llm_base_url: string | null;
   llm_model: string | null;
   system_prompt: string | null;
@@ -52,9 +54,9 @@ type ScenarioInputs = {
   duration_months: number | null;
   evaluation_trigger: string | null;
   program_cost_period: string | null;
-  no_phase0: boolean | null;
-  phase0_only: boolean | null;
-  no_phased: boolean | null;
+  skip_llm_formulation: boolean | null;
+  formulation_dry_run_only: boolean | null;
+  single_year_deployment: boolean | null;
   proposed_reallocation: number | null;
   reallocation_from_education: boolean | null;
   proposed_additional_revenue: number | null;
@@ -199,6 +201,7 @@ const initialAgent: AgentForm = {
   theta_h: 1,
   theta_s: 1,
   theta_u: 1,
+  rar_dai_weight_mode: "auto",
   llm_base_url: "",
   llm_api_key: "",
   llm_model: "",
@@ -213,9 +216,9 @@ const initialScenario: ScenarioForm = {
   duration_months: null,
   evaluation_trigger: null,
   program_cost_period: null,
-  no_phase0: null,
-  phase0_only: null,
-  no_phased: null,
+  skip_llm_formulation: null,
+  formulation_dry_run_only: null,
+  single_year_deployment: null,
   proposed_reallocation: null,
   reallocation_from_education: null,
   proposed_additional_revenue: null,
@@ -252,8 +255,8 @@ const initialScenario: ScenarioForm = {
   tax_revenue_forecast: null,
 };
 
-function NumericField({ label, value, onChange, hint }: { label: string; value: number; onChange: (value: number) => void; hint: string }) {
-  return <label className="form-field"><strong>{label}</strong><input type="number" min="0" step="0.01" value={value} onChange={(event) => onChange(Number(event.target.value))} required /><small>{hint}</small></label>;
+function NumericField({ label, value, onChange, hint, disabled = false }: { label: string; value: number; onChange: (value: number) => void; hint: string; disabled?: boolean }) {
+  return <label className="form-field range-field"><span className="range-label"><strong>{label}</strong><output>{value.toFixed(2)}</output></span><input type="range" min="0" max="2" step="0.01" value={value} disabled={disabled} onChange={(event) => onChange(Number(event.target.value))} /><small>{hint}</small></label>;
 }
 
 function OptionalTextField({ label, value, onChange, multiline = false }: { label: string; value: string | null; onChange: (value: string | null) => void; multiline?: boolean }) {
@@ -270,14 +273,30 @@ function OptionalNumberField({ label, value, onChange, min, step = "any" }: { la
 function ScenarioParameterSections({ value, onChange, lang }: { value: ScenarioForm; onChange: (value: ScenarioForm) => void; lang: "id" | "en" }) {
   const set = <K extends keyof ScenarioForm>(field: K, next: ScenarioForm[K]) => onChange({ ...value, [field]: next });
   const section = lang === "id"
-    ? { policy: "Ruang Lingkup Kebijakan", proposals: "Usulan Pembiayaan", evidence: "Bukti Terverifikasi", macro: "Prognosis Makro", yes: "Ya", no: "Tidak", unknown: "Belum diketahui" }
-    : { policy: "Policy Scope", proposals: "Financing Proposals", evidence: "Verified Evidence", macro: "Macro Outlook", yes: "Yes", no: "No", unknown: "Unknown" };
-  const booleanField = (field: keyof ScenarioInputs, label: string) => <label className="form-field" key={field}><strong>{label}</strong><select value={value[field] === null ? "" : String(value[field])} onChange={(event) => set(field, (event.target.value === "" ? null : event.target.value === "true") as never)}><option value="">{section.unknown}</option><option value="true">{section.yes}</option><option value="false">{section.no}</option></select></label>;
+    ? {
+        policy: "Ruang Lingkup Kebijakan", proposals: "Usulan Pembiayaan", evidence: "Bukti Terverifikasi", macro: "Prognosis Makro", yes: "Ya", no: "Tidak", unknown: "Belum ditentukan",
+        direct: "Eksekusi Langsung / Lewati Formulasi LLM", directHelp: "Lewati peer-review formulasi LLM; artefak SRR awal yang tervalidasi langsung masuk ke RAR-DAI, DDR, dan CAR.",
+        dryRun: "Dry-Run Formulasi Saja", dryRunHelp: "Jalankan dan validasi formulasi SRR, lalu berhenti sebelum RAR-DAI, DDR, simulasi, dan CAR.",
+        singleYear: "Deployment Penuh Satu Tahun", singleYearHelp: "Evaluasi kebijakan sebagai deployment satu tahun tanpa ronde simulasi bertahap; batas defisit CAR 3% tetap berlaku.",
+      }
+    : {
+        policy: "Policy Scope", proposals: "Financing Proposals", evidence: "Verified Evidence", macro: "Macro Outlook", yes: "Yes", no: "No", unknown: "Not specified",
+        direct: "Direct Execution / Skip LLM Formulation", directHelp: "Skip the LLM peer-review formulation stage; initial validated SRR artifacts proceed directly to RAR-DAI, DDR, and CAR.",
+        dryRun: "Formulation Dry-Run Only", dryRunHelp: "Generate and validate SRR formulation, then stop before RAR-DAI, DDR, simulation, and CAR.",
+        singleYear: "Single-Year Full Deployment", singleYearHelp: "Evaluate a one-year full deployment without iterative simulation rounds; the statutory 3% CAR ceiling still applies.",
+      };
+  const setBoolean = (field: keyof ScenarioInputs, next: boolean | null) => {
+    const updated = { ...value, [field]: next };
+    if (next === true && field === "skip_llm_formulation") updated.formulation_dry_run_only = false;
+    if (next === true && field === "formulation_dry_run_only") updated.skip_llm_formulation = false;
+    onChange(updated);
+  };
+  const booleanField = (field: keyof ScenarioInputs, label: string, help?: string) => <label className="form-field" key={field}><strong>{label}</strong><select value={value[field] === null ? "" : String(value[field])} onChange={(event) => setBoolean(field, event.target.value === "" ? null : event.target.value === "true")}><option value="">{section.unknown}</option><option value="true">{section.yes}</option><option value="false">{section.no}</option></select>{help && <small>{help}</small>}</label>;
   return <div className="scenario-parameter-sections">
-    <details open><summary>{section.policy}</summary><div className="form-grid two-column"><OptionalTextField label="Instrument" value={value.instrument} onChange={(next) => set("instrument", next)} /><OptionalTextField label="Targeting" value={value.targeting} onChange={(next) => set("targeting", next)} multiline /><OptionalNumberField label="Program Cost" value={value.program_cost} onChange={(next) => set("program_cost", next)} min={0} /><OptionalNumberField label="Duration (months)" value={value.duration_months} onChange={(next) => set("duration_months", next)} min={1} step={1} /><OptionalTextField label="Evaluation Trigger" value={value.evaluation_trigger} onChange={(next) => set("evaluation_trigger", next)} multiline /><OptionalTextField label="Program Cost Period" value={value.program_cost_period} onChange={(next) => set("program_cost_period", next)} />{booleanField("no_phase0", "No Phase 0")}{booleanField("phase0_only", "Phase 0 Only")}{booleanField("no_phased", "No Phased Implementation")}</div></details>
+    <details open><summary>{section.policy}</summary><div className="form-grid two-column"><OptionalTextField label="Instrument" value={value.instrument} onChange={(next) => set("instrument", next)} /><OptionalTextField label="Targeting" value={value.targeting} onChange={(next) => set("targeting", next)} multiline /><OptionalNumberField label="Program Cost" value={value.program_cost} onChange={(next) => set("program_cost", next)} min={0} /><OptionalNumberField label="Duration (months)" value={value.duration_months} onChange={(next) => set("duration_months", next)} min={1} step={1} /><OptionalTextField label="Evaluation Trigger" value={value.evaluation_trigger} onChange={(next) => set("evaluation_trigger", next)} multiline /><OptionalTextField label="Program Cost Period" value={value.program_cost_period} onChange={(next) => set("program_cost_period", next)} />{booleanField("skip_llm_formulation", section.direct, section.directHelp)}{booleanField("formulation_dry_run_only", section.dryRun, section.dryRunHelp)}{booleanField("single_year_deployment", section.singleYear, section.singleYearHelp)}</div></details>
     <details><summary>{section.proposals}</summary><div className="form-grid two-column"><OptionalNumberField label="Proposed Reallocation" value={value.proposed_reallocation} onChange={(next) => set("proposed_reallocation", next)} min={0} />{booleanField("reallocation_from_education", "Reallocation From Education") }<OptionalNumberField label="Proposed Additional Revenue" value={value.proposed_additional_revenue} onChange={(next) => set("proposed_additional_revenue", next)} min={0} /><OptionalTextField label="Revenue Measure Type" value={value.revenue_measure_type} onChange={(next) => set("revenue_measure_type", next)} /><OptionalNumberField label="Proposed Debt Financing" value={value.proposed_debt_financing} onChange={(next) => set("proposed_debt_financing", next)} min={0} /><OptionalTextField label="Debt Financing Mode" value={value.debt_financing_mode} onChange={(next) => set("debt_financing_mode", next)} /><OptionalNumberField label="Proposed SAL Use" value={value.proposed_sal_use} onChange={(next) => set("proposed_sal_use", next)} min={0} /><OptionalTextField label="SAL Purpose" value={value.sal_purpose} onChange={(next) => set("sal_purpose", next)} multiline /><OptionalNumberField label="Proposed Other Financing" value={value.proposed_other_financing} onChange={(next) => set("proposed_other_financing", next)} min={0} /></div></details>
-    <details><summary>{section.evidence}</summary><div className="form-grid two-column">{booleanField("appropriation_available", "Appropriation Available")}<OptionalNumberField label="Verified Reallocation Capacity" value={value.verified_reallocation_capacity} onChange={(next) => set("verified_reallocation_capacity", next)} min={0} /><OptionalNumberField label="Verified Revenue Offset Capacity" value={value.verified_revenue_offset_capacity} onChange={(next) => set("verified_revenue_offset_capacity", next)} min={0} /><OptionalNumberField label="Verified Debt Financing Headroom" value={value.verified_debt_financing_headroom} onChange={(next) => set("verified_debt_financing_headroom", next)} min={0} /><OptionalNumberField label="Verified SAL Available" value={value.verified_sal_available} onChange={(next) => set("verified_sal_available", next)} min={0} /><OptionalNumberField label="Verified Operational Cash Minimum" value={value.verified_operational_cash_minimum} onChange={(next) => set("verified_operational_cash_minimum", next)} min={0} /><OptionalNumberField label="Verified Projected Cash After Policy" value={value.verified_projected_cash_after_policy} onChange={(next) => set("verified_projected_cash_after_policy", next)} min={0} /><OptionalNumberField label="Verified Cumulative Borrowing (% GDP)" value={value.verified_cumulative_borrowing_pct_gdp} onChange={(next) => set("verified_cumulative_borrowing_pct_gdp", next)} min={0} />{booleanField("spending_reallocation_authorized", "Spending Reallocation Authorized")}{booleanField("dpr_spending_adjustment_recommendation", "DPR Spending Adjustment Recommendation")}{booleanField("finance_minister_sal_authorized", "Finance Minister SAL Authorization")}{booleanField("dpr_sal_approval_obtained", "DPR SAL Approval")}{booleanField("dpr_additional_sbn_approval_obtained", "DPR Additional SBN Approval")}{booleanField("tax_measure_has_enacted_law", "Tax Measure Has Enacted Law")}{booleanField("pnbp_measure_has_valid_tariff_instrument", "PNBP Measure Has Valid Tariff")}{booleanField("output_outcome_documented", "Output/Outcome Documented")}{booleanField("domestic_product_compliance_documented", "Domestic Product Compliance Documented")}</div></details>
-    <details><summary>{section.macro}</summary><div className="form-grid two-column"><OptionalNumberField label="Growth Outlook (%)" value={value.growth_outlook} onChange={(next) => set("growth_outlook", next)} /><OptionalNumberField label="Inflation Outlook (%)" value={value.inflation_outlook} onChange={(next) => set("inflation_outlook", next)} /><OptionalNumberField label="FX Outlook" value={value.fx_outlook} onChange={(next) => set("fx_outlook", next)} min={0} /><OptionalNumberField label="SBN 10Y Yield Outlook (%)" value={value.sbn10y_yield_outlook} onChange={(next) => set("sbn10y_yield_outlook", next)} min={0} /><OptionalNumberField label="ICP Outlook" value={value.icp_outlook} onChange={(next) => set("icp_outlook", next)} min={0} /><OptionalNumberField label="Oil Lifting Outlook" value={value.oil_lifting_outlook} onChange={(next) => set("oil_lifting_outlook", next)} min={0} /><OptionalNumberField label="Gas Lifting Outlook" value={value.gas_lifting_outlook} onChange={(next) => set("gas_lifting_outlook", next)} min={0} /><OptionalNumberField label="Tax Revenue Forecast" value={value.tax_revenue_forecast} onChange={(next) => set("tax_revenue_forecast", next)} min={0} /></div></details>
+    <details><summary>{section.evidence}</summary><div className="form-grid two-column">{booleanField("appropriation_available", "Appropriation Available")}<OptionalNumberField label="Verified Reallocation Capacity" value={value.verified_reallocation_capacity} onChange={(next) => set("verified_reallocation_capacity", next)} min={0} /><OptionalNumberField label="Verified Revenue Offset Capacity" value={value.verified_revenue_offset_capacity} onChange={(next) => set("verified_revenue_offset_capacity", next)} min={0} /><OptionalNumberField label="Verified Debt Financing Headroom" value={value.verified_debt_financing_headroom} onChange={(next) => set("verified_debt_financing_headroom", next)} min={0} /><OptionalNumberField label="Verified SAL Available" value={value.verified_sal_available} onChange={(next) => set("verified_sal_available", next)} min={0} /><OptionalNumberField label="Verified Operational Cash Minimum" value={value.verified_operational_cash_minimum} onChange={(next) => set("verified_operational_cash_minimum", next)} min={0} /><OptionalNumberField label="Verified Projected Cash After Policy" value={value.verified_projected_cash_after_policy} onChange={(next) => set("verified_projected_cash_after_policy", next)} min={0} /><OptionalNumberField label="Verified Cumulative Borrowing (% GDP)" value={value.verified_cumulative_borrowing_pct_gdp} onChange={(next) => set("verified_cumulative_borrowing_pct_gdp", next)} min={0} />{booleanField("spending_reallocation_authorized", "Spending Reallocation Authorized")}{booleanField("dpr_spending_adjustment_recommendation", "DPR Spending Adjustment Recommendation")}{booleanField("finance_minister_sal_authorized", "Finance Minister SAL Authorization")}{booleanField("dpr_sal_approval_obtained", "DPR SAL Approval")}{booleanField("dpr_additional_sbn_approval_obtained", "DPR Additional SBN Approval")}{booleanField("tax_measure_has_enacted_law", "Tax Measure Has Enacted Law")}{booleanField("pnbp_measure_has_valid_tariff_instrument", "PNBP Measure Has Valid Tariff Instrument")}{booleanField("output_outcome_documented", "Output / Outcome Documented")}{booleanField("domestic_product_compliance_documented", "Domestic Product Compliance Documented")}</div></details>
+    <details><summary>{section.macro}</summary><div className="form-grid two-column"><OptionalNumberField label="Growth Outlook (%)" value={value.growth_outlook} onChange={(next) => set("growth_outlook", next)} /><OptionalNumberField label="Inflation Outlook (%)" value={value.inflation_outlook} onChange={(next) => set("inflation_outlook", next)} /><OptionalNumberField label="FX Outlook" value={value.fx_outlook} onChange={(next) => set("fx_outlook", next)} min={0.01} /><OptionalNumberField label="SBN 10Y Yield Outlook (%)" value={value.sbn10y_yield_outlook} onChange={(next) => set("sbn10y_yield_outlook", next)} min={0} /><OptionalNumberField label="ICP Outlook" value={value.icp_outlook} onChange={(next) => set("icp_outlook", next)} min={0} /><OptionalNumberField label="Oil Lifting Outlook" value={value.oil_lifting_outlook} onChange={(next) => set("oil_lifting_outlook", next)} min={0} /><OptionalNumberField label="Gas Lifting Outlook" value={value.gas_lifting_outlook} onChange={(next) => set("gas_lifting_outlook", next)} min={0} /><OptionalNumberField label="Tax Revenue Forecast" value={value.tax_revenue_forecast} onChange={(next) => set("tax_revenue_forecast", next)} min={0} /></div></details>
   </div>;
 }
 
@@ -802,6 +821,7 @@ export default function Home() {
       theta_h: template.theta_h,
       theta_s: template.theta_s,
       theta_u: template.theta_u,
+      rar_dai_weight_mode: "auto",
     });
   }
 
@@ -818,10 +838,11 @@ export default function Home() {
     setBusy(true);
     try {
       const configs = Object.fromEntries(Object.entries(templateConfigs).map(([key, value]) => [key, { ...value, llm_base_url: value.llm_base_url || null, llm_api_key: value.llm_api_key || null, llm_model: value.llm_model || null }]));
-      const response = await apiFetch(`${apiUrl}/api/scenarios/${selectedScenario}/load-templates`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ configs }) });
+      const response = await apiFetch(`${apiUrl}/api/scenarios/${selectedScenario}/orchestrate-agents`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ configs }) });
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.detail ?? t("error.templatesLoad"));
-      setAgents(payload.agents as Agent[]);
+      const refreshedAgents = await loadAgents(selectedScenario);
+      setAgents(refreshedAgents);
       setDomainRules(null);
       setMandateReadyScenarioId(null);
       closeTemplateModal();
@@ -890,7 +911,7 @@ export default function Home() {
   function editAgent(item: Agent) {
     setEditingAgentId(item.id);
     setSelectedTemplate(item.template_key ?? "");
-    setAgent({ name: item.name, role: item.role, theta_x: item.theta_x, theta_q: item.theta_q, theta_h: item.theta_h, theta_s: item.theta_s, theta_u: item.theta_u, llm_base_url: item.llm_base_url ?? "", llm_api_key: "", llm_model: item.llm_model ?? "", temperature: item.temperature, max_tokens: item.max_tokens });
+    setAgent({ name: item.name, role: item.role, theta_x: item.theta_x, theta_q: item.theta_q, theta_h: item.theta_h, theta_s: item.theta_s, theta_u: item.theta_u, rar_dai_weight_mode: item.rar_dai_weight_mode, llm_base_url: item.llm_base_url ?? "", llm_api_key: "", llm_model: item.llm_model ?? "", temperature: item.temperature, max_tokens: item.max_tokens });
     selectTab(0);
     window.requestAnimationFrame(() => document.getElementById("wizard-panel-0")?.scrollIntoView({ behavior: "smooth" }));
   }
@@ -950,13 +971,9 @@ export default function Home() {
       const freshRules: DomainRules = { ...payload, scenario_id: scenarioId, generated: true, stale: false };
       setDomainRules(freshRules);
       setMandateReadyScenarioId(scenarioId);
-      try {
-        await refreshMandateData(scenarioId);
-      } catch (refreshError) {
+      refreshMandateData(scenarioId).catch((refreshError) => {
         setNotice(refreshError instanceof Error ? refreshError.message : t("error.refreshDelayed"));
-      }
-      setDomainRules(freshRules);
-      setMandateReadyScenarioId(scenarioId);
+      });
       setMandateLogs((current) => [...current, { stage: "MANDATE", level: payload.status === "partial" ? "WARNING" : "SUCCESS", message: payload.detail ?? t("notice.mandateGenerated", { count: formatNumber(payload.generated_count ?? 0) }) }]);
       setNotice(payload.detail ?? t("notice.mandateReady"));
     } catch (error) {
@@ -1007,7 +1024,14 @@ export default function Home() {
     setBusy(true);
     setScenarioBusy(true);
     try {
-      const scenarioPayload = { ...scenario };
+      const scenarioPayload: Partial<ScenarioForm> = editingScenarioId !== null
+        ? Object.fromEntries(
+            (Object.entries(scenario) as [keyof ScenarioForm, ScenarioForm[keyof ScenarioForm]][]).filter(([field, next]) => {
+              const current = scenarios.find((item) => item.id === editingScenarioId);
+              return current ? current[field as keyof Scenario] !== next : true;
+            }),
+          )
+        : { ...scenario };
       const endpoint = editingScenarioId !== null ? `${apiUrl}/api/scenarios/${editingScenarioId}` : `${apiUrl}/api/scenarios`;
       const response = await apiFetch(endpoint, {
         method: editingScenarioId !== null ? "PATCH" : "POST",
@@ -1241,12 +1265,14 @@ export default function Home() {
 
         <fieldset className="form-card">
           <legend><span>04</span> {t("setup.weights")}</legend>
-          <div className="theta-form-grid">
-            <NumericField label={t("theta.expertise")} value={agent.theta_x} hint={t("theta.expertiseHint")} onChange={(value) => setAgent({ ...agent, theta_x: value })} />
-            <NumericField label={t("theta.evidence")} value={agent.theta_q} hint={t("theta.evidenceHint")} onChange={(value) => setAgent({ ...agent, theta_q: value })} />
-            <NumericField label={t("theta.history")} value={agent.theta_h} hint={t("theta.historyHint")} onChange={(value) => setAgent({ ...agent, theta_h: value })} />
-            <NumericField label={t("theta.relevance")} value={agent.theta_s} hint={t("theta.relevanceHint")} onChange={(value) => setAgent({ ...agent, theta_s: value })} />
-            <NumericField label={t("theta.uncertainty")} value={agent.theta_u} hint={t("theta.uncertaintyHint")} onChange={(value) => setAgent({ ...agent, theta_u: value })} />
+          <label className="form-field weight-mode-field"><strong>{t("weights.mode")}</strong><select value={agent.rar_dai_weight_mode} onChange={(event) => setAgent({ ...agent, rar_dai_weight_mode: event.target.value as "auto" | "manual" })}><option value="auto">{t("weights.auto")}</option><option value="manual">{t("weights.manual")}</option></select><small>{t("weights.modeHint")}</small></label>
+          {agent.rar_dai_weight_mode === "manual" && <h3 className="manual-weight-title">{t("weights.manual")}</h3>}
+          <div className={`theta-form-grid ${agent.rar_dai_weight_mode === "auto" ? "auto-weight-grid" : ""}`}>
+            <NumericField label={t("theta.expertise")} value={agent.theta_x} hint={t("theta.expertiseHint")} disabled={agent.rar_dai_weight_mode === "auto"} onChange={(value) => setAgent({ ...agent, theta_x: value })} />
+            <NumericField label={t("theta.evidence")} value={agent.theta_q} hint={t("theta.evidenceHint")} disabled={agent.rar_dai_weight_mode === "auto"} onChange={(value) => setAgent({ ...agent, theta_q: value })} />
+            <NumericField label={t("theta.history")} value={agent.theta_h} hint={t("theta.historyHint")} disabled={agent.rar_dai_weight_mode === "auto"} onChange={(value) => setAgent({ ...agent, theta_h: value })} />
+            <NumericField label={t("theta.relevance")} value={agent.theta_s} hint={t("theta.relevanceHint")} disabled={agent.rar_dai_weight_mode === "auto"} onChange={(value) => setAgent({ ...agent, theta_s: value })} />
+            <NumericField label={t("theta.uncertainty")} value={agent.theta_u} hint={t("theta.uncertaintyHint")} disabled={agent.rar_dai_weight_mode === "auto"} onChange={(value) => setAgent({ ...agent, theta_u: value })} />
           </div>
         </fieldset>
         <button className="primary-button agent-submit" disabled={busy} type="submit">{editingAgentId ? t("setup.saveChanges") : t("setup.saveAgent")}<span>↗</span></button>

@@ -15,6 +15,7 @@ from backend.agent_templates import (
     STANDARD_APBN_AGENT_TEMPLATES,
     agent_revision,
     ensure_phase_one_specialists,
+    orchestrated_scenario_agent_plan,
 )
 from backend.dashboard import _disagreement_payload, _polling_contract
 from backend.database import SessionLocal
@@ -121,6 +122,31 @@ def test_generated_agent_name_is_normalized(client: TestClient) -> None:
                 )
             )
         ) == 1
+
+
+def test_agent_manual_rar_dai_mode_round_trips(client: TestClient) -> None:
+    name = f"manual-rar-dai-{uuid.uuid4()}"
+    response = client.post(
+        "/api/agents",
+        json={
+            "name": name,
+            "role": "Manual Weight Reviewer",
+            "rar_dai_weight_mode": "manual",
+            "theta_x": 1.4,
+            "theta_q": 1.3,
+            "theta_h": 0.9,
+            "theta_s": 1.2,
+            "theta_u": 1.7,
+        },
+    )
+    assert response.status_code == 201
+    assert response.json()["rar_dai_weight_mode"] == "manual"
+    updated = client.put(
+        f"/api/agents/{response.json()['id']}",
+        json={"rar_dai_weight_mode": "auto"},
+    )
+    assert updated.status_code == 200
+    assert updated.json()["rar_dai_weight_mode"] == "auto"
 
 
 def test_agent_theta_u_zero_persists(client: TestClient) -> None:
@@ -403,8 +429,8 @@ def test_scenario_specialist_rules_are_aggregated_and_not_globally_listed(
     assert specialist_id not in {item["id"] for item in listed.json()}
     assert rules.status_code == 200
     payload = rules.json()
-    assert payload["agent_count"] == 1
-    assert payload["agent_rules"][0]["agent_id"] == specialist_id
+    assert payload["agent_count"] == len(participants)
+    assert specialist_id in {item["agent_id"] for item in payload["agent_rules"]}
     assert "VERIFIED_OFFSETS_ONLY" in payload["rules"]["owned_checks"]
 
 
@@ -1243,6 +1269,8 @@ def test_scenario_persists_granular_simulation_payload(client: TestClient) -> No
             "tax_measure_has_enacted_law": False,
             "growth_outlook": 5.2,
             "inflation_outlook": 2.7,
+            "skip_llm_formulation": True,
+            "single_year_deployment": True,
         },
     )
     assert response.status_code == 201
@@ -1252,6 +1280,10 @@ def test_scenario_persists_granular_simulation_payload(client: TestClient) -> No
     assert response.json()["duration_months"] == 6
     assert response.json()["appropriation_available"] is True
     assert response.json()["growth_outlook"] == pytest.approx(5.2)
+    assert response.json()["skip_llm_formulation"] is True
+    assert response.json()["formulation_dry_run_only"] is None
+    assert response.json()["single_year_deployment"] is True
+    assert "no_phase0" not in response.json()
     with SessionLocal() as session:
         saved = session.get(Scenario, scenario_id)
         assert saved is not None
@@ -1260,6 +1292,41 @@ def test_scenario_persists_granular_simulation_payload(client: TestClient) -> No
         assert saved.tax_measure_has_enacted_law is False
         session.delete(saved)
         session.commit()
+
+
+def test_scenario_rejects_contradictory_formulation_modes(client: TestClient) -> None:
+    response = client.post(
+        "/api/scenarios",
+        json={
+            "description": "Conflicting formulation modes",
+            "skip_llm_formulation": True,
+            "formulation_dry_run_only": True,
+        },
+    )
+    assert response.status_code == 422
+
+
+def test_scenario_rejects_legacy_phase_fields(client: TestClient) -> None:
+    response = client.post(
+        "/api/scenarios",
+        json={"description": "Legacy field", "no_phase0": True},
+    )
+    assert response.status_code == 422
+
+
+def test_scenario_patch_rejects_contradictory_formulation_modes(
+    client: TestClient,
+) -> None:
+    created = client.post(
+        "/api/scenarios",
+        json={"description": "Patch conflicting formulation modes", "skip_llm_formulation": True},
+    )
+    scenario_id = created.json()["id"]
+    patched = client.patch(
+        f"/api/scenarios/{scenario_id}",
+        json={"formulation_dry_run_only": True},
+    )
+    assert patched.status_code == 422
 
 
 def test_agent_rejects_negative_theta(client: TestClient) -> None:
@@ -1488,11 +1555,36 @@ def test_force_delete_mocked_scenario_cascades_running_run_and_artifacts(
             ) is None
 
 
-def test_scenario_template_loading_replaces_agents_with_exact_standard_set(
+def test_orchestrated_plan_selects_all_five_relevant_domains() -> None:
+    scenario = Scenario(
+        description=(
+            "Tax revenue, public expenditure, debt financing, treasury liquidity, "
+            "and inflation growth outlook"
+        ),
+        proposed_additional_revenue=10.0,
+        program_cost=25.0,
+        proposed_debt_financing=5.0,
+        proposed_sal_use=2.0,
+        inflation_outlook=2.5,
+    )
+
+    selected, plan = orchestrated_scenario_agent_plan(scenario)
+
+    assert len(selected) == 5
+    assert set(selected) == {"revenue", "expenditure", "financing", "treasury", "macro"}
+    assert set(plan["weights"]) == set(selected)
+
+
+def test_scenario_orchestration_replaces_agents_with_three_to_five_specialists(
     client: TestClient,
 ) -> None:
     with SessionLocal() as session:
-        scenario = Scenario(description="Scoped template replacement")
+        scenario = Scenario(
+            description="Evaluate tax revenue, inflation, and debt financing",
+            verified_revenue_offset_capacity=12.0,
+            verified_debt_financing_headroom=10.0,
+            inflation_outlook=2.5,
+        )
         session.add(scenario)
         session.flush()
         old_agents = [
@@ -1508,27 +1600,25 @@ def test_scenario_template_loading_replaces_agents_with_exact_standard_set(
         scenario_id = scenario.id
         old_ids = {agent.id for agent in old_agents}
 
-    first = client.post(f"/api/scenarios/{scenario_id}/load-templates")
+    first = client.post(f"/api/scenarios/{scenario_id}/orchestrate-agents")
 
     assert first.status_code == 200
     first_payload = first.json()
-    assert first_payload["created"] == 5
-    assert first_payload["total"] == 5
-    assert first_payload["scenario_id"] == scenario_id
     first_agents = first_payload["agents"]
-    assert len(first_agents) == 5
-    assert {item["template_key"] for item in first_agents} == {
-        template.key for template in STANDARD_APBN_AGENT_TEMPLATES
-    }
-    assert {item["name"] for item in first_agents} == {
-        template.name for template in STANDARD_APBN_AGENT_TEMPLATES
-    }
+    assert 3 <= len(first_agents) <= 5
+    assert first_payload["created"] == len(first_agents)
+    assert first_payload["total"] == len(first_agents)
+    assert first_payload["scenario_id"] == scenario_id
     assert {item["scenario_id"] for item in first_agents} == {scenario_id}
+    assert all(item["rar_dai_weight_mode"] == "auto" for item in first_agents)
+    assert {item["specialist_domain"] for item in first_agents} == set(
+        first_payload["orchestration"]["selected_domains"]
+    )
     first_ids = {item["id"] for item in first_agents}
     assert old_ids.isdisjoint(first_ids)
 
     second = client.post(
-        f"/scenarios/{scenario_id}/load-templates",
+        f"/scenarios/{scenario_id}/orchestrate-agents",
         json={
             "configs": {
                 "revenue": {
@@ -1541,16 +1631,16 @@ def test_scenario_template_loading_replaces_agents_with_exact_standard_set(
     )
 
     assert second.status_code == 200
-    second_agents = second.json()["agents"]
-    assert len(second_agents) == 5
+    second_payload = second.json()
+    second_agents = second_payload["agents"]
+    assert 3 <= len(second_agents) <= 5
     second_ids = {item["id"] for item in second_agents}
     assert first_ids.isdisjoint(second_ids)
-    revenue = next(
-        item for item in second_agents if item["template_key"] == "revenue"
-    )
-    assert revenue["llm_model"] == "scenario-revenue-model"
-    assert revenue["temperature"] == pytest.approx(0.15)
-    assert revenue["max_tokens"] == 2500
+    if "revenue" in second_payload["orchestration"]["selected_domains"]:
+        revenue = next(item for item in second_agents if item["specialist_domain"] == "revenue")
+        assert revenue["llm_model"] == "scenario-revenue-model"
+        assert revenue["temperature"] == pytest.approx(0.15)
+        assert revenue["max_tokens"] == 2500
 
     scoped = client.get(f"/api/agents?scenario_id={scenario_id}")
     assert scoped.status_code == 200
@@ -1566,52 +1656,45 @@ def test_scenario_template_loading_replaces_agents_with_exact_standard_set(
             )
         ) == []
         persisted = list(
-            session.scalars(
-                select(Agent).where(Agent.scenario_id == scenario_id)
-            )
+            session.scalars(select(Agent).where(Agent.scenario_id == scenario_id))
         )
-        assert len(persisted) == 5
-        assert {agent.specialist_domain for agent in persisted} == {
-            template.key for template in STANDARD_APBN_AGENT_TEMPLATES
-        }
+        assert len(persisted) == len(second_agents)
+        assert {agent.specialist_domain for agent in persisted} == set(
+            second_payload["orchestration"]["selected_domains"]
+        )
 
 
-def test_scenario_template_sets_are_isolated_and_reloading_one_preserves_other(
+def test_scenario_orchestration_sets_are_isolated_and_reload_replaces_only_target(
     client: TestClient,
 ) -> None:
     first_scenario = client.post(
-        "/api/scenarios", json={"description": "Template scope A"}
+        "/api/scenarios", json={"description": "Tax revenue and inflation"}
     ).json()
     second_scenario = client.post(
-        "/api/scenarios", json={"description": "Template scope B"}
+        "/api/scenarios", json={"description": "Debt financing and liquidity"}
     ).json()
 
     first_load = client.post(
-        f"/api/scenarios/{first_scenario['id']}/load-templates"
+        f"/api/scenarios/{first_scenario['id']}/orchestrate-agents"
     )
     second_load = client.post(
-        f"/api/scenarios/{second_scenario['id']}/load-templates"
+        f"/api/scenarios/{second_scenario['id']}/orchestrate-agents"
     )
 
     assert first_load.status_code == 200
     assert second_load.status_code == 200
     first_agents = first_load.json()["agents"]
     second_agents = second_load.json()["agents"]
-    assert {item["name"] for item in first_agents} == {
-        item["name"] for item in second_agents
-    }
     first_ids = {item["id"] for item in first_agents}
     second_ids = {item["id"] for item in second_agents}
+    assert 3 <= len(first_agents) <= 5
+    assert 3 <= len(second_agents) <= 5
     assert first_ids.isdisjoint(second_ids)
-    assert {item["scenario_id"] for item in first_agents} == {
-        first_scenario["id"]
-    }
-    assert {item["scenario_id"] for item in second_agents} == {
-        second_scenario["id"]
-    }
+    assert {item["scenario_id"] for item in first_agents} == {first_scenario["id"]}
+    assert {item["scenario_id"] for item in second_agents} == {second_scenario["id"]}
 
     reloaded = client.post(
-        f"/api/scenarios/{first_scenario['id']}/load-templates"
+        f"/api/scenarios/{first_scenario['id']}/orchestrate-agents"
     )
     assert reloaded.status_code == 200
     reloaded_ids = {item["id"] for item in reloaded.json()["agents"]}
