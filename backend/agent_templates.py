@@ -4,7 +4,7 @@ import re
 from dataclasses import asdict, dataclass
 from typing import Any
 
-from sqlalchemy import delete, or_, select
+from sqlalchemy import delete, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
@@ -336,10 +336,12 @@ MASTER_ORCHESTRATOR_TEMPLATE_KEY = "master_orchestrator"
 MASTER_ORCHESTRATOR_NAME = "Master_Orchestrator"
 MASTER_ORCHESTRATOR_ROLE = "Non-voting SHCR orchestration controller"
 MASTER_ORCHESTRATOR_MANDATE = (
-    "Coordinate phase ordering, detect uncovered scenario domains, reuse existing "
-    "specialists, and create a missing specialist only when deterministic Phase 1 "
-    "coverage analysis identifies a domain gap. The orchestrator never votes, "
-    "receives RAR-DAI weight, or participates in DDR."
+    "Read the active scenario goal and context, rank the supported fiscal domains, and return "
+    "exactly four unique specialist domains from revenue, expenditure, financing, treasury, and "
+    "macro. The normal specialist roster is State Revenue, Government Expenditure, Budget "
+    "Financing, and Macro-Fiscal Stabilization, with treasury substituted only when scenario "
+    "alignment warrants it. Coordinate only; never vote, receive RAR-DAI weight, or participate "
+    "in DDR."
 )
 def _domain_patterns(*terms: str) -> tuple[re.Pattern[str], ...]:
     return tuple(
@@ -707,39 +709,43 @@ def scenario_deliberative_agents(
     return [*global_agents, *scoped_agents]
 
 
-def get_or_create_master_orchestrator(session: Session) -> tuple[Agent, bool]:
+def get_or_create_master_orchestrator(
+    session: Session,
+    scenario_id: int,
+    config: dict[str, Any] | None = None,
+) -> tuple[Agent, bool]:
     orchestrator = session.scalar(
         select(Agent).where(
-            or_(
-                Agent.is_orchestrator.is_(True),
-                Agent.template_key == MASTER_ORCHESTRATOR_TEMPLATE_KEY,
-            )
+            Agent.is_orchestrator.is_(True),
+            Agent.scenario_id == scenario_id,
         )
     )
     if orchestrator is not None:
-        orchestrator.is_orchestrator = True
-        if orchestrator.template_key is None:
-            orchestrator.template_key = MASTER_ORCHESTRATOR_TEMPLATE_KEY
+        if config:
+            for field, value in config.items():
+                if value not in (None, ""):
+                    setattr(orchestrator, field, value)
         session.flush()
         return orchestrator, False
-    global_config = get_global_llm_config(session)
-    values = apply_global_values(
-        {
-            "template_key": MASTER_ORCHESTRATOR_TEMPLATE_KEY,
-            "name": MASTER_ORCHESTRATOR_NAME,
-            "role": MASTER_ORCHESTRATOR_ROLE,
-            "system_prompt": MASTER_ORCHESTRATOR_MANDATE,
-            "temperature": 0.0,
-            "max_tokens": 1000,
-            "theta_x": 0.0,
-            "theta_q": 0.0,
-            "theta_h": 0.0,
-            "theta_s": 0.0,
-            "theta_u": 0.0,
-            "is_orchestrator": True,
-        },
-        global_config,
-    )
+    values: dict[str, Any] = {
+        "template_key": MASTER_ORCHESTRATOR_TEMPLATE_KEY,
+        "name": MASTER_ORCHESTRATOR_NAME,
+        "role": MASTER_ORCHESTRATOR_ROLE,
+        "system_prompt": MASTER_ORCHESTRATOR_MANDATE,
+        "scenario_id": scenario_id,
+        "temperature": 0.2,
+        "max_tokens": 4000,
+        "theta_x": 0.0,
+        "theta_q": 0.0,
+        "theta_h": 0.0,
+        "theta_s": 0.0,
+        "theta_u": 0.0,
+        "is_orchestrator": True,
+    }
+    if config:
+        values.update({key: value for key, value in config.items() if value not in (None, "")})
+    else:
+        values = apply_global_values(values, get_global_llm_config(session))
     inserted_id = session.scalar(
         insert(Agent)
         .values(**values)
@@ -748,10 +754,18 @@ def get_or_create_master_orchestrator(session: Session) -> tuple[Agent, bool]:
     )
     session.flush()
     orchestrator = session.scalar(
-        select(Agent).where(Agent.is_orchestrator.is_(True))
+        select(Agent).where(
+            Agent.is_orchestrator.is_(True),
+            Agent.scenario_id == scenario_id,
+        )
     )
     if orchestrator is None:
-        raise ValueError("Master_Orchestrator identity conflicts with an existing agent")
+        raise ValueError("Could not provision scenario Master_Orchestrator")
+    if inserted_id is None and config:
+        for field, value in config.items():
+            if value not in (None, ""):
+                setattr(orchestrator, field, value)
+        session.flush()
     return orchestrator, inserted_id is not None
 
 
@@ -810,8 +824,7 @@ def orchestrated_scenario_agent_plan(
             "orchestration_score": score,
         }
     ordered = sorted(domain_scores, key=lambda key: (-domain_scores[key], key))
-    selected_count = min(5, max(3, sum(score > 0.0 for score in domain_scores.values())))
-    selected_domains = ordered[:selected_count]
+    selected_domains = ordered[:4]
     weights = {
         domain: calculate_orchestrator_rar_dai_weights(
             metrics[domain]["domain_alignment"],
@@ -826,7 +839,9 @@ def ensure_phase_one_specialists(
     session: Session,
     scenario: Scenario,
 ) -> tuple[list[Agent], dict[str, Any]]:
-    orchestrator, orchestrator_created = get_or_create_master_orchestrator(session)
+    orchestrator, orchestrator_created = get_or_create_master_orchestrator(
+        session, scenario.id
+    )
     scoped_agents = scenario_scoped_agents(session, scenario.id)
     global_agents = global_deliberative_agents(session)
     has_scenario_templates = any(agent.template_key is not None for agent in scoped_agents)
@@ -836,7 +851,15 @@ def ensure_phase_one_specialists(
         for agent in coverage_agents
         if agent_domain_key(agent) is not None
     }
-    selected_domains = detected_scenario_domains(scenario)
+    selected_domains = (
+        [
+            domain
+            for agent in scoped_agents
+            if (domain := agent_domain_key(agent)) is not None
+        ]
+        if has_scenario_templates
+        else detected_scenario_domains(scenario)
+    )
     _, orchestration_plan = orchestrated_scenario_agent_plan(scenario)
     created_specialists: list[Agent] = []
     reused_specialists: list[Agent] = []
@@ -920,18 +943,37 @@ def orchestrate_scenario_agents(
     session: Session,
     scenario: Scenario,
     configs: dict[str, dict[str, Any]] | None = None,
+    selected_domains: list[str] | None = None,
 ) -> tuple[list[Agent], dict[str, Any]]:
-    session.execute(delete(Agent).where(Agent.scenario_id == scenario.id))
+    session.execute(
+        delete(Agent).where(
+            Agent.scenario_id == scenario.id,
+            Agent.is_orchestrator.is_(False),
+        )
+    )
     session.flush()
-    selected_domains, orchestration_plan = orchestrated_scenario_agent_plan(scenario)
+    planned_domains, orchestration_plan = orchestrated_scenario_agent_plan(scenario)
+    domains = selected_domains or planned_domains
+    if len(domains) != 4 or len(set(domains)) != 4:
+        raise ValueError("Orchestration requires exactly four unique domains")
+    unknown_domains = set(domains) - set(_AGENT_SPECS_BY_KEY)
+    if unknown_domains:
+        raise ValueError(f"Unknown orchestration domains: {sorted(unknown_domains)}")
+    weights = {
+        domain: calculate_orchestrator_rar_dai_weights(
+            orchestration_plan["metrics"][domain]["domain_alignment"],
+            orchestration_plan["metrics"][domain]["verified_evidence_completeness"],
+        )
+        for domain in domains
+    }
     configurations = configs or {}
     global_config = get_global_llm_config(session)
     agents: list[Agent] = []
-    for domain in selected_domains:
+    for domain in domains:
         template = _AGENT_SPECS_BY_KEY[domain]
         values = {
             **apply_global_values(template.as_agent_values(), global_config),
-            **orchestration_plan["weights"][domain],
+            **weights[domain],
             "rar_dai_weight_mode": "auto",
             "scenario_id": scenario.id,
             "specialist_domain": domain,
@@ -943,10 +985,12 @@ def orchestrate_scenario_agents(
         session.add(agent)
         agents.append(agent)
     session.flush()
+    if len(agents) != 4 or len({agent.agent_uuid for agent in agents}) != 4:
+        raise ValueError("Orchestration failed to persist four unique agents")
     return agents, {
-        "selected_domains": selected_domains,
+        "selected_domains": domains,
         "selection_metrics": orchestration_plan["metrics"],
-        "rar_dai_weights": orchestration_plan["weights"],
+        "rar_dai_weights": weights,
         "weight_mode": "auto",
         "agent_count": len(agents),
     }

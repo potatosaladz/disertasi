@@ -6,6 +6,7 @@ import { useI18n } from "./i18n";
 
 type Agent = {
   id: number;
+  agent_uuid: string;
   name: string;
   display_name?: string;
   role: string;
@@ -162,7 +163,9 @@ type PollingState = "PENDING" | "PROCESSING" | "TEMPORARY_HYDRATION_DELAY" | "SU
 type RunState = { task_id: string | null; session_id: string; scenario_id: number; status: "QUEUED" | "RUNNING" | "SUCCEEDED" | "FAILED"; polling_state?: PollingState; should_poll?: boolean; terminal?: boolean; logs: RunLog[]; simulation_artifacts?: SimulationArtifact[]; agent_breakdown?: AgentBreakdown[]; collective_reasoning?: CollectiveReasoning | null; disagreements?: Disagreement[]; progress_stage?: string | null; result?: { task?: Record<string, unknown>; result?: Record<string, unknown>; why?: Record<string, unknown>; car?: { hard_stop?: { triggered?: boolean; reason?: string; simulation_bypassed?: boolean; llm_compromise_bypassed?: boolean }; rejected_alternatives?: RejectedAlternative[]; hard_constraints?: HardConstraint[] } } | null; error?: string | null; created_at?: string | null; started_at?: string | null; completed_at?: string | null };
 type AgentDomainRules = { agent_id: number; name: string; display_name?: string; role: string; template_key: string | null; mandate: string | null; primary_sources: string[]; constraints: string[]; owned_checks: string[]; synthesis_status: "generated" | "fallback"; scenario_mandate: string | null; scenario_focus: string[]; priority_questions: string[]; required_evidence: string[]; epistemic_logic_traceability: string[]; structured_consensus_protocol: string[]; regulatory_compliance_alignment: string[]; utility_metadata?: { task?: string; result?: string; why?: string; name_source?: string }; llm_model: string | null; token_usage: number | null; error: { code: string; message: string } | null };
 type DomainRules = { scenario_id: number; revision: string; generated: boolean; stale: boolean; agent_count: number; rules: { hard_constraints?: string[]; owned_checks?: string[]; principles?: string[]; primary_sources?: string[]; automatic_deficit_ceiling?: number }; agent_rules: AgentDomainRules[]; status: "success" | "partial" | "failed" | "stale" | "missing"; generated_count: number; failure_count: number; detail: string | null };
-type AgentForm = Omit<Agent, "id" | "display_name" | "has_llm_api_key" | "template_key" | "system_prompt"> & { llm_api_key: string };
+type AgentForm = Omit<Agent, "id" | "agent_uuid" | "display_name" | "has_llm_api_key" | "template_key" | "system_prompt"> & { llm_api_key: string };
+type OrchestratorConfigForm = { api_base_url: string; api_key: string; model_name: string; temperature: number; max_tokens: number };
+type LatestRunState = "idle" | "loading" | "empty" | "available" | "error";
 type ScenarioForm = Omit<Scenario, "id">;
 type UtilityMetadata = { task?: string; result?: string; why?: string; name_source?: string };
 type HardConstraint = { code?: string; formula?: string; status?: string; reason?: string; ceiling_percent_gdp?: number; requested_ceiling_percent_gdp?: number; source_tags?: string[]; calculation_status?: string };
@@ -171,6 +174,7 @@ type GlobalConfig = { llm_base_url: string | null; llm_model: string | null; tem
 type GlobalConfigForm = { llm_base_url: string; llm_api_key: string; llm_model: string; temperature: number; max_tokens: number; apply_to_all: boolean };
 
 const initialGlobalConfig: GlobalConfigForm = { llm_base_url: "", llm_api_key: "", llm_model: "", temperature: 0.2, max_tokens: 4000, apply_to_all: false };
+const initialOrchestratorConfig: OrchestratorConfigForm = { api_base_url: "", api_key: "", model_name: "", temperature: 0.2, max_tokens: 4000 };
 
 const apiUrl = "";
 const scenarioLabels: Record<"id" | "en", { edit: string; save: string; deleted: string; updated: string; deleteFailed: string; confirmDelete: (id: number) => string }> = {
@@ -529,6 +533,10 @@ export default function Home() {
   const [editingAgentId, setEditingAgentId] = useState<number | null>(null);
   const [scenarioExpanded, setScenarioExpanded] = useState(false);
   const [templateModalOpen, setTemplateModalOpen] = useState(false);
+  const [orchestratorConfig, setOrchestratorConfig] = useState<OrchestratorConfigForm>(initialOrchestratorConfig);
+  const [orchestratorHasSavedKey, setOrchestratorHasSavedKey] = useState(false);
+  const [orchestratorConfigBusy, setOrchestratorConfigBusy] = useState(false);
+  const [latestRunState, setLatestRunState] = useState<LatestRunState>("idle");
   const [templateConfigs, setTemplateConfigs] = useState<Record<string, { llm_base_url: string; llm_api_key: string; llm_model: string; temperature: number; max_tokens: number }>>({});
   const [connectionTests, setConnectionTests] = useState<Record<number, { ok: boolean; message: string; pending?: boolean }>>({});
   const [runHydrationError, setRunHydrationError] = useState<string | null>(null);
@@ -651,26 +659,50 @@ export default function Home() {
 
 
   async function loadLatestRun(id: number) {
-    const response = await apiFetch(`${apiUrl}/api/scenarios/${id}/runs/latest`, { cache: "no-store" });
-    if (response.status === 404) {
-      setRun(null);
-      setGraph(null);
-      setTrackerHistory([]);
-      await loadDashboard(id);
-      return;
+    setLatestRunState("loading");
+    try {
+      const response = await apiFetch(`${apiUrl}/api/scenarios/${id}/runs/latest`, { cache: "no-store" });
+      if (response.status === 404) {
+        setRun(null);
+        setGraph(null);
+        setTrackerHistory([]);
+        setRunHydrationError(null);
+        setLatestRunState("empty");
+        await loadDashboard(id);
+        return;
+      }
+      if (!response.ok) throw new Error(t("error.history", { status: response.status }));
+      const payload: RunState = await response.json();
+      setRun(payload);
+      setLatestRunState("available");
+      setTrackerHistory(payload.logs ?? []);
+      if (payload.task_id) trackerLogCounts.current[payload.task_id] = payload.logs?.length ?? 0;
+      if (payload.status === "FAILED") {
+        setRunHydrationError(null);
+        setNotice(payload.error ?? t("notice.failed"));
+        return;
+      }
+      await hydrateRunData(payload);
+    } catch (error) {
+      setLatestRunState("error");
+      throw error;
     }
-    if (!response.ok) throw new Error(t("error.history", { status: response.status }));
-    const payload: RunState = await response.json();
-    setRun(payload);
-    setTrackerHistory(payload.logs ?? []);
-    if (payload.task_id) trackerLogCounts.current[payload.task_id] = payload.logs?.length ?? 0;
-    if (payload.status === "FAILED") {
-      setRunHydrationError(null);
-      setNotice(payload.error ?? t("notice.failed"));
-      return;
-    }
-    await hydrateRunData(payload);
   }
+
+  async function loadOrchestratorConfig(id: number) {
+    const response = await apiFetch(`${apiUrl}/api/scenarios/${id}/orchestrator-config`, { cache: "no-store" });
+    if (!response.ok) throw new Error(t("error.orchestratorConfig"));
+    const payload = await response.json() as { api_base_url: string | null; model_name: string | null; temperature: number; max_tokens: number; has_api_key: boolean };
+    setOrchestratorConfig({
+      api_base_url: payload.api_base_url ?? "",
+      api_key: "",
+      model_name: payload.model_name ?? "",
+      temperature: payload.temperature,
+      max_tokens: payload.max_tokens,
+    });
+    setOrchestratorHasSavedKey(payload.has_api_key);
+  }
+
   async function loadDomainRules(id: number) {
     const response = await apiFetch(`${apiUrl}/api/scenarios/${id}/domain-rules`, { cache: "no-store" });
     if (!response.ok) {
@@ -701,6 +733,7 @@ export default function Home() {
         loadAgents(selectedScenario),
         loadDashboard(selectedScenario),
         loadLatestRun(selectedScenario),
+        loadOrchestratorConfig(selectedScenario),
       ]).catch(() => setNotice(t("notice.noDashboard")));
     }
   }, [selectedScenario, lang]);
@@ -835,14 +868,29 @@ export default function Home() {
       setNotice(t("notice.selectRun"));
       return;
     }
+    if (!orchestratorConfig.api_base_url || !orchestratorConfig.model_name || (!orchestratorConfig.api_key && !orchestratorHasSavedKey)) {
+      setNotice(t("error.orchestratorRequired"));
+      return;
+    }
     setBusy(true);
+    setOrchestratorConfigBusy(true);
     try {
       const configs = Object.fromEntries(Object.entries(templateConfigs).map(([key, value]) => [key, { ...value, llm_base_url: value.llm_base_url || null, llm_api_key: value.llm_api_key || null, llm_model: value.llm_model || null }]));
-      const response = await apiFetch(`${apiUrl}/api/scenarios/${selectedScenario}/orchestrate-agents`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ configs }) });
+      const requestBody = {
+        api_base_url: orchestratorConfig.api_base_url,
+        api_key: orchestratorConfig.api_key || null,
+        model_name: orchestratorConfig.model_name,
+        temperature: orchestratorConfig.temperature,
+        max_tokens: orchestratorConfig.max_tokens,
+        configs,
+      };
+      const response = await apiFetch(`${apiUrl}/api/scenarios/${selectedScenario}/orchestrate-agents`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(requestBody) });
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.detail ?? t("error.templatesLoad"));
       const refreshedAgents = await loadAgents(selectedScenario);
       setAgents(refreshedAgents);
+      setOrchestratorConfig((current) => ({ ...current, api_key: "" }));
+      setOrchestratorHasSavedKey(payload.orchestrator_config?.has_api_key === true);
       setDomainRules(null);
       setMandateReadyScenarioId(null);
       closeTemplateModal();
@@ -851,6 +899,7 @@ export default function Home() {
       setNotice(error instanceof Error ? error.message : t("error.templatesLoad"));
     } finally {
       setBusy(false);
+      setOrchestratorConfigBusy(false);
     }
   }
 
@@ -974,7 +1023,7 @@ export default function Home() {
       refreshMandateData(scenarioId).catch((refreshError) => {
         setNotice(refreshError instanceof Error ? refreshError.message : t("error.refreshDelayed"));
       });
-      setMandateLogs((current) => [...current, { stage: "MANDATE", level: payload.status === "partial" ? "WARNING" : "SUCCESS", message: payload.detail ?? t("notice.mandateGenerated", { count: formatNumber(payload.generated_count ?? 0) }) }]);
+      setMandateLogs((current) => [...current, { stage: "MANDATE", level: payload.status === "success" ? "SUCCESS" : "WARNING", message: payload.detail ?? t("notice.mandateGenerated", { count: formatNumber(payload.generated_count ?? 0) }) }]);
       setNotice(payload.detail ?? t("notice.mandateReady"));
     } catch (error) {
       const message = error instanceof Error ? error.message : t("error.mandateGenerate");
@@ -1159,6 +1208,7 @@ export default function Home() {
     setRunHydrationError(null);
     setDashboard(null);
     setGraph(null);
+    setLatestRunState("available");
     setRun({ task_id: payload.task_id, session_id: payload.session_id, scenario_id: payload.scenario_id, status: payload.status, polling_state: payload.polling_state, should_poll: payload.should_poll, terminal: payload.terminal, logs: payload.logs, simulation_artifacts: [], agent_breakdown: [], collective_reasoning: null, disagreements: [] });
     appendQueueLog(payload.task_id, payload.logs);
     setNotice(t("notice.queued", { task: payload.task_id.slice(0, 8) }));
@@ -1189,6 +1239,11 @@ export default function Home() {
   const canGenerateRules = selectedScenario !== null && agents.length > 0;
   const canStartDiscussion = canGenerateRules && mandateReadyScenarioId === selectedScenario && domainRules?.scenario_id === selectedScenario && domainRules.generated && !domainRules.stale;
   const rulesAreStale = canGenerateRules && !canStartDiscussion;
+  const runStateLabel = latestRunState === "empty"
+    ? t("run.readyInitial")
+    : latestRunState === "loading"
+      ? t("run.checking")
+      : run?.status ?? "IDLE";
   const activeInfluence = useMemo(() => {
     return [...(runDashboard?.influence_observations ?? [])].sort(
       (a, b) => (b.normalized_weight ?? 0) - (a.normalized_weight ?? 0)
@@ -1219,11 +1274,11 @@ export default function Home() {
     <section className="dashboard-hero"><div><div className="eyebrow">{t("hero.eyebrow")}</div><h1>{t("hero.title")}<br /><em>{t("hero.emphasis")}</em></h1><p>{t("hero.description")}</p></div><div className="hero-orbit"><span>DDR</span><b>→</b><span>CAR</span><b>→</b><span>SHCR</span></div></section>
     <div className="notice" role="status" aria-live="polite"><span className="notice-label">{t("notice.label")}</span><span>{notice || t("notice.ready")}</span></div>
 
-    <section className="control-strip"><div className="scenario-overview"><span>{t("scenario.active")}</span><strong>{selectedScenario ? t("scenario.number", { id: selectedScenario }) : t("scenario.none")}</strong><p className={scenarioExpanded ? "expanded" : "collapsed"}>{scenarios.find((item) => item.id === selectedScenario)?.description ?? t("scenario.prompt")}</p><button type="button" onClick={() => setScenarioExpanded((value) => !value)}>{scenarioExpanded ? t("scenario.hide") : t("scenario.show")}</button><select aria-label={t("scenario.select")} value={selectedScenario ?? ""} onChange={(event) => { setSelectedScenario(Number(event.target.value)); setDomainRules(null); setMandateReadyScenarioId(null); setDashboard(null); setGraph(null); setRun(null); setTrackerHistory([]); setMandateLogs([]); }}><option value="" disabled>{t("scenario.select")}</option>{scenarios.map((item) => <option key={item.id} value={item.id}>#{item.id} — {item.description.slice(0, 72)}</option>)}</select></div><button className="primary-button run-button" onClick={startRun} disabled={run?.status === "RUNNING" || run?.status === "QUEUED" || !canStartDiscussion}>{run?.status === "RUNNING" ? t("run.running") : run?.status === "QUEUED" ? t("run.queued") : t("run.start")}<span>↗</span></button></section>
+    <section className="control-strip"><div className="scenario-overview"><span>{t("scenario.active")}</span><strong>{selectedScenario ? t("scenario.number", { id: selectedScenario }) : t("scenario.none")}</strong><p className={scenarioExpanded ? "expanded" : "collapsed"}>{scenarios.find((item) => item.id === selectedScenario)?.description ?? t("scenario.prompt")}</p><button type="button" onClick={() => setScenarioExpanded((value) => !value)}>{scenarioExpanded ? t("scenario.hide") : t("scenario.show")}</button><select aria-label={t("scenario.select")} value={selectedScenario ?? ""} onChange={(event) => { setSelectedScenario(Number(event.target.value)); setDomainRules(null); setMandateReadyScenarioId(null); setDashboard(null); setGraph(null); setRun(null); setLatestRunState("loading"); setTrackerHistory([]); setMandateLogs([]); }}><option value="" disabled>{t("scenario.select")}</option>{scenarios.map((item) => <option key={item.id} value={item.id}>#{item.id} — {item.description.slice(0, 72)}</option>)}</select></div><button className="primary-button run-button" onClick={startRun} disabled={run?.status === "RUNNING" || run?.status === "QUEUED" || !canStartDiscussion}>{run?.status === "RUNNING" ? t("run.running") : run?.status === "QUEUED" ? t("run.queued") : t("run.start")}<span>↗</span></button></section>
 
     <nav className="wizard-tabs" role="tablist" aria-label={t("wizard.label")}>{tabs.map((label, index) => <button ref={(element) => { tabRefs.current[index] = element; }} id={`wizard-tab-${index}`} type="button" role="tab" aria-selected={activeTab === index} aria-controls={`wizard-panel-${index}`} tabIndex={activeTab === index ? 0 : -1} className={activeTab === index ? "active" : ""} onClick={() => selectTab(index)} onKeyDown={(event) => handleTabKeyDown(event, index)} key={label}><span>{String(index + 1).padStart(2, "0")}</span><strong>{label}</strong></button>)}</nav>
 
-    <section id="wizard-panel-1" role="tabpanel" aria-labelledby="wizard-tab-1" tabIndex={0} hidden={activeTab !== 1} className="tracker-panel panel"><div className="section-header"><div><span className="section-number">03</span><h2>{t("tracker.title")}</h2></div><span className={`run-state ${run?.status?.toLowerCase() ?? "idle"}`}>{run?.status ?? "IDLE"}</span></div><div className="tracker-content"><div ref={trackerConsoleRef} className="progress-console max-h-[500px] overflow-y-auto">{activeLogs.map((log, index) => <div className={`console-line ${log.level.toLowerCase()}`} key={`${log.stage}-${index}`}><span>{String(index + 1).padStart(2, "0")}</span><i className={index === activeLogs.length - 1 && !["SUCCEEDED", "FAILED"].includes(run?.status ?? "") ? "pulse" : "done"} /><div><b>[{log.level}] {log.code ?? log.stage}</b><small>{log.messages?.[lang] ?? log.message}</small>{log.fallback?.used && <em>Fallback: {log.fallback.retained_artifact ?? log.fallback.kind} · {log.fallback.consensus_impact}</em>}</div></div>)}</div><div className="task-readout"><span>{t("tracker.task")}</span><strong>{run?.task_id ?? "—"}</strong><small>{run?.error ?? (run?.status === "SUCCEEDED" ? t("tracker.persisted") : run?.status === "FAILED" ? t("notice.failed") : t("tracker.polling"))}</small><RunMetadataPanel run={run} /></div></div>{run?.status === "FAILED" && <section className="run-failure" role="alert"><strong>{t("notice.failed")}</strong><p>{run.error ?? t("notice.failedDetail")}</p><div><button type="button" onClick={refetchRunStatus} disabled={runActionBusy}>{runActionBusy ? t("notice.refetching") : t("notice.refetch")}</button><button type="button" onClick={startRun} disabled={runActionBusy || rulesAreStale}>{t("notice.retryRun")}</button></div></section>}{runHydrationError && run?.status !== "FAILED" && <section className="run-failure" role="alert"><p>{runHydrationError}</p><button type="button" onClick={refetchRunData} disabled={runActionBusy}>{runActionBusy ? t("notice.refetching") : t("notice.refetch")}</button></section>}<AgentBreakdownPanel agents={agentBreakdown} disagreements={narrativeDisagreements} simulations={simulationArtifacts} /><WizardControls current={activeTab} onChange={selectTab} /></section>
+    <section id="wizard-panel-1" role="tabpanel" aria-labelledby="wizard-tab-1" tabIndex={0} hidden={activeTab !== 1} className="tracker-panel panel"><div className="section-header"><div><span className="section-number">03</span><h2>{t("tracker.title")}</h2></div><span className={`run-state ${latestRunState === "empty" ? "ready" : run?.status?.toLowerCase() ?? "idle"}`}>{runStateLabel}</span></div><div className="tracker-content"><div ref={trackerConsoleRef} className="progress-console max-h-[500px] overflow-y-auto">{activeLogs.map((log, index) => <div className={`console-line ${log.level.toLowerCase()}`} key={`${log.stage}-${index}`}><span>{String(index + 1).padStart(2, "0")}</span><i className={index === activeLogs.length - 1 && !["SUCCEEDED", "FAILED"].includes(run?.status ?? "") ? "pulse" : "done"} /><div><b>[{log.level}] {log.code ?? log.stage}</b><small>{log.messages?.[lang] ?? log.message}</small>{log.fallback?.used && <em>Fallback: {log.fallback.retained_artifact ?? log.fallback.kind} · {log.fallback.consensus_impact}</em>}</div></div>)}</div><div className="task-readout"><span>{t("tracker.task")}</span><strong>{run?.task_id ?? "—"}</strong><small>{run?.error ?? (latestRunState === "empty" ? t("run.readyInitialDetail") : run?.status === "SUCCEEDED" ? t("tracker.persisted") : run?.status === "FAILED" ? t("notice.failed") : t("tracker.polling"))}</small><RunMetadataPanel run={run} /></div></div>{run?.status === "FAILED" && <section className="run-failure" role="alert"><strong>{t("notice.failed")}</strong><p>{run.error ?? t("notice.failedDetail")}</p><div><button type="button" onClick={refetchRunStatus} disabled={runActionBusy}>{runActionBusy ? t("notice.refetching") : t("notice.refetch")}</button><button type="button" onClick={startRun} disabled={runActionBusy || rulesAreStale}>{t("notice.retryRun")}</button></div></section>}{runHydrationError && run?.status !== "FAILED" && <section className="run-failure" role="alert"><p>{runHydrationError}</p><button type="button" onClick={refetchRunData} disabled={runActionBusy}>{runActionBusy ? t("notice.refetching") : t("notice.refetch")}</button></section>}<AgentBreakdownPanel agents={agentBreakdown} disagreements={narrativeDisagreements} simulations={simulationArtifacts} /><WizardControls current={activeTab} onChange={selectTab} /></section>
 
     <section id="wizard-panel-2" role="tabpanel" aria-labelledby="wizard-tab-2" tabIndex={0} hidden={activeTab !== 2} className="panel"><div className="section-header"><div><span className="section-number">06</span><h2>{t("ddr.title")}</h2></div><span className="panel-code">D<sub>ij</sub> / {t("ddr.components")}</span></div><DdrNetworkPanel disagreements={narrativeDisagreements} breakdown={agentBreakdown} /><WizardControls current={activeTab} onChange={selectTab} /></section>
 
@@ -1233,8 +1288,19 @@ export default function Home() {
     <section id="wizard-panel-4" role="tabpanel" aria-labelledby="wizard-tab-4" tabIndex={0} hidden={activeTab !== 4} className="final-panel"><section id="analytics" className="analytics-section"><div className="section-header"><div><span className="section-number">07</span><h2>{t("analytics.title")}</h2></div><button className="export-button" onClick={exportManifest}>{t("analytics.export")}</button></div><CollectiveReasoningPanel analysis={collectiveReasoning} /><InfluencePanel observations={activeInfluence} /><InfeasiblePanel metric={currentMetric} hardStop={hardStop} message={finalResultMessage} rejectedAlternatives={rejectedAlternatives} hardConstraints={hardConstraints} /><section className="panel graph-panel"><div className="section-header"><div><span className="section-number">GRAPH</span><h2>{t("graph.title")}</h2></div><div className="graph-legend"><span><i className="pending" /> {t("status.pending")}</span><span><i className="running" /> {t("status.active")}</span><span><i className="succeeded" /> {t("status.complete")}</span><span><i className="warning" /> {t("status.dissent")}</span><span><i className="failed" /> {t("status.failed")}</span></div></div><RunGraph graph={currentGraph} /></section><div className="convergence-banner"><div><span>{t("analytics.final")}</span><strong>{currentMetric?.convergence_status ?? t("analytics.awaiting")}</strong></div><div className="convergence-meta"><span>{t("analytics.feasible")}</span><b>{currentMetric?.feasible_alternatives_count === undefined || currentMetric?.feasible_alternatives_count === null ? "—" : formatNumber(currentMetric.feasible_alternatives_count)}</b></div></div><div className="metric-grid"><MetricCard label={t("analytics.metrics.constraint")} value={currentMetric ? formatNumber(currentMetric.hard_constraint_violation_rate, { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : "—"} unit="%" tone="rust" /><MetricCard label={t("analytics.metrics.provenance")} value={currentMetric ? formatNumber(currentMetric.provenance_completeness_percent, { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : "—"} unit="%" /><MetricCard label={t("analytics.metrics.schema")} value={dashboard ? formatNumber(dashboard.schema_validity_percent, { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : "—"} unit="%" tone="mint" /><MetricCard label={t("analytics.metrics.latency")} value={latest ? formatNumber(latest.latency_ms, { maximumFractionDigits: 0 }) : "—"} unit={latest ? `ms · ${formatNumber(latest.token_usage)} tok` : ""} /></div><div className="analytics-lower"><div className="history-block"><div className="subhead"><span>{t("analytics.metricHistory")}</span><b>{formatNumber(dashboard?.metric_history?.length ?? 0)} {t("common.runs")}</b></div>{dashboard?.metric_history?.length ? dashboard.metric_history.slice(0, 5).map((metric) => <div className="history-row" key={metric.id}><span>#{metric.id}</span><strong>{metric.convergence_status}</strong><i>{formatNumber(metric.provenance_completeness_percent, { minimumFractionDigits: 1, maximumFractionDigits: 1 })}% {t("analytics.provenance")}</i><b>{formatDateTime(metric.created_at)}</b></div>) : <p className="empty">{t("analytics.noHistory")}</p>}</div><div className="influence-block"><div className="subhead"><span>{t("analytics.influence")}</span><b>{formatNumber(activeInfluence.length)} {t("common.observations")}</b></div>{activeInfluence.length ? activeInfluence.map((item, index) => <div className="weight-row" key={`${item.agent}-${item.proposition}`}><span>{String(index + 1).padStart(2, "0")}</span><div><strong>{item.agent}</strong><small>{item.proposition}</small></div><b>{item.normalized_weight === null ? "—" : `${formatNumber(item.normalized_weight * 100, { minimumFractionDigits: 1, maximumFractionDigits: 1 })}%`}</b></div>) : <p className="empty">{t("analytics.noInfluence")}</p>}</div></div></section><WizardControls current={activeTab} onChange={selectTab} /></section>
 
     <section id="wizard-panel-0" role="tabpanel" aria-labelledby="wizard-tab-0" tabIndex={0} hidden={activeTab !== 0} className="setup-section">
-      <div className="section-header"><div><span className="section-number">01 / 02</span><h2>{t("setup.title")}</h2></div><button ref={templateButtonRef} type="button" className="template-load-button" onClick={openTemplateModal} disabled={busy || selectedScenario === null}>{t("setup.loadTemplates")}</button></div>
+      <div className="section-header"><div><span className="section-number">01 / 02</span><h2>{t("setup.title")}</h2></div></div>
       <p className="setup-intro">{t("setup.intro")}</p>
+      <section className="orchestrator-config-card" aria-busy={orchestratorConfigBusy}>
+        <div className="orchestrator-config-heading"><div><span className="section-number">01/a</span><h3>{t("orchestrator.title")}</h3><p>{t("orchestrator.description")}</p></div><div className={`config-indicator ${orchestratorHasSavedKey ? "configured" : "unconfigured"}`}><i aria-hidden="true" /><strong>{orchestratorHasSavedKey ? t("orchestrator.configured") : t("orchestrator.notConfigured")}</strong></div></div>
+        <div className="orchestrator-config-grid">
+          <label className="form-field"><strong>{t("form.apiBase")}</strong><input type="url" placeholder="https://ai.zytroapi.my.id/v1" value={orchestratorConfig.api_base_url} onChange={(event) => setOrchestratorConfig({ ...orchestratorConfig, api_base_url: event.target.value })} /></label>
+          <label className="form-field"><strong>{t("form.apiKey")}</strong><input type="password" autoComplete="new-password" placeholder={orchestratorHasSavedKey ? t("orchestrator.keyPlaceholder") : ""} value={orchestratorConfig.api_key} onChange={(event) => setOrchestratorConfig({ ...orchestratorConfig, api_key: event.target.value })} /></label>
+          <label className="form-field"><strong>{t("form.model")}</strong><input placeholder="deepseek-v4.1-flash / gpt-4o" value={orchestratorConfig.model_name} onChange={(event) => setOrchestratorConfig({ ...orchestratorConfig, model_name: event.target.value })} /></label>
+          <label className="form-field range-field"><span className="range-label"><strong>{t("form.temperature")}</strong><output>{orchestratorConfig.temperature.toFixed(2)}</output></span><input type="range" min="0" max="2" step="0.01" value={orchestratorConfig.temperature} onChange={(event) => setOrchestratorConfig({ ...orchestratorConfig, temperature: Number(event.target.value) })} /></label>
+          <label className="form-field"><strong>{t("form.maxTokens")}</strong><input type="number" min="1" step="1" value={orchestratorConfig.max_tokens} onChange={(event) => setOrchestratorConfig({ ...orchestratorConfig, max_tokens: Number(event.target.value) })} /></label>
+        </div>
+        <div className="orchestrator-actions"><button ref={templateButtonRef} type="button" className="secondary-button" onClick={openTemplateModal} disabled={busy || selectedScenario === null}>{t("orchestrator.domainOverrides")}</button><button type="button" className="template-load-button" onClick={loadAllTemplates} disabled={busy || selectedScenario === null}>{orchestratorConfigBusy ? t("common.generating") : t("orchestrator.generate")}</button></div>
+      </section>
       <form className="global-config-form" aria-busy={globalConfigLoading || globalConfigBusy} onSubmit={submitGlobalConfig}><fieldset className="global-config-fieldset" disabled={globalConfigLoading || globalConfigBusy || globalConfigLoadError}><div className="global-config-heading"><div><span className="section-number">GLOBAL / LLM</span><h3>{t("global.title")}</h3><p>{t("global.description")}</p></div><div className={`config-indicator ${globalConfigMeta.has_llm_api_key ? "configured" : "unconfigured"}`}><i aria-hidden="true" /><strong>{globalConfigMeta.has_llm_api_key ? t("global.configured") : t("global.notConfigured")}</strong><small>{t("global.revision", { revision: globalConfigMeta.revision })}</small></div></div><div className="global-config-grid"><label className="form-field"><strong>{t("form.apiBase")}</strong><input type="url" value={globalConfig.llm_base_url} onChange={(event) => setGlobalConfig({ ...globalConfig, llm_base_url: event.target.value })} /><small>{t("global.baseHint")}</small></label><label className="form-field"><strong>{t("form.apiKey")}</strong><input type="password" autoComplete="new-password" value={globalConfig.llm_api_key} placeholder={globalConfigMeta.has_llm_api_key ? t("global.keyPlaceholder") : ""} onChange={(event) => setGlobalConfig({ ...globalConfig, llm_api_key: event.target.value })} /><small>{t("global.keyHint")}</small></label><label className="form-field"><strong>{t("form.model")}</strong><input value={globalConfig.llm_model} onChange={(event) => setGlobalConfig({ ...globalConfig, llm_model: event.target.value })} /></label><label className="form-field"><strong>{t("form.maxTokens")}</strong><input type="number" min="1" step="1" required value={globalConfig.max_tokens} onChange={(event) => setGlobalConfig({ ...globalConfig, max_tokens: Number(event.target.value) })} /></label><label className="form-field"><strong>{t("form.temperature")}</strong><input type="number" min="0" max="2" step="0.01" required value={globalConfig.temperature} onChange={(event) => setGlobalConfig({ ...globalConfig, temperature: Number(event.target.value) })} /></label><label className="toggle-field"><input type="checkbox" checked={globalConfig.apply_to_all} onChange={(event) => setGlobalConfig({ ...globalConfig, apply_to_all: event.target.checked })} /><span aria-hidden="true" /><strong>{t("global.applyAll")}</strong><small>{t("global.applyAllHint")}</small></label></div><button className="primary-button global-config-submit" disabled={globalConfigBusy}>{globalConfigBusy ? t("setup.saving") : globalConfigLoading ? t("global.loading") : t("global.save")}<span>↗</span></button></fieldset></form>{globalConfigLoadError && <div className="config-load-error" role="alert"><span>{t("notice.globalConfigPending")}</span><button type="button" onClick={() => loadGlobalConfig().catch(() => setNotice(t("notice.globalConfigPending")))}>{t("notice.refetch")}</button></div>}
       <form className="agent-config-form" onSubmit={submitAgent}>
         <fieldset className="form-card">
@@ -1280,7 +1346,7 @@ export default function Home() {
 
       <div className="agent-register"><div className="subhead"><span>{t("setup.savedAgents")}</span><b>{formatNumber(agents.length)} {t("common.agents")}</b></div>{agents.length ? agents.map((item) => <div className="agent-register-row" key={item.id}><div><strong>{item.display_name ?? item.name}</strong><small>{item.role}</small></div><span>{item.template_key ? t("setup.templateTag") : t("setup.customTag")}</span><b>{item.llm_model ?? t("setup.envDefault")}</b><div className="agent-actions"><button type="button" onClick={() => generateAgentMandate(item.id)} disabled={rulesBusy || busyAgentId !== null || busyAgentId === item.id}>{busyAgentId === item.id ? t("common.generating") : t("common.generateMandate")}</button><button type="button" onClick={() => testConnection(item)} disabled={connectionTests[item.id]?.pending === true}>{connectionTests[item.id]?.pending ? t("notice.testing") : t("action.test")}</button><button type="button" onClick={() => editAgent(item)}>{t("action.edit")}</button><button type="button" className="danger" onClick={() => deleteAgent(item)}>{t("action.delete")}</button>{connectionTests[item.id] && <small role="status" aria-live="polite" className={connectionTests[item.id].ok ? "test-ok" : "test-error"}>{connectionTests[item.id].message}</small>}</div></div>) : <p className="empty">{t("setup.noAgents")}</p>}</div>
 
-      <div className="agent-register"><div className="subhead"><span>{t("scenario.section")}</span><b>{formatNumber(scenarios.length)}</b></div>{scenarios.length ? scenarios.map((item) => <div className={`agent-register-row ${selectedScenario === item.id ? "active" : ""}`} key={item.id}><div><strong>#{item.id}</strong><small>{item.description}</small></div><span>{item.instrument ?? "APBN"}</span><div className="agent-actions"><button type="button" onClick={() => { setSelectedScenario(item.id); setDomainRules(null); setMandateReadyScenarioId(null); setDashboard(null); setGraph(null); setRun(null); setTrackerHistory([]); setMandateLogs([]); }}>{t("scenario.select")}</button><button type="button" onClick={() => editScenario(item)} disabled={scenarioBusy}>{scenarioLabels[lang].edit}</button><button type="button" className="danger" onClick={() => deleteScenario(item)} disabled={scenarioBusy}>{t("action.delete")}</button></div></div>) : <p className="empty">{t("scenario.none")}</p>}</div>
+      <div className="agent-register"><div className="subhead"><span>{t("scenario.section")}</span><b>{formatNumber(scenarios.length)}</b></div>{scenarios.length ? scenarios.map((item) => <div className={`agent-register-row ${selectedScenario === item.id ? "active" : ""}`} key={item.id}><div><strong>#{item.id}</strong><small>{item.description}</small></div><span>{item.instrument ?? "APBN"}</span><div className="agent-actions"><button type="button" onClick={() => { setSelectedScenario(item.id); setDomainRules(null); setMandateReadyScenarioId(null); setDashboard(null); setGraph(null); setRun(null); setLatestRunState("loading"); setTrackerHistory([]); setMandateLogs([]); }}>{t("scenario.select")}</button><button type="button" onClick={() => editScenario(item)} disabled={scenarioBusy}>{scenarioLabels[lang].edit}</button><button type="button" className="danger" onClick={() => deleteScenario(item)} disabled={scenarioBusy}>{t("action.delete")}</button></div></div>) : <p className="empty">{t("scenario.none")}</p>}</div>
 
       <form className="scenario-config-form" onSubmit={submitScenario}><div><span className="section-number">{t("scenario.section")}</span><h3>{t("setup.scenario")}</h3><small>{t("form.scenarioHint")}</small>{editingScenarioId !== null && <strong className="scenario-editing">{t("scenario.active")} #{editingScenarioId}</strong>}</div><label className="form-field"><strong>{t("form.goal")}</strong><textarea value={scenario.description} onChange={(event) => setScenario({ ...scenario, description: event.target.value })} rows={4} required /><small>{t("form.goalHint")}</small></label><ScenarioParameterSections value={scenario} onChange={setScenario} lang={lang} /><div className="scenario-form-actions"><button className="secondary-button" disabled={busy || scenarioBusy}>{editingScenarioId !== null ? scenarioLabels[lang].save : t("action.saveScenario")}</button>{editingScenarioId !== null && <button type="button" className="secondary-button" disabled={scenarioBusy} onClick={() => { setEditingScenarioId(null); setScenario(initialScenario); }}>{t("action.cancel")}</button>}</div></form><WizardControls current={activeTab} onChange={selectTab} />
     </section>

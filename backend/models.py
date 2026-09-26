@@ -1,6 +1,7 @@
 import enum
 from datetime import datetime
 from typing import Any
+from uuid import uuid4
 
 from sqlalchemy import (
     Boolean,
@@ -92,6 +93,7 @@ class Agent(Base):
             "rar_dai_weight_mode IN ('auto', 'manual')",
             name="ck_agent_rar_dai_weight_mode",
         ),
+        Index("uq_agents_agent_uuid", "agent_uuid", unique=True),
         Index(
             "uq_agent_global_name",
             "name",
@@ -123,10 +125,12 @@ class Agent(Base):
             ),
         ),
         Index(
-            "uq_agent_singleton_orchestrator",
-            "is_orchestrator",
+            "uq_agent_scenario_orchestrator",
+            "scenario_id",
             unique=True,
-            postgresql_where=text("is_orchestrator IS TRUE"),
+            postgresql_where=text(
+                "is_orchestrator IS TRUE AND scenario_id IS NOT NULL"
+            ),
         ),
         Index(
             "uq_agent_scenario_specialist_domain",
@@ -140,6 +144,9 @@ class Agent(Base):
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    agent_uuid: Mapped[str] = mapped_column(
+        String(36), nullable=False, default=lambda: str(uuid4())
+    )
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     role: Mapped[str] = mapped_column(String(255), nullable=False)
     template_key: Mapped[str | None] = mapped_column(String(100))

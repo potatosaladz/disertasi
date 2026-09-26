@@ -77,6 +77,7 @@ ALTER TABLE IF EXISTS scenarios
     DROP COLUMN IF EXISTS max_deficit_constraint;
 
 ALTER TABLE IF EXISTS agents
+    ADD COLUMN IF NOT EXISTS agent_uuid VARCHAR(36),
     ADD COLUMN IF NOT EXISTS template_key VARCHAR(100),
     ADD COLUMN IF NOT EXISTS scenario_id INTEGER REFERENCES scenarios(id) ON DELETE CASCADE,
     ADD COLUMN IF NOT EXISTS specialist_domain VARCHAR(100),
@@ -88,6 +89,17 @@ ALTER TABLE IF EXISTS agents
     ADD COLUMN IF NOT EXISTS system_prompt TEXT,
     ADD COLUMN IF NOT EXISTS temperature DOUBLE PRECISION NOT NULL DEFAULT 0.2,
     ADD COLUMN IF NOT EXISTS max_tokens INTEGER NOT NULL DEFAULT 4000;
+
+DO $$
+BEGIN
+    IF to_regclass('public.agents') IS NOT NULL THEN
+        UPDATE agents
+        SET agent_uuid = gen_random_uuid()::text
+        WHERE agent_uuid IS NULL OR agent_uuid = '';
+        ALTER TABLE agents ALTER COLUMN agent_uuid SET NOT NULL;
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_agents_agent_uuid ON agents (agent_uuid);
+    END IF;
+END $$;
 
 CREATE TABLE IF NOT EXISTS global_llm_config (
     id INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
@@ -109,6 +121,7 @@ BEGIN
         ALTER TABLE agents DROP CONSTRAINT IF EXISTS agents_name_key;
         ALTER TABLE agents DROP CONSTRAINT IF EXISTS agents_template_key_key;
         DROP INDEX IF EXISTS ix_agents_template_key;
+        DROP INDEX IF EXISTS uq_agent_singleton_orchestrator;
         CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_global_name
             ON agents (name) WHERE scenario_id IS NULL;
         CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_scenario_name
@@ -119,8 +132,9 @@ BEGIN
         CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_scenario_template_key
             ON agents (scenario_id, template_key)
             WHERE scenario_id IS NOT NULL AND template_key IS NOT NULL;
-        CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_singleton_orchestrator
-            ON agents (is_orchestrator) WHERE is_orchestrator IS TRUE;
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_scenario_orchestrator
+            ON agents (scenario_id)
+            WHERE is_orchestrator IS TRUE AND scenario_id IS NOT NULL;
         CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_scenario_specialist_domain
             ON agents (scenario_id, specialist_domain)
             WHERE scenario_id IS NOT NULL AND specialist_domain IS NOT NULL;

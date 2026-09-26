@@ -5,7 +5,7 @@ import warnings
 from collections.abc import AsyncIterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
-from time import perf_counter
+from time import perf_counter, sleep
 from typing import Any, Literal, cast
 
 from fastapi import FastAPI, HTTPException, Response, status
@@ -30,6 +30,7 @@ from .agent_templates import (
     is_master_orchestrator,
     load_standard_agent_templates,
     mandate_seed,
+    orchestrated_scenario_agent_plan,
     orchestrate_scenario_agents,
     scenario_deliberative_agents,
     scenario_scoped_agents,
@@ -87,6 +88,72 @@ class LoadTemplatesRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     configs: dict[str, TemplateLLMConfig] = Field(default_factory=dict)
+
+
+class OrchestratorConfigPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    api_base_url: str | None = Field(default=None, max_length=2048)
+    api_key: str | None = Field(default=None, max_length=4096)
+    model_name: str | None = Field(default=None, max_length=255)
+    temperature: float = Field(default=0.2, ge=0.0, le=2.0, allow_inf_nan=False)
+    max_tokens: int = Field(default=4000, gt=0)
+
+
+class OrchestrateAgentsRequest(OrchestratorConfigPayload):
+    configs: dict[str, TemplateLLMConfig] = Field(default_factory=dict)
+
+
+class OrchestratorConfigResponse(BaseModel):
+    scenario_id: int
+    api_base_url: str | None
+    model_name: str | None
+    temperature: float
+    max_tokens: int
+    has_api_key: bool
+
+
+RETRYABLE_LLM_STATUS_CODES = frozenset({500, 502, 503, 530})
+MAX_LLM_RETRIES = 3
+
+
+def _llm_status_code(error: Exception) -> int | None:
+    status_code = getattr(error, "status_code", None)
+    if isinstance(status_code, int):
+        return status_code
+    response = getattr(error, "response", None)
+    response_status = getattr(response, "status_code", None)
+    return response_status if isinstance(response_status, int) else None
+
+
+def _create_completion_with_retry(
+    completions: Any,
+    *,
+    operation: str,
+    request: dict[str, Any],
+) -> Any:
+    for attempt in range(MAX_LLM_RETRIES + 1):
+        try:
+            return completions.create(**request)
+        except Exception as error:
+            status_code = _llm_status_code(error)
+            transient = status_code in RETRYABLE_LLM_STATUS_CODES or isinstance(
+                error,
+                (APIConnectionError, APITimeoutError, ConnectionError, TimeoutError, OSError, socket.error),
+            )
+            if not transient or attempt == MAX_LLM_RETRIES:
+                raise
+            delay_seconds = 0.25 * (2**attempt)
+            logger.warning(
+                "%s transient LLM failure (status=%s, attempt=%s/%s); retrying in %.2fs",
+                operation,
+                status_code or type(error).__name__,
+                attempt + 1,
+                MAX_LLM_RETRIES + 1,
+                delay_seconds,
+            )
+            sleep(delay_seconds)
+    raise RuntimeError(f"{operation} retry loop terminated unexpectedly")
 
 
 class GlobalLLMConfigResponse(BaseModel):
@@ -157,6 +224,7 @@ class AgentUpdate(BaseModel):
 
 class AgentResponse(BaseModel):
     id: int
+    agent_uuid: str
     name: str
     display_name: str
     reused: bool = False
@@ -256,6 +324,7 @@ class ScenarioResponse(SimulationPayload):
 def agent_response(agent: Agent, *, reused: bool = False) -> AgentResponse:
     return AgentResponse(
         id=agent.id,
+        agent_uuid=agent.agent_uuid,
         name=agent.name,
         display_name=semantic_agent_name(agent),
         reused=reused,
@@ -328,7 +397,11 @@ def update_global_config(payload: GlobalLLMConfigUpdate) -> GlobalLLMConfigRespo
             setattr(config, field, value)
         config.revision += 1
         if config.apply_to_all:
-            for agent in session.scalars(select(Agent).order_by(Agent.id)):
+            for agent in session.scalars(
+                select(Agent)
+                .where(Agent.is_orchestrator.is_(False))
+                .order_by(Agent.id)
+            ):
                 apply_global_llm_config(agent, config)
         session.commit()
         session.refresh(config)
@@ -338,6 +411,120 @@ def update_global_config(payload: GlobalLLMConfigUpdate) -> GlobalLLMConfigRespo
 @app.get("/api/agent-templates")
 def list_agent_templates() -> list[dict[str, object]]:
     return template_catalog()
+
+
+def _orchestrator_llm_domain_selection(
+    orchestrator: Agent,
+    scenario: Scenario,
+    fallback_domains: list[str],
+) -> tuple[list[str], str | None]:
+    try:
+        config = resolve_llm_runtime_config(orchestrator)
+        prompt = {
+            "scenario": {
+                "goal": scenario.description,
+                "parameters": scenario.simulation_payload(),
+            },
+            "candidate_domains": [
+                {"key": "revenue", "role": "State Revenue Specialist"},
+                {"key": "expenditure", "role": "Government Expenditure Specialist"},
+                {"key": "financing", "role": "Budget Financing Specialist"},
+                {"key": "treasury", "role": "Treasury Liquidity Specialist"},
+                {"key": "macro", "role": "Macro-Fiscal Stabilization Specialist"},
+            ],
+            "required_output": {
+                "agents": [
+                    {"domain": "revenue"},
+                    {"domain": "expenditure"},
+                    {"domain": "financing"},
+                    {"domain": "macro"},
+                ]
+            },
+        }
+        instructions = (
+            "You are the SHCR Master Orchestrator. Read the scenario goal and all supplied "
+            "parameters, then return JSON only with an agents array containing EXACTLY FOUR "
+            "unique domain keys selected from revenue, expenditure, financing, treasury, macro. "
+            "Choose the four most relevant domains. Use domain roles State Revenue Specialist, "
+            "Government Expenditure Specialist, Budget Financing Specialist, and Macro-Fiscal "
+            "Stabilization Specialist when relevant. Do not return prose or any fifth agent."
+        )
+        result = _create_completion_with_retry(
+            OpenAI(
+                api_key=config.api_key,
+                base_url=config.base_url,
+                timeout=60.0,
+                max_retries=0,
+                default_headers=llm_request_headers(),
+            ).chat.completions,
+            operation="Orchestrator domain selection",
+            request={
+                "model": config.model,
+                "temperature": orchestrator.temperature,
+                "max_tokens": orchestrator.max_tokens,
+                "response_format": {"type": "json_object"},
+                "messages": [
+                    {"role": "system", "content": instructions},
+                    {
+                        "role": "user",
+                        "content": json.dumps(prompt, ensure_ascii=False, sort_keys=True),
+                    },
+                ],
+            },
+        )
+        content, _ = extract_llm_completion(result)
+        parsed = extract_json_object(content)
+        raw_agents = parsed.get("agents")
+        if not isinstance(raw_agents, list) or len(raw_agents) != 4:
+            raise ValueError("Orchestrator must return exactly four agents")
+        domains = [
+            item.get("domain")
+            for item in raw_agents
+            if isinstance(item, dict) and isinstance(item.get("domain"), str)
+        ]
+        if len(domains) != 4 or len(set(domains)) != 4:
+            raise ValueError("Orchestrator domains must be four unique known keys")
+        allowed_domains = {"revenue", "expenditure", "financing", "treasury", "macro"}
+        if set(domains) - allowed_domains:
+            raise ValueError("Orchestrator returned an unknown domain")
+        return cast(list[str], domains), None
+    except Exception as error:
+        logger.warning(
+            "[WARNING] Orchestrator LLM unavailable or invalid; using deterministic four-agent selection (%s)",
+            type(error).__name__,
+        )
+        return fallback_domains, f"{type(error).__name__}: deterministic selection used"
+
+
+def _orchestrator_config_response(
+    scenario_id: int,
+    orchestrator: Agent | None,
+) -> OrchestratorConfigResponse:
+    return OrchestratorConfigResponse(
+        scenario_id=scenario_id,
+        api_base_url=orchestrator.llm_base_url if orchestrator else None,
+        model_name=orchestrator.llm_model if orchestrator else None,
+        temperature=orchestrator.temperature if orchestrator else 0.2,
+        max_tokens=orchestrator.max_tokens if orchestrator else 4000,
+        has_api_key=bool(orchestrator and orchestrator.llm_api_key),
+    )
+
+
+@app.get(
+    "/api/scenarios/{scenario_id}/orchestrator-config",
+    response_model=OrchestratorConfigResponse,
+)
+def get_scenario_orchestrator_config(scenario_id: int) -> OrchestratorConfigResponse:
+    with SessionLocal() as session:
+        if session.get(Scenario, scenario_id) is None:
+            raise HTTPException(status_code=404, detail="Scenario not found")
+        orchestrator = session.scalar(
+            select(Agent).where(
+                Agent.scenario_id == scenario_id,
+                Agent.is_orchestrator.is_(True),
+            )
+        )
+        return _orchestrator_config_response(scenario_id, orchestrator)
 
 
 @app.post("/api/agents/load-templates")
@@ -362,7 +549,7 @@ def load_agent_templates(payload: LoadTemplatesRequest | None = None) -> dict[st
 @app.post("/scenarios/{scenario_id}/orchestrate-agents")
 def orchestrate_scenario_agent_set(
     scenario_id: int,
-    payload: LoadTemplatesRequest | None = None,
+    payload: OrchestrateAgentsRequest | None = None,
 ) -> dict[str, object]:
     configs = {
         key: config.model_dump()
@@ -375,18 +562,74 @@ def orchestrate_scenario_agent_set(
         scenario = session.get(Scenario, scenario_id)
         if scenario is None:
             raise HTTPException(status_code=404, detail="Scenario not found")
+        existing_orchestrator = session.scalar(
+            select(Agent).where(
+                Agent.scenario_id == scenario_id,
+                Agent.is_orchestrator.is_(True),
+            )
+        )
+        explicit = (
+            payload
+            if payload
+            and any((payload.api_base_url, payload.api_key, payload.model_name))
+            else None
+        )
+        orchestrator_values: dict[str, Any] | None = None
+        if explicit is not None:
+            supplied_key = explicit.api_key or (
+                existing_orchestrator.llm_api_key if existing_orchestrator else None
+            )
+            if not explicit.api_base_url or not explicit.model_name or not supplied_key:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        "Explicit Orchestrator configuration requires API Base URL, "
+                        "Model Name, and an API Key (new or already persisted)"
+                    ),
+                )
+            orchestrator_values = {
+                "llm_base_url": explicit.api_base_url,
+                "llm_api_key": supplied_key,
+                "llm_model": explicit.model_name,
+                "temperature": explicit.temperature,
+                "max_tokens": explicit.max_tokens,
+            }
         _clear_scenario_execution_data(session, scenario_id)
-        orchestrator, orchestrator_created = get_or_create_master_orchestrator(session)
-        agents, orchestration = orchestrate_scenario_agents(session, scenario, configs)
+        orchestrator, orchestrator_created = get_or_create_master_orchestrator(
+            session,
+            scenario_id,
+            orchestrator_values,
+        )
+        fallback_domains, _ = orchestrated_scenario_agent_plan(scenario)
+        selected_domains, orchestration_error = _orchestrator_llm_domain_selection(
+            orchestrator,
+            scenario,
+            fallback_domains,
+        )
+        agents, orchestration = orchestrate_scenario_agents(
+            session,
+            scenario,
+            configs,
+            selected_domains,
+        )
+        orchestration["selection_source"] = (
+            "deterministic_fallback" if orchestration_error else "master_orchestrator_llm"
+        )
+        orchestration["selection_error"] = orchestration_error
         session.commit()
         for agent in agents:
             session.refresh(agent)
+        session.refresh(orchestrator)
         return {
             "created": len(agents),
             "total": len(agents),
             "scenario_id": scenario_id,
             "orchestrator_id": orchestrator.id,
+            "orchestrator_uuid": orchestrator.agent_uuid,
             "orchestrator_created": orchestrator_created,
+            "orchestrator_config": _orchestrator_config_response(
+                scenario_id, orchestrator
+            ).model_dump(),
             "orchestration": orchestration,
             "agents": [agent_response(agent).model_dump() for agent in agents],
         }
@@ -535,7 +778,8 @@ def update_agent(agent_id: int, payload: AgentUpdate) -> AgentResponse:
             updates.pop("llm_api_key")
         for field, value in updates.items():
             setattr(agent, field, value)
-        apply_global_llm_config(agent, get_global_llm_config(session))
+        if not agent.is_orchestrator:
+            apply_global_llm_config(agent, get_global_llm_config(session))
         session.commit()
         session.refresh(agent)
         return agent_response(agent)
@@ -949,24 +1193,24 @@ def _synthesize_agent_domain_rules(agent: Agent, scenario: Scenario) -> AgentDom
             config.model,
             request_payload,
         )
-        print("--- OUTBOUND PROMPT ---", flush=True)
-        print(json.dumps(request_payload, indent=2, ensure_ascii=False, default=str), flush=True)
-        response = OpenAI(
-            api_key=config.api_key,
-            base_url=config.base_url,
-            timeout=60.0,
-            max_retries=2,
-            default_headers=llm_request_headers(),
-        ).chat.completions.create(
-            model=config.model,
-            temperature=agent.temperature,
-            max_tokens=agent.max_tokens,
-            response_format={"type": "json_object"},
-            messages=request_payload["messages"],
+        response = _create_completion_with_retry(
+            OpenAI(
+                api_key=config.api_key,
+                base_url=config.base_url,
+                timeout=60.0,
+                max_retries=0,
+                default_headers=llm_request_headers(),
+            ).chat.completions,
+            operation=f"Mandate synthesis for agent {agent.id}",
+            request={
+                "model": config.model,
+                "temperature": agent.temperature,
+                "max_tokens": agent.max_tokens,
+                "response_format": {"type": "json_object"},
+                "messages": request_payload["messages"],
+            },
         )
         content, tokens = extract_llm_completion(response)
-        print("--- RAW LLM RESPONSE ---", flush=True)
-        print(content, flush=True)
         parsed = _validated_mandate_payload(extract_json_object(content))
         fallback_values = _synthesis_fallbacks(agent, scenario)
         scenario_mandate = _normalise_mandate_text(
@@ -1033,10 +1277,21 @@ def _synthesize_agent_domain_rules(agent: Agent, scenario: Scenario) -> AgentDom
         if isinstance(
             error,
             (APIConnectionError, APITimeoutError, ConnectionError, TimeoutError, OSError, socket.error),
-        ):
-            logger.exception("Local LLM connection failed during mandate synthesis for agent %s", agent.id)
+        ) or _llm_status_code(error) is not None:
+            logger.warning(
+                "[WARNING] LLM provider unreachable. Injecting deterministic fallback mandate "
+                "for agent %s (%s, status=%s)",
+                agent.id,
+                type(error).__name__,
+                _llm_status_code(error),
+            )
         else:
-            logger.exception("Mandate synthesis failed for agent %s", agent.id)
+            logger.warning(
+                "[WARNING] Mandate synthesis fell back to static template due to LLM provider failure "
+                "for agent %s (%s)",
+                agent.id,
+                type(error).__name__,
+            )
         code: Literal["CONFIGURATION_ERROR", "PROVIDER_ERROR", "EMPTY_CONTENT", "INVALID_JSON", "SCHEMA_ERROR"] = (
             "CONFIGURATION_ERROR"
             if isinstance(error, ValueError) and "configuration" in str(error)
@@ -1220,7 +1475,6 @@ def _domain_rules_from_snapshot(
     responses={
         404: {"content": {"application/json": {}}},
         409: {"content": {"application/json": {}}},
-        502: {"content": {"application/json": {}}},
         500: {"content": {"application/json": {}}},
     },
 )
@@ -1248,25 +1502,23 @@ def generate_domain_rules(scenario_id: int) -> DomainRulesResponse | JSONRespons
                 )
             generated_count = sum(rule.synthesis_status == "generated" for rule in agent_rules)
             failure_count = len(agent_rules) - generated_count
-            if generated_count == 0:
-                return JSONResponse(
-                    status_code=502,
-                    content={
-                        "success": False,
-                        "detail": "All agent mandate synthesis calls failed",
-                        "agent_rules": [rule.model_dump(mode="json") for rule in agent_rules],
-                    },
-                )
             revision = agent_revision(agents, scenario)
             rules = _combined_domain_rules(agents, scenario)
-            detail = (
-                f"Generated {generated_count} scenario mandates; {failure_count} agents use local fallback."
-                if failure_count
-                else f"Generated {generated_count} scenario-specific mandates."
-            )
-            response_status: Literal["success", "partial"] = (
-                "partial" if failure_count else "success"
-            )
+            if generated_count == 0:
+                detail = (
+                    "LLM provider unavailable; deterministic fallback mandates were "
+                    f"generated for all {failure_count} agents."
+                )
+                response_status: Literal["success", "partial", "failed"] = "failed"
+            elif failure_count:
+                detail = (
+                    f"Generated {generated_count} scenario mandates; {failure_count} "
+                    "agents use deterministic fallback."
+                )
+                response_status = "partial"
+            else:
+                detail = f"Generated {generated_count} scenario-specific mandates."
+                response_status = "success"
             response = DomainRulesResponse(
                 scenario_id=scenario_id,
                 revision=revision,

@@ -19,7 +19,7 @@ from backend.agent_templates import (
 )
 from backend.dashboard import _disagreement_payload, _polling_contract
 from backend.database import SessionLocal
-from backend.main import app
+from backend.main import _create_completion_with_retry, app
 from backend.mandate_snapshots import refresh_mandate_snapshot
 from backend.models import (
     Agent,
@@ -74,6 +74,58 @@ def test_global_config_is_redacted_and_applied_to_all(client: TestClient) -> Non
     assert created.status_code == 201
     assert created.json()["llm_model"] == "global-model"
     assert created.json()["has_llm_api_key"] is True
+
+
+@pytest.mark.parametrize("status_code", [500, 502, 503, 530])
+def test_llm_completion_retries_transient_statuses(
+    status_code: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempts = 0
+
+    class TransientError(Exception):
+        def __init__(self) -> None:
+            self.status_code = status_code
+
+    class Completions:
+        def create(self, **_kwargs: object) -> str:
+            nonlocal attempts
+            attempts += 1
+            if attempts < 4:
+                raise TransientError()
+            return "ok"
+
+    monkeypatch.setattr("backend.main.sleep", lambda _seconds: None)
+
+    result = _create_completion_with_retry(
+        Completions(),
+        operation="test",
+        request={},
+    )
+
+    assert result == "ok"
+    assert attempts == 4
+
+
+def test_llm_completion_does_not_retry_non_transient_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempts = 0
+
+    class PermanentError(Exception):
+        status_code = 504
+
+    class Completions:
+        def create(self, **_kwargs: object) -> object:
+            nonlocal attempts
+            attempts += 1
+            raise PermanentError()
+
+    monkeypatch.setattr("backend.main.sleep", lambda _seconds: None)
+
+    with pytest.raises(PermanentError):
+        _create_completion_with_retry(Completions(), operation="test", request={})
+    assert attempts == 1
 
 
 def test_generated_agent_name_is_normalized(client: TestClient) -> None:
@@ -843,7 +895,7 @@ def test_domain_rules_aggregate_template_agents(
         "api_key": "revenue-secret",
         "base_url": "https://revenue.example/v1",
         "timeout": 60.0,
-        "max_retries": 2,
+            "max_retries": 0,
         "default_headers": {
             "Content-Type": "application/json",
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -948,7 +1000,7 @@ def test_domain_rules_uses_environment_fallback(
         "api_key": "environment-secret",
         "base_url": "https://environment.example/v1",
         "timeout": 60.0,
-        "max_retries": 2,
+            "max_retries": 0,
         "default_headers": {
             "Content-Type": "application/json",
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -1174,15 +1226,71 @@ def test_domain_rules_returns_json_when_all_synthesis_calls_fail(
 
     response = client.post(f"/api/scenarios/{scenario.json()['id']}/domain-rules")
 
-    assert response.status_code == 502
+    assert response.status_code == 200
     assert response.headers["content-type"].startswith("application/json")
-    assert response.json()["success"] is False
-    assert response.json()["detail"] == "All agent mandate synthesis calls failed"
+    payload = response.json()
+    assert payload["generated"] is True
+    assert payload["status"] == "failed"
+    assert payload["generated_count"] == 0
+    assert payload["failure_count"] == 1
+    assert payload["agent_rules"][0]["synthesis_status"] == "fallback"
+    assert payload["agent_rules"][0]["scenario_mandate"]
+    persisted = client.get(f"/api/scenarios/{scenario.json()['id']}/domain-rules")
+    assert persisted.status_code == 200
+    assert persisted.json()["status"] == "failed"
 
     with SessionLocal() as session:
         session.delete(session.get(Scenario, scenario.json()["id"]))
         session.delete(session.get(Agent, agent.json()["id"]))
         session.commit()
+
+
+def test_mandate_synthesis_retries_http_530_then_persists_fallback(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempts = 0
+
+    class TunnelError(Exception):
+        status_code = 530
+
+    class FailingCompletions:
+        def create(self, **_kwargs: object) -> object:
+            nonlocal attempts
+            attempts += 1
+            raise TunnelError()
+
+    class FailingClient:
+        def __init__(self, **kwargs: object) -> None:
+            assert kwargs["max_retries"] == 0
+            self.chat = type("Chat", (), {"completions": FailingCompletions()})()
+
+    monkeypatch.setattr("backend.main.OpenAI", FailingClient)
+    monkeypatch.setattr("backend.main.sleep", lambda _seconds: None)
+    client.post(
+        "/api/agents",
+        json={
+            "name": f"tunnel-rules-{uuid.uuid4()}",
+            "role": "Tunnel Failure Test",
+            "llm_base_url": "https://failed.example/v1",
+            "llm_api_key": "failed-secret",
+            "llm_model": "failed-model",
+        },
+    )
+    scenario = client.post(
+        "/api/scenarios",
+        json={"description": "Tunnel failure scenario"},
+    ).json()
+
+    response = client.post(f"/api/scenarios/{scenario['id']}/domain-rules")
+
+    assert response.status_code == 200
+    assert attempts == 4
+    payload = response.json()
+    assert payload["status"] == "failed"
+    assert payload["generated"] is True
+    assert payload["agent_rules"][0]["synthesis_status"] == "fallback"
+    assert payload["agent_rules"][0]["error"]["code"] == "PROVIDER_ERROR"
 
 
 def test_domain_rules_include_custom_agent_mandate(
@@ -1555,7 +1663,7 @@ def test_force_delete_mocked_scenario_cascades_running_run_and_artifacts(
             ) is None
 
 
-def test_orchestrated_plan_selects_all_five_relevant_domains() -> None:
+def test_orchestrated_plan_selects_exactly_four_relevant_domains() -> None:
     scenario = Scenario(
         description=(
             "Tax revenue, public expenditure, debt financing, treasury liquidity, "
@@ -1570,12 +1678,227 @@ def test_orchestrated_plan_selects_all_five_relevant_domains() -> None:
 
     selected, plan = orchestrated_scenario_agent_plan(scenario)
 
-    assert len(selected) == 5
-    assert set(selected) == {"revenue", "expenditure", "financing", "treasury", "macro"}
+    assert len(selected) == 4
+    assert len(set(selected)) == 4
+    assert set(selected) <= {"revenue", "expenditure", "financing", "treasury", "macro"}
     assert set(plan["weights"]) == set(selected)
 
 
-def test_scenario_orchestration_replaces_agents_with_three_to_five_specialists(
+def test_orchestrator_uses_explicit_scenario_config_and_persists_four_agents(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clients: list[dict[str, object]] = []
+    requests: list[dict[str, object]] = []
+
+    class FakeCompletions:
+        def create(self, **kwargs: object) -> object:
+            requests.append(kwargs)
+            content = json.dumps(
+                {
+                    "agents": [
+                        {"domain": "revenue"},
+                        {"domain": "expenditure"},
+                        {"domain": "financing"},
+                        {"domain": "macro"},
+                    ]
+                }
+            )
+            message = type("Message", (), {"content": content})()
+            choice = type("Choice", (), {"message": message})()
+            return type("Response", (), {"choices": [choice], "usage": None})()
+
+    class FakeClient:
+        def __init__(self, **kwargs: object) -> None:
+            clients.append(kwargs)
+            self.chat = type("Chat", (), {"completions": FakeCompletions()})()
+
+    monkeypatch.setattr("backend.main.OpenAI", FakeClient)
+    global_update = client.put(
+        "/api/global-config",
+        json={
+            "llm_base_url": "https://global.example/v1",
+            "llm_api_key": "global-secret",
+            "llm_model": "global-model",
+            "temperature": 0.7,
+            "max_tokens": 2000,
+            "apply_to_all": True,
+        },
+    )
+    assert global_update.status_code == 200
+    scenario = client.post(
+        "/api/scenarios", json={"description": "Revenue spending debt and inflation"}
+    ).json()
+
+    response = client.post(
+        f"/api/scenarios/{scenario['id']}/orchestrate-agents",
+        json={
+            "api_base_url": "https://orchestrator.example/v1",
+            "api_key": "orchestrator-secret",
+            "model_name": "orchestrator-model",
+            "temperature": 0.15,
+            "max_tokens": 1800,
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["total"] == 4
+    assert payload["orchestration"]["selection_source"] == "master_orchestrator_llm"
+    assert len({agent["agent_uuid"] for agent in payload["agents"]}) == 4
+    assert all(uuid.UUID(agent["agent_uuid"]) for agent in payload["agents"])
+    assert {agent["scenario_id"] for agent in payload["agents"]} == {scenario["id"]}
+    assert clients == [
+        {
+            "api_key": "orchestrator-secret",
+            "base_url": "https://orchestrator.example/v1",
+            "timeout": 60.0,
+            "max_retries": 0,
+            "default_headers": {
+                "Content-Type": "application/json",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Accept": "application/json",
+            },
+        }
+    ]
+    assert requests[0]["model"] == "orchestrator-model"
+    stored = client.get(f"/api/scenarios/{scenario['id']}/orchestrator-config")
+    assert stored.status_code == 200
+    assert stored.json() == {
+        "scenario_id": scenario["id"],
+        "api_base_url": "https://orchestrator.example/v1",
+        "model_name": "orchestrator-model",
+        "temperature": 0.15,
+        "max_tokens": 1800,
+        "has_api_key": True,
+    }
+    assert "orchestrator-secret" not in stored.text
+    client.put(
+        "/api/global-config",
+        json={
+            "llm_base_url": "https://global-new.example/v1",
+            "llm_api_key": "global-new-secret",
+            "llm_model": "global-new-model",
+            "temperature": 0.9,
+            "max_tokens": 2200,
+            "apply_to_all": True,
+        },
+    )
+    with SessionLocal() as session:
+        orchestrator = session.scalar(
+            select(Agent).where(
+                Agent.scenario_id == scenario["id"],
+                Agent.is_orchestrator.is_(True),
+            )
+        )
+        assert orchestrator is not None
+        assert orchestrator.llm_model == "orchestrator-model"
+        assert orchestrator.llm_api_key == "orchestrator-secret"
+
+
+def test_orchestrator_configs_are_isolated_between_scenarios(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeCompletions:
+        def create(self, **_kwargs: object) -> object:
+            content = json.dumps(
+                {
+                    "agents": [
+                        {"domain": "revenue"},
+                        {"domain": "expenditure"},
+                        {"domain": "financing"},
+                        {"domain": "macro"},
+                    ]
+                }
+            )
+            message = type("Message", (), {"content": content})()
+            choice = type("Choice", (), {"message": message})()
+            return type("Response", (), {"choices": [choice], "usage": None})()
+
+    class FakeClient:
+        def __init__(self, **_kwargs: object) -> None:
+            self.chat = type("Chat", (), {"completions": FakeCompletions()})()
+
+    monkeypatch.setattr("backend.main.OpenAI", FakeClient)
+    first = client.post("/api/scenarios", json={"description": "First scenario"}).json()
+    second = client.post("/api/scenarios", json={"description": "Second scenario"}).json()
+    for scenario, suffix in ((first, "one"), (second, "two")):
+        response = client.post(
+            f"/api/scenarios/{scenario['id']}/orchestrate-agents",
+            json={
+                "api_base_url": f"https://{suffix}.example/v1",
+                "api_key": f"secret-{suffix}",
+                "model_name": f"model-{suffix}",
+            },
+        )
+        assert response.status_code == 200
+
+    first_config = client.get(
+        f"/api/scenarios/{first['id']}/orchestrator-config"
+    ).json()
+    second_config = client.get(
+        f"/api/scenarios/{second['id']}/orchestrator-config"
+    ).json()
+    assert first_config["api_base_url"] == "https://one.example/v1"
+    assert first_config["model_name"] == "model-one"
+    assert second_config["api_base_url"] == "https://two.example/v1"
+    assert second_config["model_name"] == "model-two"
+    with SessionLocal() as session:
+        orchestrators = list(
+            session.scalars(
+                select(Agent).where(Agent.is_orchestrator.is_(True)).order_by(Agent.id)
+            )
+        )
+        assert len(orchestrators) == 2
+        assert {item.scenario_id for item in orchestrators} == {first["id"], second["id"]}
+        assert len({item.agent_uuid for item in orchestrators}) == 2
+
+
+def test_orchestrator_failure_falls_back_to_exactly_four_agents(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempts = 0
+
+    class TunnelError(Exception):
+        status_code = 530
+
+    class FailingCompletions:
+        def create(self, **_kwargs: object) -> object:
+            nonlocal attempts
+            attempts += 1
+            raise TunnelError()
+
+    class FailingClient:
+        def __init__(self, **_kwargs: object) -> None:
+            self.chat = type("Chat", (), {"completions": FailingCompletions()})()
+
+    monkeypatch.setattr("backend.main.OpenAI", FailingClient)
+    monkeypatch.setattr("backend.main.sleep", lambda _seconds: None)
+    scenario = client.post(
+        "/api/scenarios", json={"description": "General APBN policy"}
+    ).json()
+
+    response = client.post(
+        f"/api/scenarios/{scenario['id']}/orchestrate-agents",
+        json={
+            "api_base_url": "https://orchestrator.example/v1",
+            "api_key": "orchestrator-secret",
+            "model_name": "orchestrator-model",
+        },
+    )
+
+    assert response.status_code == 200
+    assert attempts == 4
+    payload = response.json()
+    assert payload["total"] == 4
+    assert payload["orchestration"]["selection_source"] == "deterministic_fallback"
+    assert payload["orchestration"]["selection_error"]
+    assert len({agent["agent_uuid"] for agent in payload["agents"]}) == 4
+
+
+def test_scenario_orchestration_replaces_agents_with_exactly_four_specialists(
     client: TestClient,
 ) -> None:
     with SessionLocal() as session:
@@ -1605,7 +1928,8 @@ def test_scenario_orchestration_replaces_agents_with_three_to_five_specialists(
     assert first.status_code == 200
     first_payload = first.json()
     first_agents = first_payload["agents"]
-    assert 3 <= len(first_agents) <= 5
+    assert len(first_agents) == 4
+    assert len({item["agent_uuid"] for item in first_agents}) == 4
     assert first_payload["created"] == len(first_agents)
     assert first_payload["total"] == len(first_agents)
     assert first_payload["scenario_id"] == scenario_id
@@ -1633,7 +1957,8 @@ def test_scenario_orchestration_replaces_agents_with_three_to_five_specialists(
     assert second.status_code == 200
     second_payload = second.json()
     second_agents = second_payload["agents"]
-    assert 3 <= len(second_agents) <= 5
+    assert len(second_agents) == 4
+    assert len({item["agent_uuid"] for item in second_agents}) == 4
     second_ids = {item["id"] for item in second_agents}
     assert first_ids.isdisjoint(second_ids)
     if "revenue" in second_payload["orchestration"]["selected_domains"]:
@@ -1656,7 +1981,12 @@ def test_scenario_orchestration_replaces_agents_with_three_to_five_specialists(
             )
         ) == []
         persisted = list(
-            session.scalars(select(Agent).where(Agent.scenario_id == scenario_id))
+            session.scalars(
+                select(Agent).where(
+                    Agent.scenario_id == scenario_id,
+                    Agent.is_orchestrator.is_(False),
+                )
+            )
         )
         assert len(persisted) == len(second_agents)
         assert {agent.specialist_domain for agent in persisted} == set(
@@ -1687,8 +2017,10 @@ def test_scenario_orchestration_sets_are_isolated_and_reload_replaces_only_targe
     second_agents = second_load.json()["agents"]
     first_ids = {item["id"] for item in first_agents}
     second_ids = {item["id"] for item in second_agents}
-    assert 3 <= len(first_agents) <= 5
-    assert 3 <= len(second_agents) <= 5
+    assert len(first_agents) == 4
+    assert len({item["agent_uuid"] for item in first_agents}) == 4
+    assert len(second_agents) == 4
+    assert len({item["agent_uuid"] for item in second_agents}) == 4
     assert first_ids.isdisjoint(second_ids)
     assert {item["scenario_id"] for item in first_agents} == {first_scenario["id"]}
     assert {item["scenario_id"] for item in second_agents} == {second_scenario["id"]}

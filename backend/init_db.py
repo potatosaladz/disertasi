@@ -50,6 +50,7 @@ _SCENARIO_COLUMNS: dict[str, str] = {
 }
 
 _AGENT_COLUMNS: dict[str, str] = {
+    "agent_uuid": "VARCHAR(36)",
     "llm_base_url": "VARCHAR(2048)",
     "template_key": "VARCHAR(100)",
     "scenario_id": "INTEGER REFERENCES scenarios(id) ON DELETE CASCADE",
@@ -205,11 +206,23 @@ def _upgrade_agents_table() -> None:
         connection.execute(text("ALTER TABLE agents DROP CONSTRAINT IF EXISTS agents_name_key"))
         connection.execute(text("ALTER TABLE agents DROP CONSTRAINT IF EXISTS agents_template_key_key"))
         connection.execute(text("DROP INDEX IF EXISTS uq_agent_singleton_orchestrator"))
+        connection.execute(text("DROP INDEX IF EXISTS uq_agent_scenario_orchestrator"))
+        connection.execute(text("DROP INDEX IF EXISTS uq_agents_agent_uuid"))
         connection.execute(text("DROP INDEX IF EXISTS ix_agents_template_key"))
         connection.execute(text("DROP INDEX IF EXISTS uq_agent_global_name"))
         connection.execute(text("DROP INDEX IF EXISTS uq_agent_scenario_name"))
         connection.execute(text("DROP INDEX IF EXISTS uq_agent_global_template_key"))
         connection.execute(text("DROP INDEX IF EXISTS uq_agent_scenario_template_key"))
+        connection.execute(
+            text(
+                "UPDATE agents SET agent_uuid = gen_random_uuid()::text "
+                "WHERE agent_uuid IS NULL OR agent_uuid = ''"
+            )
+        )
+        connection.execute(text("ALTER TABLE agents ALTER COLUMN agent_uuid SET NOT NULL"))
+        connection.execute(
+            text("CREATE UNIQUE INDEX uq_agents_agent_uuid ON agents (agent_uuid)")
+        )
         connection.execute(text(
             "CREATE UNIQUE INDEX uq_agent_global_name ON agents (name) "
             "WHERE scenario_id IS NULL"
@@ -228,8 +241,9 @@ def _upgrade_agents_table() -> None:
             "WHERE scenario_id IS NOT NULL AND template_key IS NOT NULL"
         ))
         connection.execute(text(
-            "CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_singleton_orchestrator "
-            "ON agents (is_orchestrator) WHERE is_orchestrator IS TRUE"
+            "CREATE UNIQUE INDEX uq_agent_scenario_orchestrator "
+            "ON agents (scenario_id) "
+            "WHERE is_orchestrator IS TRUE AND scenario_id IS NOT NULL"
         ))
         connection.execute(text(
             "CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_scenario_specialist_domain "
